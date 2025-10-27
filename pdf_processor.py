@@ -12,10 +12,10 @@ from PyPDF2 import PdfReader
 import fitz  # PyMuPDF for better extraction
 import re
 
-from logging_config import get_logger, log_execution_time, LoggingProgress
+from loggerConf import get_logger_conf, log_execution_time, LoggingProgress
 from config import MAX_PDF_SIZE_MB, MAX_CHARS_PER_FILE, SUPPORTED_FORMATS
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 @dataclass
@@ -321,7 +321,7 @@ class BatchPDFProcessor:
             processor: PDFProcessor instance to use
         """
         self.processor = processor or PDFProcessor()
-        self.logger = get_logger(f"{__name__}.BatchProcessor")
+        self.logger = get_logger_conf(f"{__name__}.BatchProcessor")
         
     def process_directory(self, 
                          directory: Path,
@@ -396,7 +396,7 @@ class PDFTextCleaner:
     """Clean and preprocess PDF text for specific use cases"""
     
     def __init__(self):
-        self.logger = get_logger(f"{__name__}.TextCleaner")
+        self.logger = get_logger_conf(f"{__name__}.TextCleaner")
         
     def clean_for_audio(self, text: str) -> str:
         """

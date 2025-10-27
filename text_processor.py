@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 import numpy as np
 
-from logging_config import get_logger
+from loggerConf import get_logger_conf
 from config import (
     CHUNK_SIZE_DEFAULT,
     CHUNK_SIZE_MIN,
@@ -17,7 +17,7 @@ from config import (
     CHUNK_OVERLAP
 )
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 class ChunkingStrategy(Enum):
@@ -446,7 +446,7 @@ class TextPreprocessor:
     """Preprocess text for different purposes"""
     
     def __init__(self):
-        self.logger = get_logger(f"{__name__}.Preprocessor")
+        self.logger = get_logger_conf(f"{__name__}.Preprocessor")
         
     def preprocess_for_llm(self, 
                           text: str,

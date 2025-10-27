@@ -5,19 +5,29 @@ Centralized configuration for all modules and settings
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
 
-# Base paths
-BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
-LOG_DIR = BASE_DIR / "logs"
-CACHE_DIR = BASE_DIR / "cache"
-OFFLOAD_DIR = BASE_DIR / "offload"
+# Import base config (no circular dependencies)
+from config_base import (
+    BASE_DIR, OUTPUT_DIR, LOG_DIR, CACHE_DIR, OFFLOAD_DIR,
+    QUANTIZATION_OPTIONS, DEFAULT_QUANTIZATION,
+    ENABLE_LAYER_SPLITTING, DEFAULT_GPU_LAYERS,
+    CHUNK_SIZE_MIN, CHUNK_SIZE_MAX, CHUNK_SIZE_DEFAULT, CHUNK_OVERLAP,
+    DEFAULT_MODEL, FALLBACK_MODEL,
+    MAX_PDF_SIZE_MB, MAX_CHARS_PER_FILE, SUPPORTED_FORMATS,
+    BATCH_PROCESSING_ENABLED, MAX_PARALLEL_FILES,
+    OUTPUT_FORMAT_OPTIONS, DEFAULT_OUTPUT_FORMAT,
+    INCLUDE_METADATA, TIMESTAMP_OUTPUTS,
+    MAX_RETRIES, RETRY_DELAY_SECONDS, FALLBACK_ON_ERROR, SAVE_ERROR_CONTEXT,
+    PIPELINE_STAGES, ENABLE_STAGE_CHECKPOINTS, CHECKPOINT_FORMAT,
+    ENABLE_API_MODE, API_RATE_LIMIT, API_TIMEOUT_SECONDS
+)
 
-# Create directories if they don't exist
-for dir_path in [OUTPUT_DIR, LOG_DIR, CACHE_DIR, OFFLOAD_DIR]:
-    dir_path.mkdir(exist_ok=True, parents=True)
+# Type checking imports (not evaluated at runtime)
+if TYPE_CHECKING:
+    from hyperparameters import HyperparameterConfig
+    from model_registry import ModelEntry
 
 # Original preprocessing prompt
 PREPROCESS_PROMPT = """
@@ -33,7 +43,7 @@ ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS 
 Here's the text:
 """
 
-# Model configurations
+# Model configurations (legacy - kept for backward compatibility)
 @dataclass
 class ModelConfig:
     """Configuration for different model options"""
@@ -45,67 +55,76 @@ class ModelConfig:
     optimal_chunk_size: int = 1000
     temperature: float = 0.7
     top_p: float = 0.9
-    max_new_tokens: Optional[int] = None  # None means dynamic sizing
+    max_new_tokens: Optional[int] = None
     quantization_support: List[str] = field(default_factory=lambda: ["4bit", "8bit"])
 
-# Available models
-MODELS = {
-    "qwen3-4b": ModelConfig(
-        name="Qwen3-4B Thinking",
-        model_id="Qwen/Qwen3-4B-Instruct-2507",
-        supports_thinking=True,
-        thinking_tokens=["<think>", "</think>", "<|thinking|>", "<|/thinking|>", "[THINK]", "[/THINK]"],
-        max_context=32768,
-        optimal_chunk_size=1500,
-        temperature=0.7,
-        top_p=0.9,
-        max_new_tokens=None
-    ),
-    "gemma-270m": ModelConfig(
-        name="Gemma 270M",
-        model_id="google/gemma-3-270m",
-        supports_thinking=False,
-        max_context=8192,
-        optimal_chunk_size=1000,
-        temperature=0.8,
-        top_p=0.95,
-        max_new_tokens=2048
-    ),
-    "llama-3.2-1b": ModelConfig(
-        name="Llama 3.2 1B",
-        model_id="meta-llama/Llama-3.2-1B-Instruct",
-        supports_thinking=False,
-        max_context=8192,
-        optimal_chunk_size=1200,
-        temperature=0.7,
-        top_p=0.9,
-        max_new_tokens=2048
-    ),
-}
 
-# Default model selection
-DEFAULT_MODEL = "qwen3-4b"
-FALLBACK_MODEL = "gemma-270m"
+# Legacy MODELS dict - dynamically populated from registry
+def _get_legacy_models() -> Dict[str, ModelConfig]:
+    """Get legacy MODELS dict from registry for backward compatibility"""
+    try:
+        from model_registry import get_registry
+        
+        registry = get_registry()
+        models = {}
+        
+        # Get predefined models
+        for entry in registry.list_models(predefined_only=True):
+            # Convert to old ModelConfig format
+            key = entry.model_id.split('/')[-1].lower().replace('-', '').replace('.', '')
+            if 'qwen' in key:
+                key = 'qwen3-4b'
+            elif 'gemma' in key:
+                key = 'gemma-270m'
+            elif 'llama' in key:
+                key = 'llama-3.2-1b'
+            
+            models[key] = ModelConfig(
+                name=entry.name,
+                model_id=entry.model_id,
+                supports_thinking=entry.supports_thinking,
+                thinking_tokens=entry.thinking_tokens or [],
+                max_context=entry.max_context,
+                optimal_chunk_size=entry.optimal_chunk_size,
+                temperature=entry.temperature,
+                top_p=entry.top_p,
+                max_new_tokens=entry.max_new_tokens,
+                quantization_support=entry.quantization_support or ["4bit", "8bit"]
+            )
+        
+        return models
+    except:
+        # Fallback if registry not available
+        return {
+            "qwen3-4b": ModelConfig(
+                name="Qwen3-4B Thinking",
+                model_id="Qwen/Qwen2.5-4B-Instruct",
+                supports_thinking=True,
+                thinking_tokens=["<think>", "</think>"],
+                max_context=32768,
+                optimal_chunk_size=1500
+            )
+        }
 
-# Chunk processing settings
-CHUNK_SIZE_MIN = 100
-CHUNK_SIZE_MAX = 5000
-CHUNK_SIZE_DEFAULT = 1000
-CHUNK_OVERLAP = 50  # Characters to overlap between chunks for context
+
+# Dynamic MODELS dict
+MODELS = _get_legacy_models()
+
 
 # Memory optimization settings
 @dataclass
 class MemoryConfig:
     """Memory optimization configuration"""
     use_quantization: bool = True
-    quantization_type: str = "8bit"  # "4bit", "8bit", or "none"
+    quantization_type: str = "8bit"
     max_gpu_memory: str = "10GB"
     max_cpu_memory: str = "30GB"
     use_flash_attention: bool = True
     use_gradient_checkpointing: bool = False
     offload_to_disk: bool = True
     batch_size: int = 1
-    
+
+
 MEMORY_PROFILES = {
     "low_vram": MemoryConfig(
         use_quantization=True,
@@ -141,6 +160,7 @@ MEMORY_PROFILES = {
     )
 }
 
+
 # Markdown formatting options
 @dataclass
 class MarkdownStyle:
@@ -149,6 +169,7 @@ class MarkdownStyle:
     emphasis_markers: Dict[str, str]
     emotion_markers: Dict[str, str]
     structure_markers: Dict[str, str]
+
 
 MARKDOWN_STYLES = {
     "podcast": MarkdownStyle(
@@ -212,6 +233,7 @@ MARKDOWN_STYLES = {
     )
 }
 
+
 # Response filtering patterns
 THINKING_PATTERNS = [
     # Common thinking model patterns
@@ -228,6 +250,7 @@ THINKING_PATTERNS = [
     (r"\(thinking:.*?\)", ""),
     (r"\[internal:.*?\]", ""),
 ]
+
 
 # Logging configuration
 LOGGING_CONFIG = {
@@ -255,7 +278,7 @@ LOGGING_CONFIG = {
             "level": "DEBUG",
             "formatter": "detailed",
             "filename": str(LOG_DIR / "llamanote.log"),
-            "maxBytes": 10485760,  # 10MB
+            "maxBytes": 10485760,
             "backupCount": 5
         },
         "error_file": {
@@ -288,40 +311,42 @@ LOGGING_CONFIG = {
     }
 }
 
-# File processing settings
-MAX_PDF_SIZE_MB = 100
-MAX_CHARS_PER_FILE = 10000000
-SUPPORTED_FORMATS = [".pdf", ".txt", ".md", ".docx"]
-BATCH_PROCESSING_ENABLED = True
-MAX_PARALLEL_FILES = 3
 
-# Output settings
-OUTPUT_FORMAT_OPTIONS = ["markdown", "text", "json", "html"]
-DEFAULT_OUTPUT_FORMAT = "markdown"
-INCLUDE_METADATA = True
-TIMESTAMP_OUTPUTS = True
+# Lazy loading functions to avoid circular imports
+def get_default_hyperparams():
+    """Lazy load default hyperparameters"""
+    from hyperparameters import HyperparameterConfig
+    return HyperparameterConfig()
 
-# Error handling settings
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 2
-FALLBACK_ON_ERROR = True
-SAVE_ERROR_CONTEXT = True
 
-# Processing pipeline settings
-PIPELINE_STAGES = [
-    "extract",
-    "preprocess",
-    "chunk",
-    "process",
-    "filter",
-    "format",
-    "save"
-]
+def get_model_hyperparams(model_identifier: str):
+    """
+    Get hyperparameters for a specific model
+    
+    Args:
+        model_identifier: Model ID or key
+        
+    Returns:
+        HyperparameterConfig
+    """
+    from hyperparameters import HyperparameterConfig
+    from model_registry import get_model_config
+    
+    # Try to get from registry
+    model_entry = get_model_config(model_identifier)
+    
+    if model_entry:
+        return HyperparameterConfig(
+            temperature=model_entry.temperature,
+            top_p=model_entry.top_p,
+            max_new_tokens=model_entry.max_new_tokens or 2048
+        )
+    
+    # Default
+    return HyperparameterConfig()
 
-ENABLE_STAGE_CHECKPOINTS = True
-CHECKPOINT_FORMAT = "pickle"  # or "json"
 
-# API/Service settings (for future module usage)
-ENABLE_API_MODE = False
-API_RATE_LIMIT = 10  # requests per minute
-API_TIMEOUT_SECONDS = 300
+def reload_models():
+    """Reload models from registry"""
+    global MODELS
+    MODELS = _get_legacy_models()

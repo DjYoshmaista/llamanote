@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from logging_config import get_logger, LoggingProgress, MemoryMonitor, ConsoleOutput
+from loggerConf import get_logger_conf, LoggingProgress, MemoryMonitor, ConsoleOutput
 from config import (
     PREPROCESS_PROMPT,
     MODELS,
@@ -29,7 +29,7 @@ from response_filter import ChunkedResponseFilter
 from markdown_formatter import MarkdownFormatter, PodcastFormatter, TechnicalFormatter
 from file_handler import FileHandler
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 class ProcessingMode(Enum):
@@ -83,7 +83,7 @@ class ProcessingPipeline:
             config: Pipeline configuration
         """
         self.config = config or PipelineConfig()
-        self.logger = get_logger(f"{__name__}.Pipeline")
+        self.logger = get_logger_conf(f"{__name__}.Pipeline")
         
         # Initialize components
         self._initialize_components()

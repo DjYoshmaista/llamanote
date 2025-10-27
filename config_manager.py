@@ -1,248 +1,330 @@
-# config_manager.py
+"""
+Configuration Manager Module
+Manages configuration files, filters, and settings
+"""
+
 import os
 import json
-import sys
+import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import shutil
+
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
 
 class ConfigManager:
-    def __init__(self):
-        self.user_home = Path.home()
-        self.default_config_dir = self.user_home / ".config" / "llamaNote" / "configs"
-        self.default_config_dir.mkdir(parents=True, exist_ok=True)
-        self.current_config = None
+    """Manages application configurations and settings"""
+    
+    def __init__(self, base_dir: Optional[Path] = None):
+        """
+        Initialize configuration manager
         
-        # Default configuration
-        self.default_config = {
-            "preprocessing": {
-                "model_type": "local",
-                "model_name": "google/gemma-3-270m",
-                "provider": "huggingface"
-            },
-            "transcription": {
-                "model_type": "local", 
-                "model_name": "Qwen/Qwen3-4B-Instruct-2507",
-                "provider": "huggingface"
-            },
-            "enhancement": {
-                "model_type": "local",
-                "model_name": "Qwen/Qwen3-4B-Instruct-2507", 
-                "provider": "huggingface"
-            },
-            "text_to_speech": {
-                "model_type": "local",
-                "model_name": "parler-tts/parler-tts-mini-v1",
-                "provider": "huggingface"
-            },
-            "cloud_settings": {
-                "openai_api_key": "",
-                "anthropic_api_key": "",
-                "google_api_key": "",
-                "mistral_api_key": "",
-                "deepseek_api_key": "",
-                "openrouter_api_key": "",
-                "qwen_api_key": ""
-            }
-        }
+        Args:
+            base_dir: Base directory for configurations
+        """
+        self.base_dir = base_dir or Path.home() / ".config" / "llamanote"
         
-        # Available providers and models
-        self.available_providers = {
-            "local": {
-                "huggingface": [
-                    "google/gemma-3-270m",
-                    "Qwen/Qwen3-4B-Instruct-2507", 
-                    "Llama-3.2-1B-Instruct",
-                    "mistralai/Mistral-7B-Instruct-v0.2",
-                    "microsoft/DialoGPT-medium"
-                ]
-            },
-            "cloud": {
-                "openai": ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"],
-                "anthropic": ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
-                "google": ["gemini-pro", "gemini-ultra"],
-                "mistral": ["mistral-large", "mistral-medium", "mistral-small"],
-                "deepseek": ["deepseek-chat"],
-                "openrouter": [
-                    "anthropic/claude-3-opus",
-                    "openai/gpt-4-turbo", 
-                    "google/gemini-pro"
-                ],
-                "qwen": ["qwen-plus", "qwen-turbo"]
-            }
-        }
-
-    def get_config_path(self, config_name: str) -> Path:
-        """Get full path for a config file"""
-        return self.default_config_dir / f"{config_name}.json"
-
-    def create_config(self, config_name: str, config_data: Dict[str, Any]) -> bool:
-        """Create a new configuration file"""
+        # Setup directory structure
+        self.config_dir = self.base_dir / "config"
+        self.filter_dir = self.base_dir / "filter"
+        self.preset_dir = self.base_dir / "preset"
+        self.pipeline_dir = self.base_dir / "pipeline"
+        self.audio_dir = self.base_dir / "audio"
+        self.model_dir = self.base_dir / "model"
+        
+        # Create directories
+        for dir_path in [self.config_dir, self.filter_dir, self.preset_dir,
+                         self.pipeline_dir, self.audio_dir, self.model_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            
+        # Default config file
+        self.default_config_file = self.config_dir / "default.json"
+        
+        # Custom paths configuration
+        self.paths_config_file = self.config_dir / "paths.json"
+        self.custom_paths = self._load_custom_paths()
+        
+        logger.info(f"Initialized ConfigManager at {self.base_dir}")
+        
+    def _load_custom_paths(self) -> Dict[str, Path]:
+        """Load custom path configurations"""
+        if self.paths_config_file.exists():
+            try:
+                with open(self.paths_config_file, 'r') as f:
+                    paths = json.load(f)
+                return {k: Path(v) for k, v in paths.items()}
+            except Exception as e:
+                logger.error(f"Failed to load custom paths: {e}")
+                
+        return {}
+        
+    def set_custom_path(self, name: str, path: Path):
+        """Set a custom path"""
+        self.custom_paths[name] = Path(path)
+        self._save_custom_paths()
+        
+    def _save_custom_paths(self):
+        """Save custom path configurations"""
         try:
-            config_path = self.get_config_path(config_name)
-            with open(config_path, 'w') as f:
-                json.dump(config_data, f, indent=2)
-            print(f"✓ Configuration '{config_name}' created successfully!")
-            return True
+            paths = {k: str(v) for k, v in self.custom_paths.items()}
+            with open(self.paths_config_file, 'w') as f:
+                json.dump(paths, f, indent=2)
         except Exception as e:
-            print(f"✗ Error creating configuration: {str(e)}")
-            return False
-
-    def load_config(self, config_name: str) -> Optional[Dict[str, Any]]:
-        """Load a configuration file"""
+            logger.error(f"Failed to save custom paths: {e}")
+            
+    def get_dir(self, dir_type: str) -> Path:
+        """Get directory path (custom or default)"""
+        if dir_type in self.custom_paths:
+            return self.custom_paths[dir_type]
+            
+        dir_map = {
+            "config": self.config_dir,
+            "filter": self.filter_dir,
+            "preset": self.preset_dir,
+            "pipeline": self.pipeline_dir,
+            "audio": self.audio_dir,
+            "model": self.model_dir
+        }
+        
+        return dir_map.get(dir_type, self.base_dir / dir_type)
+        
+    def save_config(self, name: str, config: Dict[str, Any], 
+                   dir_type: str = "config") -> bool:
+        """
+        Save configuration to file
+        
+        Args:
+            name: Configuration name
+            config: Configuration dictionary
+            dir_type: Directory type
+            
+        Returns:
+            Success status
+        """
         try:
-            config_path = self.get_config_path(config_name)
-            if not config_path.exists():
-                print(f"✗ Configuration '{config_name}' not found!")
+            config_dir = self.get_dir(dir_type)
+            config_file = config_dir / f"{name}.json"
+            
+            # Add metadata
+            config["_metadata"] = {
+                "created": datetime.now().isoformat(),
+                "version": "1.0",
+                "type": dir_type
+            }
+            
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            logger.info(f"Saved {dir_type} configuration: {name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save configuration: {e}")
+            return False
+            
+    def load_config(self, name: str, dir_type: str = "config") -> Optional[Dict[str, Any]]:
+        """
+        Load configuration from file
+        
+        Args:
+            name: Configuration name
+            dir_type: Directory type
+            
+        Returns:
+            Configuration dictionary or None
+        """
+        try:
+            config_dir = self.get_dir(dir_type)
+            config_file = config_dir / f"{name}.json"
+            
+            if not config_file.exists():
+                logger.warning(f"Configuration not found: {name}")
                 return None
                 
-            with open(config_path, 'r') as f:
+            with open(config_file, 'r') as f:
                 config = json.load(f)
+                
+            # Remove metadata for return
+            config.pop("_metadata", None)
             
-            self.current_config = config
-            print(f"✓ Configuration '{config_name}' loaded successfully!")
+            logger.info(f"Loaded {dir_type} configuration: {name}")
             return config
+            
         except Exception as e:
-            print(f"✗ Error loading configuration: {str(e)}")
+            logger.error(f"Failed to load configuration: {e}")
             return None
-
-    def delete_config(self, config_name: str) -> bool:
-        """Delete a configuration file"""
+            
+    def list_configs(self, dir_type: str = "config") -> List[str]:
+        """List available configurations"""
+        config_dir = self.get_dir(dir_type)
+        configs = []
+        
+        for file in config_dir.glob("*.json"):
+            configs.append(file.stem)
+            
+        return sorted(configs)
+        
+    def delete_config(self, name: str, dir_type: str = "config") -> bool:
+        """Delete a configuration"""
         try:
-            config_path = self.get_config_path(config_name)
-            if config_path.exists():
-                config_path.unlink()
-                print(f"✓ Configuration '{config_name}' deleted successfully!")
+            config_dir = self.get_dir(dir_type)
+            config_file = config_dir / f"{name}.json"
+            
+            if config_file.exists():
+                config_file.unlink()
+                logger.info(f"Deleted {dir_type} configuration: {name}")
                 return True
-            else:
-                print(f"✗ Configuration '{config_name}' not found!")
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to delete configuration: {e}")
+            return False
+            
+    def export_config(self, name: str, export_path: Path, 
+                     dir_type: str = "config") -> bool:
+        """Export configuration to external file"""
+        try:
+            config = self.load_config(name, dir_type)
+            if not config:
                 return False
-        except Exception as e:
-            print(f"✗ Error deleting configuration: {str(e)}")
-            return False
-
-    def list_configs(self) -> list:
-        """List all available configurations"""
-        config_files = list(self.default_config_dir.glob("*.json"))
-        return [f.stem for f in config_files]
-
-    def update_config_dir(self, new_path: str) -> bool:
-        """Update the default configuration directory"""
-        try:
-            new_dir = Path(new_path)
-            new_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Move existing configs if any
-            for config_file in self.default_config_dir.glob("*.json"):
-                config_file.rename(new_dir / config_file.name)
                 
-            self.default_config_dir = new_dir
-            print(f"✓ Configuration directory updated to: {new_path}")
+            with open(export_path, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            logger.info(f"Exported {name} to {export_path}")
             return True
+            
         except Exception as e:
-            print(f"✗ Error updating configuration directory: {str(e)}")
+            logger.error(f"Failed to export configuration: {e}")
             return False
-
-    def get_model_config(self, step: str) -> Dict[str, Any]:
-        """Get model configuration for a specific step"""
-        if self.current_config and step in self.current_config:
-            return self.current_config[step]
-        return self.default_config[step]
-
-    def interactive_config_creation(self) -> Dict[str, Any]:
-        """Interactive configuration creation wizard"""
-        print("\n" + "="*60)
-        print("CONFIGURATION CREATION WIZARD")
-        print("="*60)
-        
-        config = self.default_config.copy()
-        
-        # Configure each step
-        steps = ["preprocessing", "transcription", "enhancement", "text_to_speech"]
-        
-        for step in steps:
-            print(f"\n--- Configuring {step.upper()} Model ---")
             
-            # Model type selection
-            print("\nAvailable model types:")
-            print("1. Local (HuggingFace)")
-            print("2. Cloud (API-based)")
-            model_type_choice = input("Select model type (1-2, default=1): ").strip() or "1"
-            
-            if model_type_choice == "2":
-                config[step]["model_type"] = "cloud"
-                self.configure_cloud_model(step, config)
-            else:
-                config[step]["model_type"] = "local"
-                self.configure_local_model(step, config)
-        
-        # Configure cloud API keys
-        self.configure_cloud_keys(config)
-        
-        return config
-
-    def configure_local_model(self, step: str, config: Dict[str, Any]):
-        """Configure local model settings"""
-        print("\nAvailable local models:")
-        models = self.available_providers["local"]["huggingface"]
-        for i, model in enumerate(models, 1):
-            print(f"{i}. {model}")
-        
+    def import_config(self, import_path: Path, name: Optional[str] = None,
+                     dir_type: str = "config") -> bool:
+        """Import configuration from external file"""
         try:
-            choice = int(input(f"Select model (1-{len(models)}, default=1): ").strip() or "1")
-            if 1 <= choice <= len(models):
-                config[step]["model_name"] = models[choice-1]
-                config[step]["provider"] = "huggingface"
-            else:
-                print("Invalid choice, using default.")
-        except ValueError:
-            print("Invalid input, using default.")
-
-    def configure_cloud_model(self, step: str, config: Dict[str, Any]):
-        """Configure cloud model settings"""
-        print("\nAvailable cloud providers:")
-        providers = list(self.available_providers["cloud"].keys())
-        for i, provider in enumerate(providers, 1):
-            print(f"{i}. {provider}")
-        
-        try:
-            choice = int(input(f"Select provider (1-{len(providers)}): ").strip())
-            if 1 <= choice <= len(providers):
-                provider = providers[choice-1]
-                config[step]["provider"] = provider
+            with open(import_path, 'r') as f:
+                config = json.load(f)
                 
-                # Model selection for provider
-                models = self.available_providers["cloud"][provider]
-                print(f"\nAvailable {provider} models:")
-                for i, model in enumerate(models, 1):
-                    print(f"{i}. {model}")
-                
-                model_choice = int(input(f"Select model (1-{len(models)}): ").strip())
-                if 1 <= model_choice <= len(models):
-                    config[step]["model_name"] = models[model_choice-1]
-                else:
-                    print("Invalid choice, using first model.")
-                    config[step]["model_name"] = models[0]
-            else:
-                print("Invalid choice, using local model as fallback.")
-                config[step]["model_type"] = "local"
-                config[step]["provider"] = "huggingface"
-                config[step]["model_name"] = self.default_config[step]["model_name"]
-        except ValueError:
-            print("Invalid input, using local model as fallback.")
-            config[step]["model_type"] = "local"
-            config[step]["provider"] = "huggingface"
-            config[step]["model_name"] = self.default_config[step]["model_name"]
-
-    def configure_cloud_keys(self, config: Dict[str, Any]):
-        """Configure cloud API keys"""
-        print("\n--- Cloud API Keys Configuration ---")
-        print("Leave blank to skip or keep existing value.")
-        
-        for provider in self.available_providers["cloud"]:
-            key_name = f"{provider}_api_key"
-            current_value = config["cloud_settings"].get(key_name, "")
-            masked_value = f"{current_value[:4]}...{current_value[-4:]}" if current_value else "Not set"
+            name = name or import_path.stem
+            return self.save_config(name, config, dir_type)
             
-            new_value = input(f"{provider.upper()} API Key [{masked_value}]: ").strip()
-            if new_value:
-                config["cloud_settings"][key_name] = new_value
+        except Exception as e:
+            logger.error(f"Failed to import configuration: {e}")
+            return False
+            
+    # Specialized methods for different configuration types
+    
+    def save_pipeline_config(self, name: str, config: Dict[str, Any]) -> bool:
+        """Save pipeline configuration"""
+        return self.save_config(name, config, "pipeline")
+        
+    def load_pipeline_config(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load pipeline configuration"""
+        return self.load_config(name, "pipeline")
+        
+    def save_audio_config(self, name: str, config: Dict[str, Any]) -> bool:
+        """Save audio configuration"""
+        return self.save_config(name, config, "audio")
+        
+    def load_audio_config(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load audio configuration"""
+        return self.load_config(name, "audio")
+        
+    def save_filter_preset(self, name: str, filters: Dict[str, Any]) -> bool:
+        """Save filter preset"""
+        return self.save_config(name, filters, "filter")
+        
+    def load_filter_preset(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load filter preset"""
+        return self.load_config(name, "filter")
+        
+    def save_model_preference(self, name: str, model_info: Dict[str, Any]) -> bool:
+        """Save model preference"""
+        return self.save_config(name, model_info, "model")
+        
+    def load_model_preference(self, name: str) -> Optional[Dict[str, Any]]:
+        """Load model preference"""
+        return self.load_config(name, "model")
+        
+    def get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration"""
+        if self.default_config_file.exists():
+            return self.load_config("default", "config") or {}
+            
+        # Return hardcoded defaults
+        return {
+            "mode": "podcast",
+            "model": "qwen3-4b",
+            "memory_profile": "medium_vram",
+            "chunk_size": 1000,
+            "output_format": "markdown",
+            "audio_model": "microsoft/speecht5_tts",
+            "sample_rate": 16000
+        }
+        
+    def set_default_config(self, config: Dict[str, Any]) -> bool:
+        """Set default configuration"""
+        return self.save_config("default", config, "config")
+        
+    def backup_configs(self, backup_name: Optional[str] = None) -> Optional[Path]:
+        """Backup all configurations"""
+        try:
+            backup_name = backup_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_dir = self.base_dir / "backups" / backup_name
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Copy all config directories
+            for dir_name in ["config", "filter", "preset", "pipeline", "audio", "model"]:
+                src = self.get_dir(dir_name)
+                if src.exists():
+                    dst = backup_dir / dir_name
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    
+            logger.info(f"Created backup: {backup_dir}")
+            return backup_dir
+            
+        except Exception as e:
+            logger.error(f"Failed to create backup: {e}")
+            return None
+            
+    def restore_backup(self, backup_name: str) -> bool:
+        """Restore configurations from backup"""
+        try:
+            backup_dir = self.base_dir / "backups" / backup_name
+            
+            if not backup_dir.exists():
+                logger.error(f"Backup not found: {backup_name}")
+                return False
+                
+            # Restore each directory
+            for dir_name in ["config", "filter", "preset", "pipeline", "audio", "model"]:
+                src = backup_dir / dir_name
+                if src.exists():
+                    dst = self.get_dir(dir_name)
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    
+            logger.info(f"Restored backup: {backup_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to restore backup: {e}")
+            return False
+            
+    def list_backups(self) -> List[str]:
+        """List available backups"""
+        backup_base = self.base_dir / "backups"
+        
+        if not backup_base.exists():
+            return []
+            
+        backups = []
+        for backup_dir in backup_base.iterdir():
+            if backup_dir.is_dir():
+                backups.append(backup_dir.name)
+                
+        return sorted(backups, reverse=True)

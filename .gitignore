@@ -1,3 +1,7 @@
+output/
+offload/
+**/output/
+**/offload/
 **/logs/
 */logs/
 logs/

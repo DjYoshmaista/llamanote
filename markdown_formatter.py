@@ -7,10 +7,10 @@ import re
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
-from logging_config import get_logger
+from loggerConf import get_logger_conf
 from config import MARKDOWN_STYLES, MarkdownStyle
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 class EmotionType(Enum):

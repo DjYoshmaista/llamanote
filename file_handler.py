@@ -12,7 +12,7 @@ from datetime import datetime
 import shutil
 from dataclasses import dataclass, asdict
 
-from logging_config import get_logger, log_execution_time
+from loggerConf import get_logger_conf, log_execution_time
 from config import (
     OUTPUT_DIR,
     CACHE_DIR,
@@ -23,7 +23,7 @@ from config import (
     INCLUDE_METADATA
 )
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 @dataclass
@@ -443,7 +443,7 @@ class BatchFileManager:
             file_handler: FileHandler instance to use
         """
         self.file_handler = file_handler or FileHandler()
-        self.logger = get_logger(f"{__name__}.BatchManager")
+        self.logger = get_logger_conf(f"{__name__}.BatchManager")
         
     def collect_input_files(self,
                            input_paths: Union[List[Path], Path],

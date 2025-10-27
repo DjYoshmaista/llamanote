@@ -117,7 +117,7 @@ class ContextLogger:
             self.info(f"Performance: {operation} completed in {elapsed:.3f}s | {metrics_str}")
 
 
-def get_logger(name: str, enable_performance: bool = True) -> ContextLogger:
+def get_logger_conf(name: str, enable_performance: bool = True) -> ContextLogger:
     """Factory function to create a context logger"""
     return ContextLogger(name, enable_performance)
 
@@ -128,7 +128,7 @@ def log_execution_time(logger: Optional[ContextLogger] = None):
         @wraps(func)
         def wrapper(*args, **kwargs):
             start_time = time.time()
-            func_logger = logger or get_logger(func.__module__)
+            func_logger = logger or get_logger_conf(func.__module__)
             func_logger.debug(f"Starting {func.__name__}")
             
             try:
@@ -155,7 +155,7 @@ def log_resource_usage(logger: Optional[ContextLogger] = None):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            func_logger = logger or get_logger(func.__module__)
+            func_logger = logger or get_logger_conf(func.__module__)
             
             try:
                 import torch
