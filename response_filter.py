@@ -7,7 +7,8 @@ import re
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from loggerConf import get_logger_conf
-from config import THINKING_PATTERNS, ModelConfig
+from config import THINKING_PATTERNS
+from model_registry import ModelEntry
 
 logger = get_logger_conf(__name__)
 
@@ -31,7 +32,7 @@ class FilterResult:
 class ResponseFilter:
     """Filters thinking tokens and unwanted patterns from LLM responses"""
     
-    def __init__(self, model_config: Optional[ModelConfig] = None):
+    def __init__(self, model_config: Optional[ModelEntry] = None):
         self.model_config = model_config
         self.custom_patterns: List[Tuple[str, str]] = []
         self.thinking_patterns = THINKING_PATTERNS.copy()
@@ -224,7 +225,7 @@ class ResponseFilter:
 class ChunkedResponseFilter:
     """Specialized filter for handling chunked responses"""
     
-    def __init__(self, model_config: Optional[ModelConfig] = None):
+    def __init__(self, model_config: Optional[ModelEntry] = None):
         self.filter = ResponseFilter(model_config)
         self.chunk_history: List[str] = []
         self.continuation_patterns = [
@@ -336,7 +337,7 @@ class ChunkedResponseFilter:
 class DynamicTokenLimitCalculator:
     """Calculate optimal token limits based on content and model constraints"""
     
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelEntry):
         self.model_config = model_config
         self.base_prompt_tokens = 500  # Estimated tokens for system prompt
         

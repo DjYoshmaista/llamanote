@@ -16,7 +16,7 @@ from enum import Enum
 import logging # Import logging for setting level in verbose mode
 
 # --- LlamaNote Modules ---
-from loggerConf import ConsoleOutput, get_logger_conf
+from loggerConf import ConsoleOutput, get_logger_conf, LoggingProgress
 from config_manager import ConfigManager
 from config_base import (
     BASE_DIR, OUTPUT_DIR, CACHE_DIR, OFFLOAD_DIR,
@@ -37,7 +37,7 @@ from pipeline_types import (
 from model_hub import InteractiveModelBrowser, ModelHub, ModelInfo as HFModelInfo
 from audio_generator import (
     AudioConfig, AudioResult, AudioBackend,
-    LocalAudioBackend, OpenAITTSBackend, get_audio_backend, LoggingProgress # Import LoggingProgress here
+    LocalAudioBackend, OpenAITTSBackend, get_audio_backend # Import LoggingProgress here
 )
 from processing_pipeline import ProcessingPipeline # Keep this for instantiation
 from text_processor import ChunkingStrategy
@@ -175,9 +175,9 @@ class AppState:
     output_filename: Optional[str] = None
     processing_mode: ProcessingMode = ProcessingMode.PODCAST
     text_model_provider: str = "local"
-    text_model_specifier: str = DEFAULT_MODEL # This should be a key initially
+    text_model_specifier: str = DEFAULT_MODEL
     audio_model_provider: str = "local"
-    audio_model_specifier: str = "microsoft/speecht5_tts" # Example default TTS
+    audio_model_specifier: str = "microsoft/speecht5_tts"
     hyperparameters: HyperparameterConfig = field(default_factory=HyperparameterConfig)
     audio_config: AudioConfig = field(default_factory=AudioConfig)
     stages_to_run: List[str] = field(default_factory=lambda: list(PIPELINE_STAGES))
@@ -190,23 +190,11 @@ class AppState:
     max_gpu_memory: str = "10GB"
     max_cpu_memory: str = "30GB"
 
-    def __post_init__(self):
-        # Resolve default model key to ID on init if possible
-        registry = get_registry()
-        default_entry = registry.get_by_key(DEFAULT_MODEL)
-        if default_entry:
-            self.text_model_specifier = default_entry.model_id
-        else:
-            # Handle case where default key doesn't resolve (registry empty?)
-            logger.warning(f"Default model key '{DEFAULT_MODEL}' not found in registry. Using key as specifier.")
-            self.text_model_specifier = DEFAULT_MODEL # Keep the key as specifier
-
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the app state to a dictionary for saving."""
-        # Need to handle Path objects and Enums correctly
         return {
-            "input_files": [str(f.resolve()) for f in self.input_files], # Save absolute paths as strings
-            "output_dir": str(self.output_dir.resolve()),
+            "input_files": [str(f) for f in self.input_files], # Save as strings
+            "output_dir": str(self.output_dir),
             "output_filename": self.output_filename,
             "processing_mode": self.processing_mode.value, # Save enum value
             "text_model_provider": self.text_model_provider,
@@ -214,13 +202,16 @@ class AppState:
             "audio_model_provider": self.audio_model_provider,
             "audio_model_specifier": self.audio_model_specifier,
             "hyperparameters": asdict(self.hyperparameters),
-            "audio_config": asdict(self.audio_config), # Use helper if needed for complex types
-            "stages_to_run": self.stages_to_run, # Use current state directly
-            "run_audio_generation": self.run_audio_generation, # Use current state directly
+            "audio_config": asdict(self.audio_config),
+            # CORRECTED: Use self directly
+            "stages_to_run": self.stages_to_run,
+            "run_audio_generation": self.run_audio_generation,
+            # END CORRECTION
             "quantization": self.quantization,
             "gpu_layers": self.gpu_layers,
             "max_gpu_memory": self.max_gpu_memory,
             "max_cpu_memory": self.max_cpu_memory
+            # NOTE: Cloud API keys are intentionally NOT saved in presets
         }
 
     def from_dict(self, data: Dict[str, Any]):
@@ -254,42 +245,41 @@ class AppState:
             # Optionally reset to defaults on load error?
             # self.__init__() # Reset to defaults
 
-
     def get_pipeline_config(self) -> PipelineConfig:
         """Creates a PipelineConfig based on current AppState."""
-        # Use the specifier from state (which should be resolved ID or path)
-        model_name_meta = f"{self.state.text_model_provider}:{self.state.text_model_specifier}"
+        model_name_meta = f"{self.text_model_provider}:{self.text_model_specifier}"
 
-        # Create mock args namespace for the helper functions
-        # This is slightly awkward, consider moving helpers or refactoring them
+        # Create mock args namespace just for the helpers
+        # Ensure torch is imported at the top of menu_system.py if not already
+        import torch
         mock_args = argparse.Namespace(
             quantization=self.quantization,
-            compute_dtype='bfloat16', # Make configurable if needed
+            compute_dtype='bfloat16', # TODO: Make this configurable in AppState
             gpu_layers=self.gpu_layers,
-            no_layer_split=(not ENABLE_LAYER_SPLITTING), # Use base config
+            no_layer_split=False, # TODO: Make this configurable in AppState
             max_gpu_memory=self.max_gpu_memory,
             max_cpu_memory=self.max_cpu_memory
         )
 
-        # Create Quantization and LayerSplit configs using helpers
-        q_config = create_quantization_config(mock_args)
-        ls_config = create_layer_split_config(mock_args)
+        # Assuming create_quantization_config and create_layer_split_config
+        # are defined correctly later in menu_system.py or imported.
+        # Ensure PipelineConfig is imported from pipeline_types
+        from pipeline_types import PipelineConfig, ChunkingStrategy
 
         return PipelineConfig(
             mode=self.processing_mode,
-            model_name=model_name_meta, # For logging/metadata
+            model_name=model_name_meta,
             model_provider=self.text_model_provider,
-            model_specifier=self.text_model_specifier, # Actual ID/path
-            quantization_config=q_config, # Pass generated config
-            layer_split_config=ls_config, # Pass generated config
-            # memory_profile is redundant now
-            chunking_strategy=ChunkingStrategy.WORD_BOUNDARY, # Make configurable
-            chunk_size=1000, # Make configurable
-            markdown_style=self.processing_mode.value, # Or separate config
-            output_format="markdown", # Make configurable
-            hyperparameters=self.hyperparameters # Pass current hyperparams
+            model_specifier=self.text_model_specifier,
+            quantization_config=create_quantization_config(mock_args),
+            layer_split_config=create_layer_split_config(mock_args),
+            memory_profile="medium_vram", # TODO: This is now redundant, remove later
+            chunking_strategy=ChunkingStrategy.WORD_BOUNDARY, # TODO: Make configurable in AppState
+            chunk_size=1000, # TODO: Make configurable in AppState
+            markdown_style=self.processing_mode.value,
+            output_format="markdown", # TODO: Make configurable in AppState
+            hyperparameters=self.hyperparameters
         )
-
 
 class MenuSystem:
     def __init__(self):

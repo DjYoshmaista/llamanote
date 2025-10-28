@@ -24,7 +24,7 @@ import httpx # Required for Anthropic proxy setting
 
 # --- LlamaNote Modules ---
 from loggerConf import get_logger_conf, log_execution_time, log_resource_usage, ConsoleOutput, LoggingProgress
-from config import ModelConfig, MemoryConfig # Keep ModelConfig for local filter/calc, MemoryConfig legacy
+from config import MemoryConfig # Keep ModelEntry for local filter/calc, MemoryConfig legacy
 from config_base import (
     FALLBACK_MODEL,
     DEFAULT_MODEL,
@@ -43,7 +43,7 @@ from pipeline_types import (
 )
 from hyperparameters import HyperparameterConfig
 from response_filter import ResponseFilter, DynamicTokenLimitCalculator
-from model_registry import get_model_config
+from model_registry import get_model_config, ModelEntry
 
 # --- Backend-specific Imports (Conditional) ---
 try:
@@ -134,7 +134,7 @@ class LocalTransformerBackend(LLMBackend):
 
     def __init__(self,
                  model_id: str,
-                 model_config: ModelConfig, # Needs the specific ModelConfig for filter/calc
+                 model_config: ModelEntry, # Needs the specific ModelEntry for filter/calc
                  quantization_config: Optional[QuantizationConfig] = None,
                  layer_split_config: Optional[LayerSplitConfig] = None,
                  hyperparameters: Optional[HyperparameterConfig] = None,
@@ -180,7 +180,7 @@ class LocalTransformerBackend(LLMBackend):
         self.response_filter = ResponseFilter(self.model_config)
         self.token_calculator = DynamicTokenLimitCalculator(
             self.model_config,
-            # Use max_context from the *specific* ModelConfig passed to init
+            # Use max_context from the *specific* ModelEntry passed to init
             model_max_context=self.model_config.max_context
         )
 
@@ -1378,7 +1378,7 @@ def get_llm_backend(provider: str,
                       hyperparameters: HyperparameterConfig,
                       # Kwargs for local-specific configs
                       # Add model_config required by LocalTransformerBackend
-                      model_config: Optional[ModelConfig] = None,
+                      model_config: Optional[ModelEntry] = None,
                       quantization_config: Optional[QuantizationConfig] = None,
                       layer_split_config: Optional[LayerSplitConfig] = None,
                       memory_config: Optional[MemoryConfig] = None # Keep for legacy compatibility
@@ -1392,11 +1392,11 @@ def get_llm_backend(provider: str,
             # This is a local Hugging Face Transformers model
             # Ensure model_config is provided
             if model_config is None:
-                 logger.warning(f"ModelConfig not provided for local model {model_specifier}. Attempting to fetch from registry.")
+                 logger.warning(f"ModelEntry not provided for local model {model_specifier}. Attempting to fetch from registry.")
                  model_entry = get_model_config(model_specifier)
                  if model_entry:
-                      # Convert ModelEntry to ModelConfig
-                      model_config = ModelConfig(
+                      # Convert ModelEntry to ModelEntry
+                      model_config = ModelEntry(
                           name=model_entry.name, model_id=model_entry.model_id,
                           supports_thinking=model_entry.supports_thinking,
                           thinking_tokens=model_entry.thinking_tokens or [],
@@ -1407,13 +1407,13 @@ def get_llm_backend(provider: str,
                           quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
                       )
                  else:
-                      logger.error(f"Model {model_specifier} not found in registry and no ModelConfig provided.")
-                      raise ValueError(f"Missing ModelConfig for local model {model_specifier}")
+                      logger.error(f"Model {model_specifier} not found in registry and no ModelEntry provided.")
+                      raise ValueError(f"Missing ModelEntry for local model {model_specifier}")
 
 
             return LocalTransformerBackend(
                 model_id=model_specifier,
-                model_config=model_config, # Pass the resolved ModelConfig
+                model_config=model_config, # Pass the resolved ModelEntry
                 quantization_config=quantization_config,
                 layer_split_config=layer_split_config,
                 hyperparameters=hyperparameters,

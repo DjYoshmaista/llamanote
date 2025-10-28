@@ -13,7 +13,7 @@ from datetime import datetime # Added for timestamping output
 from loggerConf import get_logger_conf, LoggingProgress, MemoryMonitor, ConsoleOutput
 from config import ( # Keep specific config values if needed, but PipelineConfig comes from types
     PREPROCESS_PROMPT,
-    MODELS, # Keep for ModelConfig reference if filter needs it
+    MODELS, # Keep for ModelEntry reference if filter needs it
     DEFAULT_MODEL,
     MEMORY_PROFILES,
     MARKDOWN_STYLES,
@@ -41,8 +41,8 @@ from markdown_formatter import MarkdownFormatter, PodcastFormatter, TechnicalFor
 from file_handler import FileHandler
 from hyperparameters import HyperparameterConfig
 from model_registry import get_registry, get_model_config # Import registry functions
-# Import specific ModelConfig from config, needed by ResponseFilter
-from config import ModelConfig
+# Import specific ModelEntry from config, needed by ResponseFilter
+from model_registry import ModelEntry
 
 logger = get_logger_conf(__name__)
 
@@ -91,13 +91,13 @@ class ProcessingPipeline:
             strategy=self.config.chunking_strategy
         )
 
-        # Response filter - needs ModelConfig potentially
+        # Response filter - needs ModelEntry potentially
         model_config_for_filter = None
         if self.config.model_provider == "local":
              model_entry = get_model_config(self.config.model_specifier)
              if model_entry:
-                  # Convert ModelEntry to ModelConfig (from config.py)
-                  model_config_for_filter = ModelConfig(
+                  # Convert ModelEntry to ModelEntry (from config.py)
+                  model_config_for_filter = ModelEntry(
                        name=model_entry.name, model_id=model_entry.model_id,
                        supports_thinking=model_entry.supports_thinking,
                        thinking_tokens=model_entry.thinking_tokens or [],
@@ -108,8 +108,8 @@ class ProcessingPipeline:
                        quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
                   )
              else:
-                 # Create a default ModelConfig if not found in registry
-                 model_config_for_filter = ModelConfig(name="unknown", model_id=self.config.model_specifier)
+                 # Create a default ModelEntry if not found in registry
+                 model_config_for_filter = ModelEntry(name="unknown", model_id=self.config.model_specifier)
 
 
         self.response_filter = ChunkedResponseFilter(

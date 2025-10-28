@@ -7,13 +7,15 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
+import torch # Import needed for MemoryConfig dtype, if used
+
 # Import base config (no circular dependencies)
 from config_base import (
     BASE_DIR, OUTPUT_DIR, LOG_DIR, CACHE_DIR, OFFLOAD_DIR,
     QUANTIZATION_OPTIONS, DEFAULT_QUANTIZATION,
     ENABLE_LAYER_SPLITTING, DEFAULT_GPU_LAYERS,
     CHUNK_SIZE_MIN, CHUNK_SIZE_MAX, CHUNK_SIZE_DEFAULT, CHUNK_OVERLAP,
-    DEFAULT_MODEL, FALLBACK_MODEL,
+    DEFAULT_MODEL, FALLBACK_MODEL, # DEFAULT_MODEL is now just a key string
     MAX_PDF_SIZE_MB, MAX_CHARS_PER_FILE, SUPPORTED_FORMATS,
     BATCH_PROCESSING_ENABLED, MAX_PARALLEL_FILES,
     OUTPUT_FORMAT_OPTIONS, DEFAULT_OUTPUT_FORMAT,
@@ -25,10 +27,12 @@ from config_base import (
 
 # Type checking imports (not evaluated at runtime)
 if TYPE_CHECKING:
+    # Use the centralized types now
+    from pipeline_types import QuantizationConfig, LayerSplitConfig
     from hyperparameters import HyperparameterConfig
     from model_registry import ModelEntry
 
-# Original preprocessing prompt
+# Original preprocessing prompt (kept as is)
 PREPROCESS_PROMPT = """
 You are a world class text pre-processor, here is the raw data from a PDF. Please parse and return it in a way that is crispy and usable to send to a podcast writer.
 The raw data is riddled with new line breaks, LaTeX math, and you will see fluff that you should remove completely. Remove, or alternatively translate, any details or data that would be lost, useless, misunderstood, or simply lost in translation from a pure text and raw data format to the audio podcast format.
@@ -42,125 +46,107 @@ ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS 
 Here's the text:
 """
 
-# Model configurations (legacy - kept for backward compatibility)
-@dataclass
-class ModelConfig:
-    """Configuration for different model options"""
-    name: str
-    model_id: str
-    supports_thinking: bool = False
-    thinking_tokens: List[str] = field(default_factory=list)
-    max_context: int = 32768
-    optimal_chunk_size: int = 1000
-    temperature: float = 0.7
-    top_p: float = 0.9
-    max_new_tokens: Optional[int] = None
-    quantization_support: List[str] = field(default_factory=lambda: ["4bit", "8bit"])
+# --- Deprecated ModelConfig ---
+# @dataclass
+# class ModelConfig:
+#     """(DEPRECATED - Use ModelEntry from model_registry instead)"""
+#     name: str
+#     model_id: str
+#     supports_thinking: bool = False
+#     thinking_tokens: List[str] = field(default_factory=list)
+#     max_context: int = 32768
+#     optimal_chunk_size: int = 1000
+#     temperature: float = 0.7
+#     top_p: float = 0.9
+#     max_new_tokens: Optional[int] = None
+#     quantization_support: List[str] = field(default_factory=lambda: ["4bit", "8bit"])
 
+# --- Dynamic MODELS dict for CLI choices ---
+# This dict maps short keys (like 'qwen3-4b') to model IDs.
+# It's populated dynamically from the registry for predefined models.
 
-# Legacy MODELS dict - dynamically populated from registry
-def _get_legacy_models() -> Dict[str, ModelConfig]:
-    """Get legacy MODELS dict from registry for backward compatibility"""
+MODELS: Dict[str, str] = {} # Initialize as empty
+
+def reload_models():
+    """Reload MODELS dict from registry's predefined models"""
+    global MODELS
     try:
         from model_registry import get_registry
-        
         registry = get_registry()
-        models = {}
-        
-        # Get predefined models
-        for entry in registry.list_models(predefined_only=True):
-            # Convert to old ModelConfig format
-            key = entry.model_id.split('/')[-1].lower().replace('-', '').replace('.', '')
-            if 'qwen' in key:
-                key = 'qwen3-4b'
-            elif 'gemma' in key:
-                key = 'gemma-270m'
-            elif 'llama' in key:
-                key = 'llama-3.2-1b'
-            
-            models[key] = ModelConfig(
-                name=entry.name,
-                model_id=entry.model_id,
-                supports_thinking=entry.supports_thinking,
-                thinking_tokens=entry.thinking_tokens or [],
-                max_context=entry.max_context,
-                optimal_chunk_size=entry.optimal_chunk_size,
-                temperature=entry.temperature,
-                top_p=entry.top_p,
-                max_new_tokens=entry.max_new_tokens,
-                quantization_support=entry.quantization_support or ["4bit", "8bit"]
-            )
-        
-        return models
-    except:
-        # Fallback if registry not available
-        return {
-            "qwen3-4b": ModelConfig(
-                name="Qwen3-4B Thinking",
-                model_id="Qwen/Qwen2.5-4B-Instruct",
-                supports_thinking=True,
-                thinking_tokens=["<think>", "</think>"],
-                max_context=32768,
-                optimal_chunk_size=1500
-            )
+        MODELS = {}
+        predefined = registry.list_models(predefined_only=True)
+        for entry in predefined:
+            if entry.short_key:
+                MODELS[entry.short_key] = entry.model_id
+            else:
+                # Fallback key if short_key is missing (should not happen for predefined)
+                fallback_key = entry.model_id.split('/')[-1].lower().replace('-', '').replace('.', '')
+                MODELS[fallback_key] = entry.model_id
+        # Ensure default and fallback keys exist if possible
+        if DEFAULT_MODEL not in MODELS:
+             entry = registry.get_by_key(DEFAULT_MODEL)
+             if entry: MODELS[DEFAULT_MODEL] = entry.model_id
+        if FALLBACK_MODEL not in MODELS:
+             entry = registry.get_by_key(FALLBACK_MODEL)
+             if entry: MODELS[FALLBACK_MODEL] = entry.model_id
+
+        # print(f"Reloaded MODELS dict: {list(MODELS.keys())}") # Debug print
+    except Exception as e:
+        print(f"Warning: Could not reload MODELS dict from registry: {e}")
+        # Provide minimal fallback if registry fails
+        MODELS = {
+            DEFAULT_MODEL: "Qwen/Qwen3-4B-Instruct-2507",
+            FALLBACK_MODEL: "google/gemma-3-270m"
         }
 
+# Initial population
+reload_models()
 
-# Dynamic MODELS dict
-MODELS = _get_legacy_models()
 
-
-# Memory optimization settings
+# Memory optimization settings (Legacy - may be replaced by LayerSplitConfig/QuantizationConfig)
 @dataclass
 class MemoryConfig:
-    """Memory optimization configuration"""
+    """(LEGACY) Memory optimization configuration - Prefer direct QuantizationConfig/LayerSplitConfig"""
     use_quantization: bool = True
-    quantization_type: str = "4bit"
-    max_gpu_memory: str = "4GB"
-    max_cpu_memory: str = "30GB"
-    use_flash_attention: bool = True
-    use_gradient_checkpointing: bool = True
-    offload_to_disk: bool = True
-    batch_size: int = 16
+    quantization_type: str = "4bit" # Should match DEFAULT_QUANTIZATION
+    max_gpu_memory: str = "10GB" # Example default
+    max_cpu_memory: str = "30GB" # Example default
+    use_flash_attention: bool = True # Specific to transformers backend
+    use_gradient_checkpointing: bool = False # Usually for training
+    offload_to_disk: bool = True # Maps to LayerSplitConfig offload folder
+    batch_size: int = 1 # Relevant for batch processing
 
 
+# Example memory profiles (Can be used to create Quantization/LayerSplit configs)
 MEMORY_PROFILES = {
-    "low_vram": MemoryConfig(
-        use_quantization=True,
-        quantization_type="4bit",
-        max_gpu_memory="4GB",
-        max_cpu_memory="16GB",
-        use_flash_attention=True,
-        batch_size=1
-    ),
-    "medium_vram": MemoryConfig(
-        use_quantization=True,
-        quantization_type="4bit",
-        max_gpu_memory="4GB",
-        max_cpu_memory="24GB",
-        use_flash_attention=True,
-        batch_size=1
-    ),
-    "high_vram": MemoryConfig(
-        use_quantization=False,
-        quantization_type="8bit",
-        max_gpu_memory="24GB",
-        max_cpu_memory="32GB",
-        use_flash_attention=True,
-        batch_size=2
-    ),
-    "cpu_only": MemoryConfig(
-        use_quantization=True,
-        quantization_type="8bit",
-        max_gpu_memory="0GB",
-        max_cpu_memory="64GB",
-        use_flash_attention=False,
-        batch_size=1
-    )
+    "low_vram": {
+        "quantization": "4bit",
+        "max_gpu_memory": "4GB",
+        "max_cpu_memory": "16GB",
+        "gpu_layers": -1 # Auto layers for GGUF
+    },
+    "medium_vram": {
+        "quantization": DEFAULT_QUANTIZATION,
+        "max_gpu_memory": "10GB",
+        "max_cpu_memory": "30GB",
+        "gpu_layers": DEFAULT_GPU_LAYERS
+    },
+    "high_vram": {
+        "quantization": "none", # Or maybe 8bit
+        "max_gpu_memory": "24GB",
+        "max_cpu_memory": "64GB",
+        "gpu_layers": -1
+    },
+    "cpu_only": {
+        "quantization": "none", # BNB Quantization usually needs GPU
+        "max_gpu_memory": "0GB",
+        "max_cpu_memory": "64GB",
+        "gpu_layers": 0 # Explicitly CPU only for GGUF
+    }
 }
 
 
-# Markdown formatting options
+# Markdown formatting options (Kept as is)
 @dataclass
 class MarkdownStyle:
     """Markdown formatting style configuration"""
@@ -169,183 +155,93 @@ class MarkdownStyle:
     emotion_markers: Dict[str, str]
     structure_markers: Dict[str, str]
 
-
 MARKDOWN_STYLES = {
     "podcast": MarkdownStyle(
         name="Podcast Script",
         emphasis_markers={
-            "strong": "**{}**",
-            "emphasis": "*{}*",
-            "pause": "... {} ...",
-            "slow": "~{}~",
-            "fast": "^{}^"
+            "strong": "**{}**", "emphasis": "*{}*", "pause": "... {} ...",
+            "slow": "~{}~", "fast": "^{}^"
         },
         emotion_markers={
-            "excited": "🎉 {}",
-            "thoughtful": "🤔 {}",
-            "serious": "😐 {}",
-            "humorous": "😄 {}",
-            "surprised": "😲 {}",
-            "questioning": "❓ {}"
+            "excited": "🎉 {}", "thoughtful": "🤔 {}", "serious": "😐 {}",
+            "humorous": "😄 {}", "surprised": "😲 {}", "questioning": "❓ {}"
         },
         structure_markers={
-            "section": "\n## {}\n",
-            "subsection": "\n### {}\n",
-            "transition": "\n---\n",
-            "speaker_change": "\n**[Speaker {}]:**\n"
+            "section": "\n## {}\n", "subsection": "\n### {}\n",
+            "transition": "\n---\n", "speaker_change": "\n**[Speaker {}]:**\n"
         }
     ),
     "narrative": MarkdownStyle(
         name="Narrative Style",
-        emphasis_markers={
-            "strong": "**{}**",
-            "emphasis": "*{}*",
-            "whisper": "_{}_",
-            "shout": "***{}***"
-        },
-        emotion_markers={
-            "narrator": "📖 {}",
-            "dialogue": "💬 {}",
-            "action": "🎬 {}",
-            "description": "🖼️ {}"
-        },
-        structure_markers={
-            "chapter": "\n# {}\n",
-            "scene": "\n## {}\n",
-            "break": "\n* * *\n"
-        }
+        emphasis_markers={"strong": "**{}**", "emphasis": "*{}*", "whisper": "_{}_", "shout": "***{}***"},
+        emotion_markers={"narrator": "📖 {}", "dialogue": "💬 {}", "action": "🎬 {}", "description": "🖼️ {}"},
+        structure_markers={"chapter": "\n# {}\n", "scene": "\n## {}\n", "break": "\n* * *\n"}
     ),
     "technical": MarkdownStyle(
         name="Technical Documentation",
-        emphasis_markers={
-            "code": "`{}`",
-            "important": "**⚠️ {}**",
-            "note": "📝 *{}*",
-            "tip": "💡 {}"
-        },
+        emphasis_markers={"code": "`{}`", "important": "**⚠️ {}**", "note": "📝 *{}*", "tip": "💡 {}"},
         emotion_markers={},
-        structure_markers={
-            "section": "\n## {}\n",
-            "code_block": "\n```\n{}\n```\n",
-            "list_item": "- {}"
-        }
+        structure_markers={"section": "\n## {}\n", "code_block": "\n```\n{}\n```\n", "list_item": "- {}"}
     )
 }
 
 
-# Response filtering patterns
+# Response filtering patterns (Kept as is, filter uses registry info now)
 THINKING_PATTERNS = [
-    # Common thinking model patterns
     (r"<think>(.*?)</think>", ""),
     (r"<\|thinking\|>(.*?)<\|/thinking\|>", ""),
     (r"\[THINK\](.*?)\[/THINK\]", ""),
     (r"<thinking>(.*?)</thinking>", ""),
     (r"```thinking(.*?)```", ""),
-    # Chain of thought patterns
     (r"Let me think.*?(?=\n\n)", ""),
     (r"Step \d+:.*?(?=\n\n)", ""),
     (r"First,.*?(?=\n\n)", ""),
-    # Internal monologue patterns
     (r"\(thinking:.*?\)", ""),
     (r"\[internal:.*?\]", ""),
 ]
 
 
-# Logging configuration
+# Logging configuration (Kept as is)
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "detailed": {
-            "format": "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S"
-        },
-        "simple": {
-            "format": "%(asctime)s - %(levelname)s - %(message)s",
-            "datefmt": "%H:%M:%S"
-        }
+        "detailed": {"format": "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s", "datefmt": "%Y-%m-%d %H:%M:%S"},
+        "simple": {"format": "%(asctime)s - %(levelname)s - %(message)s", "datefmt": "%H:%M:%S"}
     },
     "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "level": "INFO",
-            "formatter": "simple",
-            "stream": "ext://sys.stdout"
-        },
-        "file": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": "DEBUG",
-            "formatter": "detailed",
-            "filename": str(LOG_DIR / "llamanote.log"),
-            "maxBytes": 10485760,
-            "backupCount": 5
-        },
-        "error_file": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": "ERROR",
-            "formatter": "detailed",
-            "filename": str(LOG_DIR / "errors.log"),
-            "maxBytes": 10485760,
-            "backupCount": 5
-        }
+        "console": {"class": "logging.StreamHandler", "level": "INFO", "formatter": "simple", "stream": "ext://sys.stdout"},
+        "file": {"class": "logging.handlers.RotatingFileHandler", "level": "DEBUG", "formatter": "detailed", "filename": str(LOG_DIR / "llamanote.log"), "maxBytes": 10485760, "backupCount": 5},
+        "error_file": {"class": "logging.handlers.RotatingFileHandler", "level": "ERROR", "formatter": "detailed", "filename": str(LOG_DIR / "errors.log"), "maxBytes": 10485760, "backupCount": 5}
     },
     "loggers": {
-        "llamanote": {
-            "level": "DEBUG",
-            "handlers": ["console", "file", "error_file"],
-            "propagate": False
-        },
-        "transformers": {
-            "level": "WARNING",
-            "handlers": ["console", "file"]
-        },
-        "torch": {
-            "level": "WARNING",
-            "handlers": ["console", "file"]
-        }
+        "llamanote": {"level": "DEBUG", "handlers": ["console", "file", "error_file"], "propagate": False},
+        "transformers": {"level": "WARNING", "handlers": ["console", "file"]},
+        "torch": {"level": "WARNING", "handlers": ["console", "file"]}
     },
-    "root": {
-        "level": "INFO",
-        "handlers": ["console", "file"]
-    }
+    "root": {"level": "INFO", "handlers": ["console", "file"]}
 }
 
+# --- Lazy Loading Helpers ---
+# These now correctly point to the moved/centralized definitions
 
-# Lazy loading functions to avoid circular imports
 def get_default_hyperparams():
     """Lazy load default hyperparameters"""
     from hyperparameters import HyperparameterConfig
     return HyperparameterConfig()
 
-
 def get_model_hyperparams(model_identifier: str):
-    """
-    Get hyperparameters for a specific model
-    
-    Args:
-        model_identifier: Model ID or key
-        
-    Returns:
-        HyperparameterConfig
-    """
+    """Get hyperparameters based on model entry in registry"""
     from hyperparameters import HyperparameterConfig
     from model_registry import get_model_config
-    
-    # Try to get from registry
-    model_entry = get_model_config(model_identifier)
-    
+
+    model_entry = get_model_config(model_identifier) # Use registry function
     if model_entry:
+        # Create HyperparameterConfig from ModelEntry defaults
         return HyperparameterConfig(
             temperature=model_entry.temperature,
             top_p=model_entry.top_p,
-            max_new_tokens=model_entry.max_new_tokens or 2048
+            max_new_tokens=model_entry.max_new_tokens or 2048 # Default if None
+            # Add other relevant mappings if ModelEntry stores more defaults
         )
-    
-    # Default
-    return HyperparameterConfig()
-
-
-def reload_models():
-    """Reload models from registry"""
-    global MODELS
-    MODELS = _get_legacy_models()
+    return HyperparameterConfig() # Return default if not found
