@@ -276,29 +276,45 @@ class MemoryMonitor:
             
         try:
             import psutil
+            import gc # Import gc
+            
+            # Run garbage collection before checking memory
+            gc.collect() 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             process = psutil.Process()
             current_memory = process.memory_info().rss / 1024 / 1024
             delta = current_memory - self.baseline_memory
             
+            log_message = (
+                f"Memory check during {operation}: "
+                f"Current RAM={current_memory:.1f}MB, "
+                f"Delta={delta:.1f}MB"
+            )
+
+            # Try to get GPU memory as well
+            try:
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024
+                    gpu_cached = torch.cuda.memory_reserved() / 1024 / 1024
+                    log_message += (
+                        f" | GPU Allocated={gpu_memory:.1f}MB, "
+                        f"GPU Cached/Reserved={gpu_cached:.1f}MB"
+                    )
+            except Exception:
+                pass # Fail silently if torch/cuda check fails
+            
+            # Log at DEBUG level by default
+            self.logger.debug(log_message)
+
+            # Log at WARNING level only if threshold exceeded
             if delta > self.threshold_mb:
                 self.logger.warning(
                     f"High memory usage during {operation}: "
-                    f"Current={current_memory:.1f}MB, "
+                    f"Current RAM={current_memory:.1f}MB, "
                     f"Delta={delta:.1f}MB"
                 )
-                
-                # Try to get GPU memory as well
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024
-                        gpu_cached = torch.cuda.memory_reserved() / 1024 / 1024
-                        self.logger.warning(
-                            f"GPU memory: Allocated={gpu_memory:.1f}MB, "
-                            f"Cached={gpu_cached:.1f}MB"
-                        )
-                except:
-                    pass
                     
         except Exception as e:
             self.logger.debug(f"Memory check failed: {e}")
@@ -308,46 +324,101 @@ class MemoryMonitor:
 class ConsoleOutput:
     """Utilities for formatted console output"""
     
+    # ANSI color codes
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+    @staticmethod
+    def _is_color_supported():
+        """Check if the terminal supports color"""
+        return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
     @staticmethod
     def header(text: str, width: int = 80):
         """Print a formatted header"""
-        print("\n" + "=" * width)
-        print(text.center(width))
-        print("=" * width)
+        separator = "=" * width
+        if ConsoleOutput._is_color_supported():
+            print(f"\n{ConsoleOutput.BOLD}{ConsoleOutput.HEADER}{separator}{ConsoleOutput.ENDC}")
+            print(f"{ConsoleOutput.BOLD}{ConsoleOutput.HEADER}{text.center(width)}{ConsoleOutput.ENDC}")
+            print(f"{ConsoleOutput.BOLD}{ConsoleOutput.HEADER}{separator}{ConsoleOutput.ENDC}")
+        else:
+            print(f"\n{separator}")
+            print(text.center(width))
+            print(separator)
         
     @staticmethod
     def section(text: str, width: int = 60):
         """Print a section divider"""
-        print("\n" + "-" * width)
-        print(text)
-        print("-" * width)
-        
+        separator = "-" * width
+        if ConsoleOutput._is_color_supported():
+            print(f"\n{ConsoleOutput.BOLD}{ConsoleOutput.OKCYAN}{separator}{ConsoleOutput.ENDC}")
+            print(f"{ConsoleOutput.BOLD}{ConsoleOutput.OKCYAN}{text}{ConsoleOutput.ENDC}")
+            print(f"{ConsoleOutput.BOLD}{ConsoleOutput.OKCYAN}{separator}{ConsoleOutput.ENDC}")
+        else:
+            print(f"\n{separator}")
+            print(text)
+            print(separator)
+
     @staticmethod
-    def progress_bar(current: int, total: int, width: int = 50, prefix: str = "Progress"):
-        """Print a progress bar"""
-        percentage = (current / total) * 100 if total > 0 else 0
-        filled = int(width * current / total) if total > 0 else 0
+    def subsection(text: str):
+        """Print a subsection header"""
+        if ConsoleOutput._is_color_supported():
+            print(f"\n{ConsoleOutput.BOLD}{text}{ConsoleOutput.ENDC}")
+        else:
+            print(f"\n{text}")
+
+    @staticmethod
+    def progress_bar(current: int, total: int, width: int = 40, prefix: str = "Progress"):
+        """Print a dynamic progress bar"""
+        if total == 0: return # Avoid division by zero
+        percentage = (current / total)
+        filled = int(width * percentage)
         bar = "█" * filled + "░" * (width - filled)
-        print(f"\r{prefix}: |{bar}| {percentage:.1f}% ({current}/{total})", end="", flush=True)
+        
+        # Use carriage return to overwrite the line
+        if ConsoleOutput._is_color_supported():
+            print(f"\r{ConsoleOutput.OKBLUE}{prefix}: |{bar}| {percentage:.1%} ({current}/{total}){ConsoleOutput.ENDC}", end="", flush=True)
+        else:
+            print(f"\r{prefix}: |{bar}| {percentage:.1%} ({current}/{total})", end="", flush=True)
+            
         if current == total:
             print()  # New line when complete
             
     @staticmethod
     def success(message: str):
         """Print a success message"""
-        print(f"✅ {message}")
+        if ConsoleOutput._is_color_supported():
+            print(f"{ConsoleOutput.OKGREEN}✅ {message}{ConsoleOutput.ENDC}")
+        else:
+            print(f"✅ {message}")
         
     @staticmethod
     def warning(message: str):
         """Print a warning message"""
-        print(f"⚠️  {message}")
+        if ConsoleOutput._is_color_supported():
+            print(f"{ConsoleOutput.WARNING}⚠️  {message}{ConsoleOutput.ENDC}")
+        else:
+            print(f"⚠️  {message}")
         
     @staticmethod
     def error(message: str):
         """Print an error message"""
-        print(f"❌ {message}")
+        if ConsoleOutput._is_color_supported():
+            print(f"{ConsoleOutput.FAIL}❌ {message}{ConsoleOutput.ENDC}")
+        else:
+            print(f"❌ {message}")
         
     @staticmethod
     def info(message: str):
         """Print an info message"""
-        print(f"ℹ️  {message}")
+        if ConsoleOutput._is_color_supported():
+            print(f"{ConsoleOutput.OKCYAN}ℹ️  {message}{ConsoleOutput.ENDC}")
+        else:
+            print(f"ℹ️  {message}")

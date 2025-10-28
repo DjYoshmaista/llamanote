@@ -19,7 +19,7 @@ for dir_path in [OUTPUT_DIR, LOG_DIR, CACHE_DIR, OFFLOAD_DIR]:
 
 # Quantization options
 QUANTIZATION_OPTIONS = ["none", "4bit", "8bit", "16bit"]
-DEFAULT_QUANTIZATION = "8bit"
+DEFAULT_QUANTIZATION = "4bit"
 
 # Layer splitting configuration
 ENABLE_LAYER_SPLITTING = True
@@ -45,6 +45,7 @@ MAX_PARALLEL_FILES = 3
 # Output settings
 OUTPUT_FORMAT_OPTIONS = ["markdown", "text", "json", "html"]
 DEFAULT_OUTPUT_FORMAT = "markdown"
+DEFAULT_OUTPUT_DIR = "~/.cache/llamanote/outputs/"
 INCLUDE_METADATA = True
 TIMESTAMP_OUTPUTS = True
 

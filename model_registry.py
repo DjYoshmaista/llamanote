@@ -137,7 +137,7 @@ class ModelRegistry:
         """Ensure predefined models are in registry"""
         predefined = {
             "qwen3-4b": ModelEntry(
-                model_id="Qwen/Qwen2.5-4B-Instruct",
+                model_id="Qwen/Qwen3-4B-Instruct-2507",
                 name="Qwen3-4B Thinking",
                 author="Qwen",
                 supports_thinking=True,
@@ -174,24 +174,37 @@ class ModelRegistry:
             ),
         }
         
-        # Add predefined models if they don't exist
+        # Add predefined models if they don't exist or update existing predefined
         updated = False
         for key, entry in predefined.items():
             # Assign the short key before adding/updating
             entry.short_key = key
+            entry.is_predefined = True # Ensure predefined flag is set
 
-            # Add or update using the full model_id as the primary key
-            if entry.model_id not in self.models or not self.models[entry.model_id]:
-                self.models(entry.model_id) == entry
+            existing_entry = self.models.get(entry.model_id)
+
+            if not existing_entry:
+                # Add new predefined model using the existing method
+                self.add_model(entry, save=False) # Pass save=False to avoid saving in loop
                 updated = True
-            # Ensure existing predefined entries also have the short key
-            elif self.models[entry.model_id].is_predefined and self.models[entry.model_id].short_key != key:
-                self.models[entry.model_id].short_key = key
-                updated = True
-                   
+            elif existing_entry.is_predefined:
+                # Update existing predefined model if necessary (e.g., short_key mismatch)
+                needs_update = False
+                if existing_entry.short_key != key:
+                    existing_entry.short_key = key
+                    needs_update = True
+                # You could add more checks here if needed
+
+                if needs_update:
+                    # Update using the existing method
+                    self.add_model(existing_entry, save=False) # Pass save=False
+                    updated = True
+            # else: Do nothing if an entry with the same ID exists but isn't marked predefined
+
+        # Save once after the loop if any changes were made
         if updated:
             self._save_registry()
-    
+   
     def add_model(self, entry: ModelEntry, save: bool = True) -> bool:
         """
         Add a model to the registry

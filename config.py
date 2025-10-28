@@ -115,13 +115,13 @@ MODELS = _get_legacy_models()
 class MemoryConfig:
     """Memory optimization configuration"""
     use_quantization: bool = True
-    quantization_type: str = "8bit"
-    max_gpu_memory: str = "10GB"
+    quantization_type: str = "4bit"
+    max_gpu_memory: str = "4GB"
     max_cpu_memory: str = "30GB"
     use_flash_attention: bool = True
-    use_gradient_checkpointing: bool = False
+    use_gradient_checkpointing: bool = True
     offload_to_disk: bool = True
-    batch_size: int = 1
+    batch_size: int = 16
 
 
 MEMORY_PROFILES = {
@@ -135,15 +135,15 @@ MEMORY_PROFILES = {
     ),
     "medium_vram": MemoryConfig(
         use_quantization=True,
-        quantization_type="8bit",
-        max_gpu_memory="8GB",
+        quantization_type="4bit",
+        max_gpu_memory="4GB",
         max_cpu_memory="24GB",
         use_flash_attention=True,
         batch_size=1
     ),
     "high_vram": MemoryConfig(
         use_quantization=False,
-        quantization_type="none",
+        quantization_type="8bit",
         max_gpu_memory="24GB",
         max_cpu_memory="32GB",
         use_flash_attention=True,
