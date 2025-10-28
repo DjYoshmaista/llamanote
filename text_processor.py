@@ -19,43 +19,6 @@ from config import (
 
 logger = get_logger_conf(__name__)
 
-def _apply_overlap_and_create_chunks(self, 
-                                     initial_chunks: List[str], 
-                                     strategy: ChunkingStrategy) -> List[TextChunk]:
-    """
-    Helper method to apply overlap and create TextChunk objects.
-    
-    Args:
-        initial_chunks: List of raw text chunks
-        strategy: The chunking strategy used
-        
-    Returns:
-        List of TextChunk objects with overlap applied
-    """
-    if not initial_chunks:
-        return []
-    
-    final_chunks = []
-    
-    for i, chunk_text in enumerate(initial_chunks):
-        # Apply overlap from previous chunk
-        if i > 0 and self.overlap_size > 0:
-            prev_chunk = initial_chunks[i - 1]
-            overlap_text = prev_chunk[-self.overlap_size:] if len(prev_chunk) > self.overlap_size else prev_chunk
-            chunk_text = overlap_text + " " + chunk_text
-        
-        # Create TextChunk object
-        text_chunk = TextChunk(
-            text=chunk_text,
-            index=i,
-            char_count=len(chunk_text),
-            word_count=len(chunk_text.split()),
-            strategy=strategy
-        )
-        final_chunks.append(text_chunk)
-    
-    return final_chunks
-
 class ChunkingStrategy(Enum):
     """Different strategies for chunking text"""
     WORD_BOUNDARY = "word_boundary"
@@ -93,6 +56,42 @@ class ChunkingResult:
     overlap_used: int
     metadata: Dict[str, Any] = None
 
+def _apply_overlap_and_create_chunks(self, 
+                                     initial_chunks: List[str], 
+                                     strategy: ChunkingStrategy) -> List[TextChunk]:
+    """
+    Helper method to apply overlap and create TextChunk objects.
+    
+    Args:
+        initial_chunks: List of raw text chunks
+        strategy: The chunking strategy used
+        
+    Returns:
+        List of TextChunk objects with overlap applied
+    """
+    if not initial_chunks:
+        return []
+    
+    final_chunks = []
+    
+    for i, chunk_text in enumerate(initial_chunks):
+        # Apply overlap from previous chunk
+        if i > 0 and self.overlap_size > 0:
+            prev_chunk = initial_chunks[i - 1]
+            overlap_text = prev_chunk[-self.overlap_size:] if len(prev_chunk) > self.overlap_size else prev_chunk
+            chunk_text = overlap_text + " " + chunk_text
+        
+        # Create TextChunk object
+        text_chunk = TextChunk(
+            text=chunk_text,
+            index=i,
+            char_count=len(chunk_text),
+            word_count=len(chunk_text.split()),
+            strategy=strategy
+        )
+        final_chunks.append(text_chunk)
+    
+    return final_chunks
 
 class TextChunker:
     """Advanced text chunking with multiple strategies"""
