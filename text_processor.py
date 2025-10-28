@@ -85,7 +85,77 @@ class TextChunker:
         
         logger.info(f"Initialized TextChunker (strategy={strategy.value}, "
                    f"target_size={target_size}, overlap={overlap})")
+
+    def _chunk_with_accumulator(self,
+                                items: List[str],
+                                item_sizes: List[int],
+                                join_str: str = ' ') -> List[TextChunk]:
+        """
+    Generic chunking logic using accumulator pattern.
         
+        Args:
+            items: List of text items to chunk (words, sentences, paragraphs)
+            item_sizes: List of sizes for each item
+            join_str: String to join items with
+        
+        Returns:
+            List of TextChunk objects
+        """
+        chunks = []
+        current_items = []
+        current_length = 0
+        start_pos = 0
+        
+        for i, (item, item_size) in enumerate(zip(items, item_sizes)):
+            # Check if adding this item would exceed target
+            if current_length + item_size > self.target_size and current_items:
+                # Create chunk from accumulated items
+                chunk_text = join_str.join(current_items)
+                chunks.append(TextChunk(
+                    text=chunk_text,
+                    index=len(chunks),
+                    start_pos=start_pos,
+                    end_pos=start_pos + len(chunk_text),
+                    word_count=len(chunk_text.split()),
+                    char_count=len(chunk_text)
+                ))
+                
+                # Handle overlap
+                if self.overlap > 0 and len(current_items) > 1:
+                    # Keep items for overlap
+                    overlap_items = []
+                    overlap_length = 0
+                    for idx in range(len(current_items) - 1, -1, -1):
+                        overlap_length += item_sizes[i - len(current_items) + idx]
+                        if overlap_length >= self.overlap:
+                            break
+                        overlap_items.insert(0, current_items[idx])
+                    
+                    current_items = overlap_items
+                    current_length = sum(len(item) + len(join_str) for item in current_items)
+                    start_pos = start_pos + len(chunk_text) - current_length
+                else:
+                    current_items = []
+                    current_length = 0
+                    start_pos += len(chunk_text) + len(join_str)
+            
+            current_items.append(item)
+            current_length += item_size
+        
+        # Add remaining items
+        if current_items:
+            chunk_text = join_str.join(current_items)
+            chunks.append(TextChunk(
+                text=chunk_text,
+                index=len(chunks),
+                start_pos=start_pos,
+                end_pos=start_pos + len(chunk_text),
+                word_count=len(chunk_text.split()),
+                char_count=len(chunk_text)
+            ))
+        
+        return chunks
+    
     def chunk_text(self, text: str, 
                   strategy: Optional[ChunkingStrategy] = None) -> ChunkingResult:
         """
@@ -131,118 +201,19 @@ class TextChunker:
             overlap_used=self.overlap,
             metadata={"original_length": len(text)}
         )
-        
+
     def _chunk_by_words(self, text: str) -> List[TextChunk]:
         """Chunk text at word boundaries"""
         words = text.split()
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        start_pos = 0
-        
-        for i, word in enumerate(words):
-            word_length = len(word) + 1  # +1 for space
-            
-            if current_length + word_length > self.target_size and current_chunk:
-                # Create chunk
-                chunk_text = ' '.join(current_chunk)
-                chunks.append(TextChunk(
-                    text=chunk_text,
-                    index=len(chunks),
-                    start_pos=start_pos,
-                    end_pos=start_pos + len(chunk_text),
-                    word_count=len(current_chunk),
-                    char_count=len(chunk_text)
-                ))
-                
-                # Handle overlap
-                if self.overlap > 0:
-                    # Keep last N characters worth of words for overlap
-                    overlap_words = []
-                    overlap_length = 0
-                    for w in reversed(current_chunk):
-                        overlap_length += len(w) + 1
-                        if overlap_length >= self.overlap:
-                            break
-                        overlap_words.insert(0, w)
-                    current_chunk = overlap_words
-                    current_length = sum(len(w) + 1 for w in overlap_words)
-                    start_pos = start_pos + len(chunk_text) - current_length
-                else:
-                    current_chunk = []
-                    current_length = 0
-                    start_pos += len(chunk_text) + 1
-                    
-            current_chunk.append(word)
-            current_length += word_length
-            
-        # Add remaining words
-        if current_chunk:
-            chunk_text = ' '.join(current_chunk)
-            chunks.append(TextChunk(
-                text=chunk_text,
-                index=len(chunks),
-                start_pos=start_pos,
-                end_pos=start_pos + len(chunk_text),
-                word_count=len(current_chunk),
-                char_count=len(chunk_text)
-            ))
-            
-        return chunks
-        
+        sizes = [len(word) + 1 for word in words]  # +1 for space
+        return self._chunk_with_accumulator(words, sizes, join_str=' ')
+    
     def _chunk_by_sentences(self, text: str) -> List[TextChunk]:
         """Chunk text at sentence boundaries"""
-        # Simple sentence splitting (can be improved with NLTK)
         sentences = re.split(r'(?<=[.!?])\s+', text)
-        
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        start_pos = 0
-        
-        for sentence in sentences:
-            sentence_length = len(sentence) + 1
-            
-            if current_length + sentence_length > self.target_size and current_chunk:
-                # Create chunk
-                chunk_text = ' '.join(current_chunk)
-                chunks.append(TextChunk(
-                    text=chunk_text,
-                    index=len(chunks),
-                    start_pos=start_pos,
-                    end_pos=start_pos + len(chunk_text),
-                    word_count=len(chunk_text.split()),
-                    char_count=len(chunk_text)
-                ))
-                
-                # Handle overlap (keep last sentence if overlap enabled)
-                if self.overlap > 0 and len(current_chunk) > 1:
-                    overlap_sentence = current_chunk[-1]
-                    current_chunk = [overlap_sentence]
-                    current_length = len(overlap_sentence)
-                    start_pos = start_pos + len(chunk_text) - current_length
-                else:
-                    current_chunk = []
-                    current_length = 0
-                    start_pos += len(chunk_text) + 1
-                    
-            current_chunk.append(sentence)
-            current_length += sentence_length
-            
-        # Add remaining sentences
-        if current_chunk:
-            chunk_text = ' '.join(current_chunk)
-            chunks.append(TextChunk(
-                text=chunk_text,
-                index=len(chunks),
-                start_pos=start_pos,
-                end_pos=start_pos + len(chunk_text),
-                word_count=len(chunk_text.split()),
-                char_count=len(chunk_text)
-            ))
-            
-        return chunks
-        
+        sizes = [len(sent) + 1 for sent in sentences]  # +1 for space
+        return self._chunk_with_accumulator(sentences, sizes, join_str=' ')
+
     def _chunk_by_paragraphs(self, text: str) -> List[TextChunk]:
         """Chunk text at paragraph boundaries"""
         paragraphs = text.split('\n\n')

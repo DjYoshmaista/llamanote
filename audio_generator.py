@@ -18,7 +18,7 @@ import abc
 
 # --- LlamaNote Modules ---
 from loggerConf import LoggingProgress, get_logger_conf, log_execution_time, ConsoleOutput
-from huggingface_search import ModelDownloader # Keep for local models
+from model_hub import ModelDownloader # Keep for local models
 from config_manager import ConfigManager # Not directly needed here, but used by callers
 # Imports for local model types (conditionally imported in LocalAudioBackend)
 

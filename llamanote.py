@@ -81,7 +81,6 @@ except ImportError:
 # Initialize logger
 logger = get_logger_conf("llamanote_main")
 
-
 # Helper function to create the parser
 def parse_arguments():
     """Creates the argument parser."""
@@ -383,104 +382,108 @@ def handle_hyperparameter_configuration(args) -> HyperparameterConfig:
 
     return hyperparams
 
-# --- Utility Functions (Copied from menu_system) ---
-
-def list_models():
-    """List available models from the registry."""
-    registry = get_registry()
-    ConsoleOutput.header("Available Models in Registry")
-
-    predefined = registry.list_models(predefined_only=True, sort_by="name")
-    if predefined:
-        ConsoleOutput.section("Predefined Models (use key with --model)")
-        for model in predefined:
-            key_info = f" (Key: {model.short_key})" if model.short_key else ""
-            print(f"- {model.name}{key_info}")
-            print(f"  ID: {model.model_id}")
-            print(f"  Context: {model.max_context:,} | Thinking: {'Yes' if model.supports_thinking else 'No'}")
-            # print(f"  Cached: {'Yes' if model.is_cached else 'No'}") # is_cached might not be up-to-date here
-    else:
-        print("No predefined models found in registry.")
-
-
-    all_models = registry.list_models(sort_by="name")
-    other_models = [m for m in all_models if not m.is_predefined]
-    if other_models:
-        ConsoleOutput.section("Other Models in Registry (use ID with --model-id)")
-        max_show = 20
-        for model in other_models[:max_show]:
-            dl_info = f" (Downloads: {model.downloads:,})" if model.downloads > 0 else ""
-            print(f"- {model.model_id}{dl_info}")
-            # print(f"  Cached: {'Yes' if model.is_cached else 'No'}")
-        if len(other_models) > max_show:
-            print(f"  ... and {len(other_models) - max_show} more.")
-
-    print("\nUse --search-models TERM to find more on HuggingFace Hub.")
-    print("Use --refresh-registry to update registry from Hub.")
-
-
-def search_models(search_term: str):
-    """Search HuggingFace Hub for models."""
-    hub = ModelHub() # Assuming ModelHub is available
-    ConsoleOutput.header(f"Searching HuggingFace Hub for: '{search_term}'")
-    results = hub.search_models(search_term=search_term, limit=20)
-    if not results:
-        ConsoleOutput.warning("No models found matching the search term.")
-        return
-    ConsoleOutput.info(f"Found {len(results)} potential models:")
-    for i, model in enumerate(results, 1):
-        dl_info = f"Downloads: {model.downloads:,}" if model.downloads else "Downloads: N/A"
-        size_info = f"Size: {model.format_size()}" if model.model_size_mb else "Size: N/A"
-        print(f"{i:2}. {model.model_id}")
-        print(f"    {dl_info} | Likes: {model.likes} | {size_info}")
-        if model.description:
-            print(f"    Desc: {model.description[:80]}...")
-    print("\nUse the full Model ID (e.g., 'Org/ModelName') with --model-id to select.")
-    print("Run --refresh-registry to potentially add these to your local registry.")
-
-
-def list_gguf_models():
-    """List available GGUF models from cache."""
-    if not LLAMACPP_AVAILABLE:
-        ConsoleOutput.error("llama-cpp-python is not installed. Cannot list GGUF models.")
-        print("Install with: pip install llama-cpp-python")
-        return
-
-    try:
-        manager = GGUFModelManager(cache_dir=CACHE_DIR / "gguf_models")
-        models = manager.list_available_models()
-        ConsoleOutput.header("Available GGUF Models (in cache)")
-        if not models:
-            ConsoleOutput.warning("No GGUF models found in cache.")
-            print(f"Cache directory searched: {manager.cache_dir}")
+class ModelRegistryUtils:
+    """Utility functions for model registry operations."""
+    
+    @staticmethod
+    def list_models():
+        """List available models from the registry."""
+        registry = get_registry()
+        ConsoleOutput.header("Available Models in Registry")
+        
+        predefined = registry.list_models(predefined_only=True, sort_by="name")
+        if predefined:
+            ConsoleOutput.section("Predefined Models (use key with --model)")
+            for model in predefined:
+                key_info = f" (Key: {model.short_key})" if model.short_key else ""
+                print(f"- {model.name}{key_info}")
+                print(f"  ID: {model.model_id}")
+                print(f"  Context: {model.max_context:,} | Thinking: {'Yes' if model.supports_thinking else 'No'}")
+        else:
+            print("No predefined models found in registry.")
+        
+        all_models = registry.list_models(sort_by="name")
+        other_models = [m for m in all_models if not m.is_predefined]
+        if other_models:
+            ConsoleOutput.section("Other Models in Registry (use ID with --model-id)")
+            max_show = 20
+            for model in other_models[:max_show]:
+                dl_info = f" (Downloads: {model.downloads:,})" if model.downloads > 0 else ""
+                print(f"- {model.model_id}{dl_info}")
+            if len(other_models) > max_show:
+                print(f"  ... and {len(other_models) - max_show} more.")
+        
+        print("\nUse --search-models TERM to find more on HuggingFace Hub.")
+        print("Use --refresh-registry to update registry from Hub.")
+    
+    @staticmethod
+    def search_models(search_term: str):
+        """Search HuggingFace Hub for models."""
+        hub = ModelHub()
+        ConsoleOutput.header(f"Searching HuggingFace Hub for: '{search_term}'")
+        results = hub.search_models(search_term=search_term, limit=20)
+        if not results:
+            ConsoleOutput.warning("No models found matching the search term.")
             return
+        ConsoleOutput.info(f"Found {len(results)} potential models:")
+        for i, model in enumerate(results, 1):
+            dl_info = f"Downloads: {model.downloads:,}" if model.downloads else "Downloads: N/A"
+            size_info = f"Size: {model.format_size()}" if model.model_size_mb else "Size: N/A"
+            print(f"{i:2}. {model.model_id}")
+            print(f"    {dl_info} | Likes: {model.likes} | {size_info}")
+            if model.description:
+                print(f"    Desc: {model.description[:80]}...")
+        print("\nUse the full Model ID (e.g., 'Org/ModelName') with --model-id to select.")
+    
+    @staticmethod
+    def list_gguf_models():
+        """List available GGUF models from cache."""
+        if not LLAMACPP_AVAILABLE:
+            ConsoleOutput.error("llama-cpp-python is not installed. Cannot list GGUF models.")
+            print("Install with: pip install llama-cpp-python")
+            return
+        
+        try:
+            manager = GGUFModelManager(cache_dir=CACHE_DIR / "gguf_models")
+            models = manager.list_available_models()
+            ConsoleOutput.header("Available GGUF Models (in cache)")
+            if not models:
+                ConsoleOutput.warning("No GGUF models found in cache.")
+                print(f"Cache directory searched: {manager.cache_dir}")
+                return
+            
+            for model_path in models:
+                info = manager.get_model_info(model_path)
+                print(f"- {info.get('name', model_path.name)}")
+                print(f"  Size: {info.get('size_mb', 0):.1f} MB | Format: {info.get('format', 'N/A')}")
+                if 'quantization' in info:
+                    print(f"  Quantization: {info['quantization']}")
+                print(f"  Path: {model_path}")
+            print("\nUse --use-gguf PATH/TO/MODEL.gguf to select.")
+        except Exception as e:
+            ConsoleOutput.error(f"Error listing GGUF models: {e}")
+    
+    @staticmethod
+    def refresh_registry():
+        """Refresh model registry from HuggingFace Hub."""
+        ConsoleOutput.header("Refreshing Model Registry from HuggingFace Hub")
+        terms_input = input("Enter search terms (comma-separated, Enter for defaults 'instruct,chat'): ").strip()
+        terms = [t.strip() for t in terms_input.split(',')] if terms_input else ["instruct", "chat"]
+        limit_input = input("Max models per term (default 100): ").strip()
+        limit = int(limit_input) if limit_input.isdigit() else 100
+        
+        ConsoleOutput.info(f"Searching for terms: {terms} (limit {limit} each)...")
+        try:
+            count = refresh_registry_from_hub(search_terms=terms, limit=limit)
+            ConsoleOutput.success(f"Registry updated. Added/updated {count} models.")
+        except Exception as e:
+            ConsoleOutput.error(f"Failed to refresh registry: {e}")
+            logger.error("Registry refresh failed", exc_info=True)
 
-        for model_path in models:
-            info = manager.get_model_info(model_path) # Assumes this method exists
-            print(f"- {info.get('name', model_path.name)}")
-            print(f"  Size: {info.get('size_mb', 0):.1f} MB | Format: {info.get('format', 'N/A')}")
-            if 'quantization' in info: print(f"  Quantization: {info['quantization']}")
-            print(f"  Path: {model_path}")
-        print("\nUse --use-gguf PATH/TO/MODEL.gguf to select.")
-    except Exception as e:
-        ConsoleOutput.error(f"Error listing GGUF models: {e}")
-
-
-def refresh_registry():
-    """Refresh model registry from HuggingFace Hub."""
-    ConsoleOutput.header("Refreshing Model Registry from HuggingFace Hub")
-    terms_input = input("Enter search terms (comma-separated, Enter for defaults 'instruct,chat'): ").strip()
-    terms = [t.strip() for t in terms_input.split(',')] if terms_input else ["instruct", "chat"]
-    limit_input = input("Max models per term (default 100): ").strip()
-    limit = int(limit_input) if limit_input.isdigit() else 100
-
-    ConsoleOutput.info(f"Searching for terms: {terms} (limit {limit} each)...")
-    try:
-        count = refresh_registry_from_hub(search_terms=terms, limit=limit)
-        ConsoleOutput.success(f"Registry updated. Added/updated {count} models.")
-    except Exception as e:
-        ConsoleOutput.error(f"Failed to refresh registry: {e}")
-        logger.error("Registry refresh failed", exc_info=True)
+list_models = ModelRegistryUtils.list_models
+search_models = ModelRegistryUtils.search_models
+list_gguf_models = ModelRegistryUtils.list_gguf_models
+refresh_registry = ModelRegistryUtils.refresh_registry
 
 def export_registry(path: Path):
     """Export registry to JSON file."""

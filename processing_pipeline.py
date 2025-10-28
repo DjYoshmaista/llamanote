@@ -48,6 +48,48 @@ from model_registry import ModelEntry
 logger = get_logger_conf(__name__)
 # Removed TIMESTAMP_OUTPUTS from here, should be handled by FileHandler/config_base
 
+def with_checkpoint(stage_name: str):
+    """
+    Decorator to handle checkpoint save/load for pipeline stages.
+    
+    Usage:
+        @with_checkpoint("extract")
+        def _stage_extract(self, input_path: Path) -> Optional[ExtractionResult]:
+            # ... processing logic ...
+            return result
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            self.current_stage = stage_name
+            ConsoleOutput.section(f"Stage: {stage_name.title()}")
+            
+            # Check for checkpoint
+            if self.config.enable_checkpoints:
+                checkpoint = self.file_handler.load_checkpoint(
+                    self.checkpoint_name, stage_name
+                )
+                if checkpoint is not None:
+                    self.logger.info(f"Loaded {stage_name} checkpoint")
+                    self.stages_completed.append(stage_name)
+                    return checkpoint
+            
+            # Execute stage function
+            result = func(self, *args, **kwargs)
+            
+            # Save checkpoint
+            if self.config.enable_checkpoints and result is not None:
+                self.file_handler.save_checkpoint(
+                    result, self.checkpoint_name, stage_name
+                )
+            
+            # Mark stage complete
+            self.stages_completed.append(stage_name)
+            return result
+        
+        return wrapper
+    return decorator
+
 class ProcessingPipeline:
     """Main processing pipeline for PDF to formatted text"""
 
@@ -348,99 +390,39 @@ class ProcessingPipeline:
             # Do NOT unload model here, caller manages backend lifecycle
             pass
 
-
+@with_checkpoint("extract")
     def _stage_extract(self, input_path: Path) -> Optional[ExtractionResult]:
         """Stage 1: Extract text from PDF"""
-        self.current_stage = "extract"
-        ConsoleOutput.section("Stage 1: Extracting text")
-
-        # Check for checkpoint
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            if checkpoint and isinstance(checkpoint, ExtractionResult):
-                self.logger.info("Loaded extraction checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
-        # Extract text
         result = self.pdf_processor.extract_text(input_path)
-
+        
         if not result:
             return None
-
+        
         ConsoleOutput.info(f"Extracted {result.char_count:,} characters from {result.metadata.num_pages} pages")
         for warning in result.warnings:
-             ConsoleOutput.warning(warning)
-
-        # Save checkpoint (save the whole result object)
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                result, self.checkpoint_name, self.current_stage
-            )
-
-        self.stages_completed.append(self.current_stage)
+            ConsoleOutput.warning(warning)
+        
         self.memory_monitor.check("after extraction")
         return result
-
+    
+    @with_checkpoint("preprocess")
     def _stage_preprocess(self, text: str) -> str:
         """Stage 2: Preprocess text"""
-        self.current_stage = "preprocess"
-        ConsoleOutput.section("Stage 2: Preprocessing text")
-
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            if checkpoint and isinstance(checkpoint, str):
-                self.logger.info("Loaded preprocessing checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
-        cleaned_text = text # Start with input text
+        cleaned_text = text
         if self.config.clean_for_audio and self.config.mode == ProcessingMode.PODCAST:
             cleaned_text = self.text_cleaner.clean_for_audio(cleaned_text)
             ConsoleOutput.info("Applied audio-specific cleaning")
-
+        
         preprocessed_text = self.text_preprocessor.preprocess_for_llm(cleaned_text)
-
         ConsoleOutput.info(f"Preprocessed text: {len(preprocessed_text):,} characters")
-
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                preprocessed_text, self.checkpoint_name, self.current_stage
-            )
-
-        self.stages_completed.append(self.current_stage)
+        
         return preprocessed_text
-
-    def _stage_chunk(self, text: str) -> 'ChunkingResult': # Use type hint from text_processor
+    
+    @with_checkpoint("chunk")
+    def _stage_chunk(self, text: str) -> 'ChunkingResult':
         """Stage 3: Chunk text"""
-        self.current_stage = "chunk"
-        ConsoleOutput.section("Stage 3: Chunking text")
-
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            # Need to check if loaded checkpoint is the correct type (ChunkingResult)
-            if checkpoint and hasattr(checkpoint, 'chunks') and hasattr(checkpoint, 'strategy_used'):
-                self.logger.info("Loaded chunking checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
         result = self.text_chunker.chunk_text(text)
-        # chunks = [chunk.text for chunk in result.chunks] # We need the full result for checkpoint
-
         ConsoleOutput.info(f"Created {len(result.chunks)} chunks (avg size: {result.average_chunk_size:.0f} chars)")
-
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                result, self.checkpoint_name, self.current_stage # Save the ChunkingResult object
-            )
-
-        self.stages_completed.append(self.current_stage)
         return result
 
     def _stage_process(self, chunks: List[str]) -> List[str]:

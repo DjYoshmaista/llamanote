@@ -86,6 +86,48 @@ except ImportError:
 
 logger = get_logger_conf(__name__)
 
+def _map_hyperparams_common(hp: HyperparameterConfig, provider_limits: Dict[str, Tuple[float, float]] = None) -> Dict[str, Any]:
+    """
+    Common hyperparameter mapping logic for cloud backends.
+    
+    Args:
+        hp: HyperparameterConfig to map
+        provider_limits: Dict of parameter limits, e.g. {'temperature': (0.0, 2.0)}
+    
+    Returns:
+        Dict of mapped parameters
+    """
+    params = {}
+    
+    # Max tokens
+    if hp.max_new_tokens is not None:
+        params["max_tokens"] = hp.max_new_tokens
+    
+    # Temperature
+    if not hp.do_sample:
+        params["temperature"] = 0.0
+    elif hp.temperature is not None:
+        limits = provider_limits.get('temperature', (0.0, 2.0)) if provider_limits else (0.0, 2.0)
+        params["temperature"] = max(limits[0], min(limits[1], hp.temperature))
+    
+    # Top-p
+    if hp.top_p is not None:
+        limits = provider_limits.get('top_p', (0.001, 1.0)) if provider_limits else (0.001, 1.0)
+        # Handle edge case where top_p is exactly 1.0
+        top_p_val = hp.top_p
+        if top_p_val >= 1.0:
+            top_p_val = None  # Some providers don't accept 1.0
+        else:
+            top_p_val = max(limits[0], min(limits[1], top_p_val))
+        if top_p_val is not None:
+            params["top_p"] = top_p_val
+    
+    # Top-k (not all providers support this)
+    if hp.top_k is not None and hp.top_k > 0:
+        params["top_k"] = hp.top_k
+    
+    return params
+
 def _get_default_hyperparms():
     """Lazy load default hyperparameters"""
     return HyperparameterConfig()
@@ -862,40 +904,19 @@ class OpenAIBackend(LLMBackend):
 
     def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
         """Maps HyperparameterConfig to OpenAI's API parameters."""
-        params = {}
-        if hp.max_new_tokens is not None:
-            params["max_tokens"] = hp.max_new_tokens
-        if hp.temperature is not None:
-             # Ensure temperature is within valid range (0 to 2)
-             params["temperature"] = max(0.0, min(2.0, hp.temperature))
-        if hp.top_p is not None:
-             # OpenAI API often expects top_p < 1.0 or None, handle 1.0 case
-             params["top_p"] = max(0.001, min(0.999, hp.top_p)) if hp.top_p < 1.0 else None
-        # Handle do_sample implicitly: OpenAI samples if temperature > 0
-        if not hp.do_sample:
-            params["temperature"] = 0.0 # Force deterministic output
-
-        # Map repetition_penalty to presence_penalty (different concepts, but closest match)
+        params = _map_hyperparams_common(hp, {'temperature': (0.0, 2.0), 'top_p': (0.001, 0.999)})
+        
+        # OpenAI-specific mappings
         if hp.repetition_penalty is not None and hp.repetition_penalty != 1.0:
-             # Scale appropriately: 1.0 (HF) -> 0.0 (OpenAI), 1.2 (HF) -> 0.2 (OpenAI)
-             # Clamp between -2.0 and 2.0 as per OpenAI docs
-             presence_penalty = max(-2.0, min(2.0, hp.repetition_penalty - 1.0))
-             # Avoid setting penalty to 0.0 if repetition_penalty was 1.0
-             if abs(presence_penalty) > 1e-6 :
-                  params["presence_penalty"] = presence_penalty
-                  self.logger.debug(f"Mapping repetition_penalty {hp.repetition_penalty} to presence_penalty {params['presence_penalty']}")
-
-        # Map no_repeat_ngram_size to frequency_penalty (also different, heuristic mapping)
+            presence_penalty = max(-2.0, min(2.0, hp.repetition_penalty - 1.0))
+            if abs(presence_penalty) > 1e-6:
+                params["presence_penalty"] = presence_penalty
+        
         if hp.no_repeat_ngram_size is not None and hp.no_repeat_ngram_size > 0:
-            # Higher ngram size implies stronger need to penalize frequency
-            # Clamp between -2.0 and 2.0
-            frequency_penalty = max(-2.0, min(2.0, 0.1 * hp.no_repeat_ngram_size)) # Small penalty
+            frequency_penalty = max(-2.0, min(2.0, 0.1 * hp.no_repeat_ngram_size))
             if abs(frequency_penalty) > 1e-6:
                 params["frequency_penalty"] = frequency_penalty
-                self.logger.debug(f"Mapping no_repeat_ngram_size {hp.no_repeat_ngram_size} to frequency_penalty {params['frequency_penalty']}")
-
-        # Note: OpenAI API doesn't support top_k, length_penalty, etc. directly.
-
+        
         return params
 
     @log_execution_time()
@@ -1069,34 +1090,14 @@ class GoogleAIBackend(LLMBackend):
 
     def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
         """Maps HyperparameterConfig to Google's GenerationConfig."""
-        gen_config_params = {}
-
-        # Ensure temperature is set, default to 0.0 for deterministic if sample is False
-        if not hp.do_sample:
-            gen_config_params["temperature"] = 0.0
-        elif hp.temperature is not None:
-            # Google API temperature range is typically [0.0, 1.0] (sometimes up to 2.0, check docs)
-            gen_config_params["temperature"] = max(0.0, min(1.0, hp.temperature))
-
-        if hp.max_new_tokens is not None:
-            gen_config_params["max_output_tokens"] = hp.max_new_tokens
-
-        if hp.top_p is not None:
-             # Google API accepts top_p=1.0, range [0.0, 1.0]
-             gen_config_params["top_p"] = max(0.0, min(1.0, hp.top_p))
-
-        if hp.top_k is not None and hp.top_k > 0:
-             gen_config_params["top_k"] = hp.top_k
-
-        # Map stop sequences if provided
-        # if hp.stop_sequences: # Assuming stop_sequences is added to HyperparameterConfig
-        #    gen_config_params["stop_sequences"] = hp.stop_sequences
-
-        # Note: Google API doesn't support repetition_penalty, length_penalty, etc.
-        if hasattr(hp, 'repetition_penalty') and hp.repetition_penalty != 1.0:
-            self.logger.warning("repetition_penalty is not supported by Google Gemini API.")
-
-        return gen_config_params
+        # Use common mapper with Google's parameter names
+        params = _map_hyperparams_common(hp, {'temperature': (0.0, 1.0), 'top_p': (0.0, 1.0)})
+        
+        # Rename to Google's parameter names
+        if "max_tokens" in params:
+            params["max_output_tokens"] = params.pop("max_tokens")
+        
+        return params
 
     @log_execution_time()
     def generate(self, prompt: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
@@ -1267,32 +1268,12 @@ class AnthropicBackend(LLMBackend):
 
     def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
         """Maps HyperparameterConfig to Anthropic's API parameters."""
-        params = {}
-
+        params = _map_hyperparams_common(hp, {'temperature': (0.0, 1.0), 'top_p': (0.001, 1.0)})
+        
         # Anthropic requires max_tokens
-        params["max_tokens"] = hp.max_new_tokens or 4096 # Use a reasonable default if None
-
-        if hp.temperature is not None:
-             # Anthropic range [0.0, 1.0]
-             params["temperature"] = max(0.0, min(1.0, hp.temperature))
-        # Handle do_sample implicitly: Anthropic samples if temperature > 0
-        if not hp.do_sample:
-             params["temperature"] = 0.0 # Force deterministic
-
-        if hp.top_p is not None:
-             # Anthropic range (0.0, 1.0] - exclude 0? Check docs. Assuming similar to OpenAI.
-             params["top_p"] = max(0.001, min(1.0, hp.top_p))
-        if hp.top_k is not None and hp.top_k > 0:
-             params["top_k"] = hp.top_k
-
-        # Map stop sequences if provided
-        # if hp.stop_sequences:
-        #    params["stop_sequences"] = hp.stop_sequences
-
-        # Note: Anthropic doesn't support repetition_penalty, length_penalty, etc.
-        if hasattr(hp, 'repetition_penalty') and hp.repetition_penalty != 1.0:
-            self.logger.warning("repetition_penalty is not supported by Anthropic API.")
-
+        if "max_tokens" not in params:
+            params["max_tokens"] = 4096
+        
         return params
 
     @log_execution_time()

@@ -46,25 +46,6 @@ ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS 
 Here's the text:
 """
 
-# --- Deprecated ModelConfig ---
-# @dataclass
-# class ModelConfig:
-#     """(DEPRECATED - Use ModelEntry from model_registry instead)"""
-#     name: str
-#     model_id: str
-#     supports_thinking: bool = False
-#     thinking_tokens: List[str] = field(default_factory=list)
-#     max_context: int = 32768
-#     optimal_chunk_size: int = 1000
-#     temperature: float = 0.7
-#     top_p: float = 0.9
-#     max_new_tokens: Optional[int] = None
-#     quantization_support: List[str] = field(default_factory=lambda: ["4bit", "8bit"])
-
-# --- Dynamic MODELS dict for CLI choices ---
-# This dict maps short keys (like 'qwen3-4b') to model IDs.
-# It's populated dynamically from the registry for predefined models.
-
 MODELS: Dict[str, str] = {} # Initialize as empty
 
 def reload_models():

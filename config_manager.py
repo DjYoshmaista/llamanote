@@ -246,12 +246,22 @@ class ConfigManager:
          return sorted(list(active_keys.keys()))
 
     # --- Generic Config Methods (Unchanged, but use get_dir) ---
+# --- Generic Config Methods (Refactored for DRY) ---
     def save_config(self, name: str, config: Dict[str, Any], dir_type: str = "config") -> bool:
+        """
+        Generic config save method.
+        
+        Args:
+            name: Config name (filename without extension)
+            config: Config dictionary to save
+            dir_type: Config directory type (config/filter/preset/pipeline/audio/model/cloud)
+        """
         try:
-            config_dir = self.get_dir(dir_type) # Use get_dir
+            config_dir = self.get_dir(dir_type)
             config_file = config_dir / f"{name}.json"
             config["_metadata"] = {"created": datetime.now().isoformat(), "type": dir_type}
-            with open(config_file, 'w') as f: json.dump(config, f, indent=2)
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
             logger.info(f"Saved {dir_type} configuration: {name} to {config_file}")
             return True
         except Exception as e:
@@ -259,13 +269,14 @@ class ConfigManager:
             return False
 
     def load_config(self, name: str, dir_type: str = "config") -> Optional[Dict[str, Any]]:
+        """Generic config load method."""
         try:
-            config_dir = self.get_dir(dir_type) # Use get_dir
+            config_dir = self.get_dir(dir_type)
             config_file = config_dir / f"{name}.json"
             if not config_file.exists():
-                # logger.warning(f"{dir_type.capitalize()} configuration '{name}' not found at {config_file}")
                 return None
-            with open(config_file, 'r') as f: config = json.load(f)
+            with open(config_file, 'r') as f:
+                config = json.load(f)
             config.pop("_metadata", None)
             logger.info(f"Loaded {dir_type} configuration: {name} from {config_file}")
             return config
@@ -274,77 +285,54 @@ class ConfigManager:
             return None
 
     def list_configs(self, dir_type: str = "config") -> List[str]:
-        config_dir = self.get_dir(dir_type) # Use get_dir
+        """List all configs of a given type."""
+        config_dir = self.get_dir(dir_type)
         configs = [f.stem for f in config_dir.glob("*.json")]
         return sorted(configs)
 
     def delete_config(self, name: str, dir_type: str = "config") -> bool:
+        """Generic config delete method."""
         try:
-            config_dir = self.get_dir(dir_type) # Use get_dir
+            config_dir = self.get_dir(dir_type)
             config_file = config_dir / f"{name}.json"
             if config_file.exists():
                 config_file.unlink()
-                logger.info(f"Deleted {dir_type} configuration: {name} from {config_file}")
+                logger.info(f"Deleted {dir_type} configuration: {name}")
                 return True
-            logger.warning(f"{dir_type.capitalize()} configuration '{name}' not found for deletion.")
+            logger.warning(f"{dir_type.capitalize()} configuration '{name}' not found")
             return False
         except Exception as e:
             logger.error(f"Failed to delete {dir_type} configuration '{name}': {e}")
             return False
 
-    # --- Export/Import (Unchanged, but use load/save_config) ---
-    def export_config(self, name: str, export_path: Path, dir_type: str = "config") -> bool:
-        config = self.load_config(name, dir_type)
-        if not config: return False
-        try:
-            export_path.parent.mkdir(parents=True, exist_ok=True) # Ensure export dir exists
-            with open(export_path, 'w') as f: json.dump(config, f, indent=2)
-            logger.info(f"Exported {dir_type} config '{name}' to {export_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to export {dir_type} config '{name}': {e}")
-            return False
-
-    def import_config(self, import_path: Path, name: Optional[str] = None, dir_type: str = "config") -> bool:
-        if not import_path.exists():
-             logger.error(f"Import path does not exist: {import_path}")
-             return False
-        try:
-            with open(import_path, 'r') as f: config = json.load(f)
-            import_name = name or import_path.stem
-            if self.save_config(import_name, config, dir_type):
-                 logger.info(f"Imported {dir_type} config '{import_name}' from {import_path}")
-                 return True
-            else:
-                 logger.error(f"Failed to save imported {dir_type} config '{import_name}'")
-                 return False
-        except json.JSONDecodeError:
-             logger.error(f"Failed to import {dir_type} config: Invalid JSON file at {import_path}")
-             return False
-        except Exception as e:
-            logger.error(f"Failed to import {dir_type} config from {import_path}: {e}")
-            return False
-
-    # --- Specialized methods (Unchanged, use generic save/load) ---
+    # --- Specialized convenience methods (wrappers) ---
     def save_pipeline_config(self, name: str, config: Dict[str, Any]) -> bool:
         return self.save_config(name, config, "pipeline")
+    
     def load_pipeline_config(self, name: str) -> Optional[Dict[str, Any]]:
         return self.load_config(name, "pipeline")
+    
     def save_audio_config(self, name: str, config: Dict[str, Any]) -> bool:
         return self.save_config(name, config, "audio")
+    
     def load_audio_config(self, name: str) -> Optional[Dict[str, Any]]:
         return self.load_config(name, "audio")
+    
     def save_filter_preset(self, name: str, filters: Dict[str, Any]) -> bool:
         return self.save_config(name, filters, "filter")
+    
     def load_filter_preset(self, name: str) -> Optional[Dict[str, Any]]:
         return self.load_config(name, "filter")
+    
     def save_hyperparameter_preset(self, name: str, params: Dict[str, Any]) -> bool:
-         # Uses 'preset' directory type
-         return self.save_config(name, params, "preset")
+        return self.save_config(name, params, "preset")
+    
     def load_hyperparameter_preset(self, name: str) -> Optional[Dict[str, Any]]:
-         return self.load_config(name, "preset")
+        return self.load_config(name, "preset")
+    
     def save_model_preference(self, name: str, model_info: Dict[str, Any]) -> bool:
         return self.save_config(name, model_info, "model")
+    
     def load_model_preference(self, name: str) -> Optional[Dict[str, Any]]:
         return self.load_config(name, "model")
 
