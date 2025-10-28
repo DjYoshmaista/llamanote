@@ -37,7 +37,7 @@ from pipeline_types import (
 from model_hub import InteractiveModelBrowser, ModelHub, ModelInfo as HFModelInfo
 from audio_generator import (
     AudioConfig, AudioResult, AudioBackend,
-    LocalAudioBackend, OpenAITTSBackend, get_audio_backend # Import LoggingProgress here
+    LocalAudioBackend, OpenAITTSBackend, get_audio_backend
 )
 from processing_pipeline import ProcessingPipeline # Keep this for instantiation
 from text_processor import ChunkingStrategy
@@ -1712,15 +1712,14 @@ class MenuSystem:
                  ConsoleOutput.info(f"Initializing Text Backend ({pipeline_config.model_provider})...")
                  start_init = time.time()
                  try:
-                     # Prepare kwargs for local backends, including ModelConfig
+                     # Prepare kwargs for local backends, including ModelEntry
                      local_kwargs = {}
                      model_conf_for_local = None
                      if pipeline_config.model_provider == "local":
                          model_entry = get_registry().get_model(pipeline_config.model_specifier)
                          if model_entry:
-                             from config import ModelConfig # Local import
-                             model_conf_for_local = ModelConfig(
-                                 name=model_entry.name, model_id=model_entry.model_id,
+                             model_conf_for_local = ModelEntry(
+                                 name=model_entry.name, model_id=model_entry.model_id, author=model_entry.author,
                                  supports_thinking=model_entry.supports_thinking, thinking_tokens=model_entry.thinking_tokens or [],
                                  max_context=model_entry.max_context, optimal_chunk_size=model_entry.optimal_chunk_size,
                                  temperature=model_entry.temperature, top_p=model_entry.top_p,
@@ -1728,9 +1727,9 @@ class MenuSystem:
                                  quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
                              )
                          else:
-                             raise ValueError(f"ModelConfig not found in registry for {pipeline_config.model_specifier}")
+                             raise ValueError(f"ModelEntry not found in registry for {pipeline_config.model_specifier}")
 
-                         local_kwargs['model_config'] = model_conf_for_local # Pass resolved ModelConfig
+                         local_kwargs['model_config'] = model_conf_for_local # Pass resolved ModelEntry
                          local_kwargs['quantization_config'] = pipeline_config.quantization_config
                          local_kwargs['layer_split_config'] = pipeline_config.layer_split_config
 

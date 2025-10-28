@@ -2,7 +2,8 @@
 Processing Pipeline Module
 Main pipeline that orchestrates the PDF processing workflow
 """
-
+import gc
+import torch
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -11,13 +12,14 @@ from datetime import datetime # Added for timestamping output
 
 # --- LlamaNote Modules ---
 from loggerConf import get_logger_conf, LoggingProgress, MemoryMonitor, ConsoleOutput
+from config_base import *
 from config import ( # Keep specific config values if needed, but PipelineConfig comes from types
     PREPROCESS_PROMPT,
-    MODELS, # Keep for ModelEntry reference if filter needs it
+    MODELS,
     DEFAULT_MODEL,
     MEMORY_PROFILES,
     MARKDOWN_STYLES,
-    PIPELINE_STAGES, # Import this
+    PIPELINE_STAGES,
     ENABLE_STAGE_CHECKPOINTS,
     MAX_RETRIES,
     RETRY_DELAY_SECONDS,
@@ -31,21 +33,20 @@ from pipeline_types import (
     QuantizationConfig,
     LayerSplitConfig
 )
-from pdf_processor import PDFProcessor, PDFTextCleaner, PDFMetadata, ExtractionResult # Import dependent types
-from text_processor import TextChunker, TextPreprocessor, ChunkingStrategy, TextChunk # Import dependent types
-from llm_handler import ( # Import only necessary backend items
+from pdf_processor import PDFProcessor, PDFTextCleaner, PDFMetadata, ExtractionResult
+from text_processor import TextChunker, TextPreprocessor, ChunkingStrategy, TextChunk
+from llm_handler import (
     LLMBackend, GenerationResult, get_llm_backend
 )
-from response_filter import ChunkedResponseFilter, FilterResult # Import dependent types
+from response_filter import ChunkedResponseFilter, FilterResult
 from markdown_formatter import MarkdownFormatter, PodcastFormatter, TechnicalFormatter
 from file_handler import FileHandler
 from hyperparameters import HyperparameterConfig
-from model_registry import get_registry, get_model_config # Import registry functions
-# Import specific ModelEntry from config, needed by ResponseFilter
+from model_registry import get_registry, get_model_config
 from model_registry import ModelEntry
 
 logger = get_logger_conf(__name__)
-
+TIMESTAMP_OUTPUTS = str(datetime.now())
 
 class ProcessingPipeline:
     """Main processing pipeline for PDF to formatted text"""

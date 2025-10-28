@@ -2,7 +2,7 @@
 Audio Generator Module - Refactored with Backend Abstraction
 Text-to-speech generation using local HuggingFace models or cloud providers
 """
-
+import gc
 import os
 import torch
 import numpy as np
@@ -14,12 +14,12 @@ import librosa
 from transformers import pipeline, AutoProcessor, AutoModel # Keep for local models
 import warnings
 import time
-import abc # Import Abstract Base Class
+import abc
 
 # --- LlamaNote Modules ---
 from loggerConf import get_logger_conf, log_execution_time, ConsoleOutput
 from huggingface_search import ModelDownloader # Keep for local models
-# from config_manager import ConfigManager # Not directly needed here, but used by callers
+from config_manager import ConfigManager # Not directly needed here, but used by callers
 # Imports for local model types (conditionally imported in LocalAudioBackend)
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -32,14 +32,14 @@ class AudioConfig:
     """Configuration for audio generation (common settings)."""
     # model_id is now provider-specific, handled by AppState or PipelineConfig
     speaker_embedding: Optional[str] = None # Relevant for some local models like SpeechT5
-    sample_rate: int = 16000 # Target sample rate, backends might resample
+    sample_rate: int = 44100 # Target sample rate, backends might resample
     output_format: str = "wav" # Preferred output format (wav, mp3, flac)
     chunk_size: int = 3000  # Characters per text chunk for local models if needed
     speed: float = 1.0 # Playback speed factor (requires post-processing)
     pitch_shift: int = 0  # Semitones for pitch shift (requires post-processing)
     volume_normalize: bool = True # Whether to normalize volume (post-processing)
     device: str = "auto"  # auto, cpu, cuda (mainly for local models)
-    use_half_precision: bool = False # For local models
+    use_half_precision: bool = True # For local models
     # Cloud specific settings might go here or in backend-specific configs if complex
     cloud_voice: str = "alloy" # Example: default voice for cloud providers like OpenAI
 
@@ -84,7 +84,7 @@ class AudioBackend(abc.ABC):
         pass
 
     @abc.abstractmethod
-    @log_execution_time() # Apply decorator to implementations if desired
+    @log_execution_time()
     def generate_audio(self,
                       text: str,
                       output_path: Optional[Path] = None,
@@ -166,7 +166,6 @@ class AudioBackend(abc.ABC):
         valid_arrays = [arr for arr in audio_arrays if isinstance(arr, np.ndarray) and arr.size > 0]
         if not valid_arrays: return None
         if len(valid_arrays) == 1: return valid_arrays[0]
-
 
         # Add small silence between chunks
         silence_samples = int(0.2 * self.config.sample_rate)  # 200ms
@@ -288,6 +287,7 @@ class LocalAudioBackend(AudioBackend):
         "vits": ["facebook/mms-tts-eng"], # MMS uses VITS architecture
         "tacotron2": ["speechbrain/tts-tacotron2-ljspeech"],
         "fastspeech2": ["facebook/fastspeech2-en-ljspeech"],
+        "vibevoice": ["VibeVoice", "vibevoice"],
     }
 
     def __init__(self, config: AudioConfig, model_specifier: str):
@@ -331,6 +331,10 @@ class LocalAudioBackend(AudioBackend):
             elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["mms"]):
                  # Assuming MMS uses VITS architecture
                 self._load_vits_model(model_id)
+                loaded = True
+            elif any(term.lower() in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
+                self.logger.info("Detected VibeVoice model, using enhanced pipeline loading")
+                self._load_generic_pipeline(model_id)
                 loaded = True
             # Add checks for Tacotron2, FastSpeech2 if using direct loading instead of pipeline
             # elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["tacotron2"]):
@@ -404,16 +408,30 @@ class LocalAudioBackend(AudioBackend):
         """Load generic TTS model using pipeline."""
         # Determine device index for pipeline
         pipeline_device = 0 if self.device == "cuda" else -1
-        self.pipeline = pipeline(
-            "text-to-speech",
-            model=model_id,
-            device=pipeline_device
-        )
-        # Store the pipeline's internal model/processor if needed, or rely on pipeline call
-        if self.pipeline.model: self.model = self.pipeline.model
-        if self.pipeline.tokenizer: self.processor = self.pipeline.tokenizer # Use processor for consistency
-        elif self.pipeline.feature_extractor: self.processor = self.pipeline.feature_extractor
 
+        self.logger.info(f"Initializing TTS pipeline for {model_id}...")
+        
+        try:
+            self.pipeline = pipeline(
+                "text-to-speech",
+                model=model_id,
+                device=pipeline_device,
+                trust_remote_code=True
+            )
+
+            # Store the pipeline's internal model/processor if needed, or rely on pipeline call
+            if hasattr(self.pipeline, 'model') and self.pipeline.model:
+                self.model = self.pipeline.model
+            if hasattr(self.pipeline, 'tokenizer') and self.pipeline.tokenizer:
+                self.processor = self.pipeline.tokenizer # Use processor for consistency
+            elif hasattr(self.pipeline, 'feature_extractor') and self.pipeline.feature_extractor:
+                self.processor = self.pipeline.feature_extractor
+
+            self.logger.info(f"Pipeline initialized successfully for {model_id}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize pipeline: {e}", exc_info=True)
+            raise
 
     @log_execution_time()
     def generate_audio(self,
@@ -444,15 +462,23 @@ class LocalAudioBackend(AudioBackend):
                 text_chunks = self._split_text(text)
                 chunks_processed = len(text_chunks)
                 self.logger.info(f"Text too long, splitting into {chunks_processed} chunks.")
-                with LoggingProgress(self.logger, "Generating audio chunks", chunks_processed) as progress:
+                try:
+                    with LoggingProgress(self.logger, "Generating audio chunks", chunks_processed) as progress:
+                        for i, chunk in enumerate(text_chunks):
+                            self.logger.debug(f"Processing chunk {i+1}/{chunks_processed} (len: {len(chunk)})")
+                            audio_chunk = self._generate_single_chunk(chunk)
+                            if audio_chunk is not None and audio_chunk.size > 0:
+                                audio_arrays.append(audio_chunk)
+                            else:
+                                 self.logger.warning(f"Chunk {i+1} generated empty audio, skipping.")
+                            progress.update(1)
+                except ImportError:
+                    # Fallback without a progress bar
                     for i, chunk in enumerate(text_chunks):
-                        self.logger.debug(f"Processing chunk {i+1}/{chunks_processed} (len: {len(chunk)})")
+                        self.logger.debug(f"Processing chunk {i+1}/{chunks_processed}")
                         audio_chunk = self._generate_single_chunk(chunk)
                         if audio_chunk is not None and audio_chunk.size > 0:
                             audio_arrays.append(audio_chunk)
-                        else:
-                             self.logger.warning(f"Chunk {i+1} generated empty audio, skipping.")
-                        progress.update(1)
             else:
                 audio_chunk = self._generate_single_chunk(text)
                 if audio_chunk is not None and audio_chunk.size > 0:
@@ -513,6 +539,8 @@ class LocalAudioBackend(AudioBackend):
                 return self._generate_speecht5(text)
             elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["mms"]):
                 return self._generate_vits(text) # Assuming MMS uses VITS
+#            elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
+#                return self._generate_vibevoice(text)
             # Add other specific model calls here if needed
             else:
                 self.logger.error(f"Generation logic not implemented for model type: {self.model_specifier}. Try pipeline.")
@@ -528,20 +556,6 @@ class LocalAudioBackend(AudioBackend):
 
 
     # --- Specific Model Generation Methods ---
-    def _generate_bark(self, text: str) -> Optional[np.ndarray]:
-        if not self.model or not self.processor: return None
-        inputs = self.processor(text, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            # Bark generates audio directly
-            # Note: Bark generation can be slow, especially long sequences. Chunking is important.
-            # Consider adding generation arguments (e.g., voice presets) if available
-            audio_output = self.model.generate(**inputs, do_sample=True) # Or specific generate method
-        # Bark output needs sampling rate info - assume model config or default
-        self.config.sample_rate = self.model.generation_config.sample_rate # Get from model if possible
-        # Output might be on GPU, move to CPU and convert to numpy
-        return audio_output.cpu().numpy().squeeze()
-
-
     def _generate_speecht5(self, text: str) -> Optional[np.ndarray]:
         if not self.model or not self.processor or self.speaker_embeddings is None:
             self.logger.error("SpeechT5 components not fully loaded (model, processor, or embeddings missing).")
@@ -574,40 +588,97 @@ class LocalAudioBackend(AudioBackend):
             output = self.model(**inputs)
             # Access waveform based on model output structure (might be output.waveform or similar)
             waveform = output.waveform if hasattr(output, 'waveform') else output[0] # Adjust based on actual output
-        self.config.sample_rate = self.model.config.sampling_rate # Get from model config
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'sampling_rate'):
+            self.config.sample_rate = self.model.config.sampling_rate # Get from model config
+        else:
+            self.logger.warning("Could not determine sample rate from VITS model, using config default")
         return waveform.cpu().numpy().squeeze()
 
-
     def _generate_pipeline(self, text: str) -> Optional[np.ndarray]:
-        """Generate using the loaded Transformers pipeline."""
+        """Generate using the loaded Transformers pipeline - ENHANCED."""
         if not self.pipeline: return None
         try:
             # Pipeline expects string input, returns dict or audio data
+            self.logger.debug(f"Calling pipeline for text: {text[:50]}...")
             output = self.pipeline(text)
 
-            # Extract audio array - format varies between models
-            if isinstance(output, dict) and "audio" in output:
-                audio_array = output["audio"]
-                # Get sample rate from output if available
-                if "sampling_rate" in output:
-                     self.config.sample_rate = output["sampling_rate"]
+            # FIXED: Enhanced output parsing to handle more formats
+            audio_array = None
+            detected_sr = None
+            
+            # Try multiple output format possibilities
+            if isinstance(output, dict):
+                # Format 1: {"audio": array, "sampling_rate": int}
+                if "audio" in output:
+                    audio_array = output["audio"]
+                    detected_sr = output.get("sampling_rate") or output.get("sample_rate")
+                # Format 2: {"waveform": array, "sample_rate": int}
+                elif "waveform" in output:
+                    audio_array = output["waveform"]
+                    detected_sr = output.get("sample_rate") or output.get("sampling_rate")
+                # Format 3: Keys might be different for VibeVoice
+                elif "generated_audio" in output:
+                    audio_array = output["generated_audio"]
+                    detected_sr = output.get("sr") or output.get("sampling_rate")
+                else:
+                    # Try to find array-like values
+                    for key, value in output.items():
+                        if isinstance(value, (np.ndarray, list)) and not key.startswith('_'):
+                            audio_array = value
+                            self.logger.info(f"Found audio data under key: {key}")
+                            break
+                    
             elif isinstance(output, (np.ndarray, list)):
-                 # Assume output is directly the audio array
-                 audio_array = np.array(output) # Ensure numpy array
-                 # Try to get sample rate from pipeline config
-                 if hasattr(self.pipeline, 'model') and hasattr(self.pipeline.model, 'config') and hasattr(self.pipeline.model.config, 'sampling_rate'):
-                       self.config.sample_rate = self.pipeline.model.config.sampling_rate
-                 else:
-                       self.logger.warning("Could not determine sample rate from pipeline output. Using default.")
+                 # Direct array output
+                 audio_array = np.array(output)
+                 
+            elif isinstance(output, tuple):
+                # Some models return (audio, sample_rate)
+                if len(output) >= 2:
+                    audio_array = output[0]
+                    detected_sr = output[1] if isinstance(output[1], (int, float)) else None
+                elif len(output) == 1:
+                    audio_array = output[0]
             else:
                  self.logger.error(f"Unexpected output format from pipeline: {type(output)}")
+                 self.logger.debug(f"Output keys/type: {output.keys() if isinstance(output, dict) else type(output)}")
                  return None
 
-            # Squeeze unnecessary dimensions
-            if isinstance(audio_array, np.ndarray):
-                 return audio_array.squeeze()
+            # Ensure we have audio data
+            if audio_array is None:
+                self.logger.error("Could not extract audio array from pipeline output")
+                return None
+                
+            # Convert to numpy array if needed
+            if not isinstance(audio_array, np.ndarray):
+                audio_array = np.array(audio_array)
+            
+            # Update sample rate if detected
+            if detected_sr is not None:
+                self.config.sample_rate = int(detected_sr)
+                self.logger.info(f"Detected sample rate from pipeline: {self.config.sample_rate}Hz")
             else:
-                 return np.array(audio_array).squeeze() # Ensure numpy array
+                # FIXED: Try to get from model config as fallback
+                if hasattr(self.pipeline, 'model') and hasattr(self.pipeline.model, 'config'):
+                    model_config = self.pipeline.model.config
+                    for sr_attr in ['sampling_rate', 'sample_rate', 'sr']:
+                        if hasattr(model_config, sr_attr):
+                            self.config.sample_rate = int(getattr(model_config, sr_attr))
+                            self.logger.info(f"Got sample rate from model config: {self.config.sample_rate}Hz")
+                            break
+                else:
+                    self.logger.warning(f"Could not determine sample rate from pipeline output. Using config default: {self.config.sample_rate}Hz")
+
+            # Squeeze unnecessary dimensions
+            audio_array = audio_array.squeeze()
+            
+            # Validate output
+            if audio_array.size == 0:
+                self.logger.error("Pipeline returned empty audio array")
+                return None
+                
+            self.logger.debug(f"Successfully generated audio: shape={audio_array.shape}, dtype={audio_array.dtype}")
+            return audio_array
 
         except Exception as e:
             self.logger.error(f"Error during pipeline generation: {e}", exc_info=True)
@@ -617,7 +688,6 @@ class LocalAudioBackend(AudioBackend):
     def unload_model(self):
         """Unload local model and free memory."""
         self.logger.info(f"Unloading local model: {self.model_specifier}")
-        # Delete references
         if self.model: del self.model
         if self.processor: del self.processor
         if self.vocoder: del self.vocoder
@@ -634,7 +704,6 @@ class LocalAudioBackend(AudioBackend):
     def __del__(self):
         self.unload_model()
 
-
 # --- Cloud Backend Example: OpenAI TTS ---
 
 # Try importing OpenAI library
@@ -644,7 +713,6 @@ try:
 except ImportError:
     openai = None
     OPENAI_AVAILABLE = False
-
 
 class OpenAITTSBackend(AudioBackend):
     """Generate audio using OpenAI's Text-to-Speech API."""
@@ -820,7 +888,6 @@ class OpenAITTSBackend(AudioBackend):
                    try: input_audio_path.unlink()
                    except OSError: pass
               return None
-
 
 # --- Factory Function ---
 

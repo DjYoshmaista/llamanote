@@ -111,10 +111,10 @@ class MemoryConfig:
     quantization_type: str = "4bit" # Should match DEFAULT_QUANTIZATION
     max_gpu_memory: str = "10GB" # Example default
     max_cpu_memory: str = "30GB" # Example default
-    use_flash_attention: bool = True # Specific to transformers backend
-    use_gradient_checkpointing: bool = False # Usually for training
+    use_flash_attention: bool = False # Specific to transformers backend
+    use_gradient_checkpointing: bool = True # Usually for training
     offload_to_disk: bool = True # Maps to LayerSplitConfig offload folder
-    batch_size: int = 1 # Relevant for batch processing
+    batch_size: int = 128 # Relevant for batch processing
 
 
 # Example memory profiles (Can be used to create Quantization/LayerSplit configs)

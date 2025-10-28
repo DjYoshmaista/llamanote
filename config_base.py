@@ -27,8 +27,8 @@ DEFAULT_GPU_LAYERS = -1  # -1 means auto-detect
 
 # Chunk processing settings
 CHUNK_SIZE_MIN = 100
-CHUNK_SIZE_MAX = 5000
-CHUNK_SIZE_DEFAULT = 1000
+CHUNK_SIZE_MAX = 50000
+CHUNK_SIZE_DEFAULT = 5000
 CHUNK_OVERLAP = 50
 
 # Default model selection
