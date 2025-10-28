@@ -356,6 +356,52 @@ class LocalAudioBackend(AudioBackend):
             self.model = self.processor = self.vocoder = self.pipeline = None
             return False
 
+    def unload_model(self):
+        """Unload local model and free memory."""
+        self.logger.info(f"Unloading local model: {self.model_specifier}")
+        
+        # Delete model reference
+        if hasattr(self, 'model') and self.model is not None:
+            del self.model
+            self.model = None
+        
+        # Delete processor reference
+        if hasattr(self, 'processor') and self.processor is not None:
+            del self.processor
+            self.processor = None
+        
+        # Delete vocoder reference (SpeechT5 specific)
+        if hasattr(self, 'vocoder') and self.vocoder is not None:
+            del self.vocoder
+            self.vocoder = None
+        
+        # Delete pipeline reference
+        if hasattr(self, 'pipeline') and self.pipeline is not None:
+            del self.pipeline
+            self.pipeline = None
+        
+        # Clear speaker embeddings
+        if hasattr(self, 'speaker_embeddings') and self.speaker_embeddings is not None:
+            self.speaker_embeddings = None
+        
+        if hasattr(self, 'embeddings_dataset') and self.embeddings_dataset is not None:
+            self.embeddings_dataset = None
+        
+        # Clear CUDA cache if available
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                self.logger.debug("CUDA cache cleared")
+        except ImportError:
+            pass
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        self.logger.info("Local audio model unloaded")
+
     def _load_bark_model(self, model_id: str):
         from transformers import BarkModel, AutoProcessor
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -403,15 +449,15 @@ class LocalAudioBackend(AudioBackend):
              # For MMS, the pipeline handles it, but direct use might need adjustment
              self.logger.warning(f"Loaded VITS model {model_id} might require specific generation call.")
 
-
     def _load_generic_pipeline(self, model_id: str):
-        """Load generic TTS model using pipeline."""
-        # Determine device index for pipeline
+        """Load generic TTS model using pipeline with enhanced diagnostics."""
         pipeline_device = 0 if self.device == "cuda" else -1
 
         self.logger.info(f"Initializing TTS pipeline for {model_id}...")
+        self.logger.debug(f"Device: {self.device} (pipeline_device={pipeline_device})")
         
         try:
+            # Try loading with trust_remote_code
             self.pipeline = pipeline(
                 "text-to-speech",
                 model=model_id,
@@ -419,14 +465,38 @@ class LocalAudioBackend(AudioBackend):
                 trust_remote_code=True
             )
 
-            # Store the pipeline's internal model/processor if needed, or rely on pipeline call
-            if hasattr(self.pipeline, 'model') and self.pipeline.model:
+            # Log pipeline details
+            self.logger.info(f"Pipeline initialized: {type(self.pipeline).__name__}")
+            
+            # Try to get model info
+            if hasattr(self.pipeline, 'model'):
                 self.model = self.pipeline.model
-            if hasattr(self.pipeline, 'tokenizer') and self.pipeline.tokenizer:
-                self.processor = self.pipeline.tokenizer # Use processor for consistency
-            elif hasattr(self.pipeline, 'feature_extractor') and self.pipeline.feature_extractor:
+                self.logger.debug(f"Pipeline model type: {type(self.model).__name__}")
+                
+                if hasattr(self.model, 'config'):
+                    config = self.model.config
+                    self.logger.debug(f"Model config type: {type(config).__name__}")
+                    
+                    # Log relevant config attributes
+                    config_attrs = ['sampling_rate', 'sample_rate', 'sr', 'model_type']
+                    for attr in config_attrs:
+                        if hasattr(config, attr):
+                            self.logger.debug(f"Model config.{attr} = {getattr(config, attr)}")
+            
+            if hasattr(self.pipeline, 'tokenizer'):
+                self.processor = self.pipeline.tokenizer
+                self.logger.debug("Got tokenizer from pipeline")
+            elif hasattr(self.pipeline, 'feature_extractor'):
                 self.processor = self.pipeline.feature_extractor
+                self.logger.debug("Got feature_extractor from pipeline")
 
+            # Test the pipeline with a short sample
+            self.logger.info("Testing pipeline with sample text...")
+            test_result = self.pipeline("Test")
+            self.logger.info(f"Test generation successful. Output type: {type(test_result)}")
+            if isinstance(test_result, dict):
+                self.logger.info(f"Test output keys: {list(test_result.keys())}")
+            
             self.logger.info(f"Pipeline initialized successfully for {model_id}")
 
         except Exception as e:
@@ -595,114 +665,161 @@ class LocalAudioBackend(AudioBackend):
         return waveform.cpu().numpy().squeeze()
 
     def _generate_pipeline(self, text: str) -> Optional[np.ndarray]:
-        """Generate using the loaded Transformers pipeline - ENHANCED."""
-        if not self.pipeline: return None
+        """Generate using the loaded Transformers pipeline - ENHANCED with better error handling."""
+        if not self.pipeline:
+            self.logger.error("Pipeline not loaded")
+            return None
+        
         try:
-            # Pipeline expects string input, returns dict or audio data
             self.logger.debug(f"Calling pipeline for text: {text[:50]}...")
+            self.logger.debug(f"Pipeline type: {type(self.pipeline)}")
+            
+            # Call the pipeline
             output = self.pipeline(text)
-
-            # FIXED: Enhanced output parsing to handle more formats
+            
+            self.logger.debug(f"Pipeline output type: {type(output)}")
+            self.logger.debug(f"Pipeline output keys/structure: {output.keys() if isinstance(output, dict) else type(output)}")
+            
+            # Initialize variables
             audio_array = None
             detected_sr = None
             
-            # Try multiple output format possibilities
+            # === FORMAT DETECTION WITH EXTENSIVE LOGGING ===
+            
             if isinstance(output, dict):
-                # Format 1: {"audio": array, "sampling_rate": int}
-                if "audio" in output:
-                    audio_array = output["audio"]
-                    detected_sr = output.get("sampling_rate") or output.get("sample_rate")
-                # Format 2: {"waveform": array, "sample_rate": int}
-                elif "waveform" in output:
-                    audio_array = output["waveform"]
-                    detected_sr = output.get("sample_rate") or output.get("sampling_rate")
-                # Format 3: Keys might be different for VibeVoice
-                elif "generated_audio" in output:
-                    audio_array = output["generated_audio"]
-                    detected_sr = output.get("sr") or output.get("sampling_rate")
-                else:
-                    # Try to find array-like values
+                self.logger.debug(f"Output is dict with keys: {list(output.keys())}")
+                
+                # Try common key patterns in priority order
+                audio_keys = ['audio', 'waveform', 'generated_audio', 'speech', 'generated_speech']
+                sr_keys = ['sampling_rate', 'sample_rate', 'sr', 'rate']
+                
+                # Find audio data
+                for key in audio_keys:
+                    if key in output:
+                        audio_array = output[key]
+                        self.logger.info(f"Found audio data under key: '{key}'")
+                        break
+                
+                # If no standard key found, try to find any array-like value
+                if audio_array is None:
+                    self.logger.warning("No standard audio key found, searching for array-like values...")
                     for key, value in output.items():
                         if isinstance(value, (np.ndarray, list)) and not key.startswith('_'):
-                            audio_array = value
-                            self.logger.info(f"Found audio data under key: {key}")
-                            break
-                    
+                            # Check if it looks like audio data (1D or 2D array with reasonable size)
+                            if isinstance(value, np.ndarray):
+                                if value.ndim == 1 or (value.ndim == 2 and value.shape[0] <= 2):
+                                    audio_array = value
+                                    self.logger.info(f"Found audio-like array under key: '{key}' (shape: {value.shape})")
+                                    break
+                            elif isinstance(value, list) and len(value) > 100:  # Likely audio samples
+                                audio_array = value
+                                self.logger.info(f"Found audio-like list under key: '{key}' (length: {len(value)})")
+                                break
+                
+                # Find sample rate
+                for key in sr_keys:
+                    if key in output and isinstance(output[key], (int, float)):
+                        detected_sr = int(output[key])
+                        self.logger.info(f"Found sample rate under key: '{key}' = {detected_sr}Hz")
+                        break
+                        
             elif isinstance(output, (np.ndarray, list)):
-                 # Direct array output
-                 audio_array = np.array(output)
-                 
+                self.logger.debug(f"Output is direct array/list")
+                audio_array = np.array(output) if isinstance(output, list) else output
+                self.logger.info(f"Using direct array output (shape: {audio_array.shape if hasattr(audio_array, 'shape') else len(audio_array)})")
+                
             elif isinstance(output, tuple):
-                # Some models return (audio, sample_rate)
+                self.logger.debug(f"Output is tuple with {len(output)} elements")
                 if len(output) >= 2:
                     audio_array = output[0]
-                    detected_sr = output[1] if isinstance(output[1], (int, float)) else None
+                    if isinstance(output[1], (int, float)):
+                        detected_sr = int(output[1])
+                        self.logger.info(f"Found sample rate from tuple: {detected_sr}Hz")
                 elif len(output) == 1:
                     audio_array = output[0]
+                self.logger.info(f"Using audio from tuple (element 0)")
             else:
-                 self.logger.error(f"Unexpected output format from pipeline: {type(output)}")
-                 self.logger.debug(f"Output keys/type: {output.keys() if isinstance(output, dict) else type(output)}")
-                 return None
+                self.logger.error(f"Unexpected output type: {type(output)}")
+                self.logger.debug(f"Output content: {str(output)[:200]}")
+                return None
 
-            # Ensure we have audio data
+            # === VALIDATE AUDIO ARRAY ===
             if audio_array is None:
                 self.logger.error("Could not extract audio array from pipeline output")
+                if isinstance(output, dict):
+                    self.logger.error(f"Available keys were: {list(output.keys())}")
                 return None
-                
+            
             # Convert to numpy array if needed
             if not isinstance(audio_array, np.ndarray):
-                audio_array = np.array(audio_array)
+                try:
+                    audio_array = np.array(audio_array)
+                    self.logger.debug(f"Converted audio to numpy array: {audio_array.shape}, {audio_array.dtype}")
+                except Exception as conv_err:
+                    self.logger.error(f"Failed to convert audio to numpy array: {conv_err}")
+                    return None
             
-            # Update sample rate if detected
+            # === SAMPLE RATE DETECTION/FALLBACK ===
             if detected_sr is not None:
                 self.config.sample_rate = int(detected_sr)
-                self.logger.info(f"Detected sample rate from pipeline: {self.config.sample_rate}Hz")
+                self.logger.info(f"Using detected sample rate: {self.config.sample_rate}Hz")
             else:
-                # FIXED: Try to get from model config as fallback
+                # Try to get from model config
+                sr_from_model = None
                 if hasattr(self.pipeline, 'model') and hasattr(self.pipeline.model, 'config'):
                     model_config = self.pipeline.model.config
                     for sr_attr in ['sampling_rate', 'sample_rate', 'sr']:
                         if hasattr(model_config, sr_attr):
-                            self.config.sample_rate = int(getattr(model_config, sr_attr))
-                            self.logger.info(f"Got sample rate from model config: {self.config.sample_rate}Hz")
+                            sr_from_model = int(getattr(model_config, sr_attr))
+                            self.config.sample_rate = sr_from_model
+                            self.logger.info(f"Got sample rate from model config.{sr_attr}: {self.config.sample_rate}Hz")
                             break
-                else:
-                    self.logger.warning(f"Could not determine sample rate from pipeline output. Using config default: {self.config.sample_rate}Hz")
+                
+                if sr_from_model is None:
+                    self.logger.warning(f"Could not detect sample rate. Using config default: {self.config.sample_rate}Hz")
+                    self.logger.warning("Audio playback speed may be incorrect!")
 
-            # Squeeze unnecessary dimensions
+            # === PROCESS AUDIO ARRAY ===
+            # Handle multi-channel audio (stereo -> mono)
+            if audio_array.ndim == 2:
+                if audio_array.shape[0] <= 2:  # Channels first
+                    self.logger.info(f"Converting {audio_array.shape[0]}-channel audio to mono")
+                    audio_array = np.mean(audio_array, axis=0)
+                elif audio_array.shape[1] <= 2:  # Channels last
+                    self.logger.info(f"Converting {audio_array.shape[1]}-channel audio to mono")
+                    audio_array = np.mean(audio_array, axis=1)
+                else:
+                    self.logger.warning(f"Unexpected 2D shape: {audio_array.shape}, squeezing...")
+                    audio_array = audio_array.squeeze()
+            
+            # Final squeeze to ensure 1D
             audio_array = audio_array.squeeze()
             
-            # Validate output
+            # === VALIDATION ===
             if audio_array.size == 0:
                 self.logger.error("Pipeline returned empty audio array")
                 return None
-                
-            self.logger.debug(f"Successfully generated audio: shape={audio_array.shape}, dtype={audio_array.dtype}")
+            
+            if audio_array.ndim != 1:
+                self.logger.error(f"Audio array has unexpected dimensions: {audio_array.ndim}D, shape: {audio_array.shape}")
+                return None
+            
+            # Check for reasonable values
+            max_val = np.abs(audio_array).max()
+            if max_val < 1e-6:
+                self.logger.warning("Audio array appears to be silent (max absolute value < 1e-6)")
+            
+            self.logger.info(f"Successfully generated audio: shape={audio_array.shape}, dtype={audio_array.dtype}, "
+                            f"range=[{audio_array.min():.3f}, {audio_array.max():.3f}], sr={self.config.sample_rate}Hz")
+            
             return audio_array
 
         except Exception as e:
             self.logger.error(f"Error during pipeline generation: {e}", exc_info=True)
+            self.logger.error(f"Pipeline model: {self.model_specifier}")
+            if hasattr(self, 'pipeline') and self.pipeline:
+                self.logger.error(f"Pipeline class: {self.pipeline.__class__.__name__}")
             return None
-
-
-    def unload_model(self):
-        """Unload local model and free memory."""
-        self.logger.info(f"Unloading local model: {self.model_specifier}")
-        if self.model: del self.model
-        if self.processor: del self.processor
-        if self.vocoder: del self.vocoder
-        if self.pipeline: del self.pipeline
-        self.model = self.processor = self.vocoder = self.pipeline = None
-        self.speaker_embeddings = None # Clear embeddings too
-        self.embeddings_dataset = None
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        self.logger.info("Local model unloaded.")
-
-    def __del__(self):
-        self.unload_model()
 
 # --- Cloud Backend Example: OpenAI TTS ---
 
