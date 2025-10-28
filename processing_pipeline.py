@@ -3,6 +3,7 @@ Processing Pipeline Module
 Main pipeline that orchestrates the PDF processing workflow
 """
 import gc
+from functools import wraps
 import torch
 import time
 from pathlib import Path
@@ -390,7 +391,7 @@ class ProcessingPipeline:
             # Do NOT unload model here, caller manages backend lifecycle
             pass
 
-@with_checkpoint("extract")
+    @with_checkpoint("extract")
     def _stage_extract(self, input_path: Path) -> Optional[ExtractionResult]:
         """Stage 1: Extract text from PDF"""
         result = self.pdf_processor.extract_text(input_path)
@@ -404,7 +405,7 @@ class ProcessingPipeline:
         
         self.memory_monitor.check("after extraction")
         return result
-    
+
     @with_checkpoint("preprocess")
     def _stage_preprocess(self, text: str) -> str:
         """Stage 2: Preprocess text"""
@@ -417,7 +418,7 @@ class ProcessingPipeline:
         ConsoleOutput.info(f"Preprocessed text: {len(preprocessed_text):,} characters")
         
         return preprocessed_text
-    
+
     @with_checkpoint("chunk")
     def _stage_chunk(self, text: str) -> 'ChunkingResult':
         """Stage 3: Chunk text"""
@@ -425,24 +426,13 @@ class ProcessingPipeline:
         ConsoleOutput.info(f"Created {len(result.chunks)} chunks (avg size: {result.average_chunk_size:.0f} chars)")
         return result
 
+    @with_checkpoint("process")
     def _stage_process(self, chunks: List[str]) -> List[str]:
         """Stage 4: Process chunks with LLM"""
-        self.current_stage = "process"
-        ConsoleOutput.section(f"Stage 4: Processing with LLM ({self.llm_backend.model_identifier})")
-
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            if checkpoint and isinstance(checkpoint, list):
-                self.logger.info("Loaded processing checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
         if self.llm_backend is None:
-             raise RuntimeError("LLM Backend not set in pipeline. Cannot process.")
+            raise RuntimeError("LLM Backend not set in pipeline. Cannot process.")
         
-        # Ensure model is loaded (it should be, but check)
+        # Ensure model is loaded
         if self.llm_backend.model is None:
             self.logger.warning("LLM backend model was not loaded. Attempting to load now.")
             if not self.llm_backend.load_model():
@@ -456,7 +446,7 @@ class ProcessingPipeline:
             for i, chunk in enumerate(chunks):
                 retry_count = 0
                 success = False
-                result_text = chunk # Default to original if fallback enabled
+                result_text = chunk  # Default to original if fallback enabled
 
                 while retry_count <= self.config.max_retries and not success:
                     try:
@@ -468,9 +458,9 @@ class ProcessingPipeline:
                             remove_thinking=False  # Filter in next stage
                         )
 
-                        # Check if result indicates an error (e.g., API error)
+                        # Check if result indicates an error
                         if "[Error:" in result.raw_output or "[Blocked" in result.raw_output:
-                             raise RuntimeError(f"LLM API Error: {result.raw_output}")
+                            raise RuntimeError(f"LLM API Error: {result.raw_output}")
 
                         result_text = result.raw_output
                         processed_chunks.append(result_text)
@@ -483,52 +473,33 @@ class ProcessingPipeline:
 
                         if retry_count <= self.config.max_retries:
                             ConsoleOutput.warning(f"Retrying chunk {i+1} (attempt {retry_count})...")
-                            time.sleep(RETRY_DELAY_SECONDS * (2**(retry_count-1))) # Exponential backoff
+                            time.sleep(RETRY_DELAY_SECONDS * (2**(retry_count-1)))  # Exponential backoff
                         else:
                             self.logger.error(f"Chunk {i+1} failed permanently after {self.config.max_retries} attempts.")
                             if FALLBACK_ON_ERROR:
-                                processed_chunks.append(chunk) # Use original chunk
+                                processed_chunks.append(chunk)  # Use original chunk
                                 self.logger.info(f"Using original chunk {i+1} as fallback")
-                                success = True # Allow pipeline to continue
+                                success = True
                                 progress.update(1, f"Chunk {i+1}/{len(chunks)} - Fallback")
                             else:
-                                raise RuntimeError(f"Failed to process chunk {i+1}: {e}") # Propagate error if no fallback
+                                raise RuntimeError(f"Failed to process chunk {i+1}: {e}")
 
-                # Memory management (clear CUDA cache periodically for local models)
+                # Memory management
                 if self.llm_backend.provider_identifier.startswith("local") and torch.cuda.is_available():
-                    if (i + 1) % 5 == 0: # Clear every 5 chunks
-                         gc.collect()
-                         torch.cuda.empty_cache()
-                         self.memory_monitor.check(f"after clearing cache (chunk {i+1})")
+                    if (i + 1) % 5 == 0:  # Clear every 5 chunks
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        self.memory_monitor.check(f"after clearing cache (chunk {i+1})")
 
         ConsoleOutput.success(f"Processed {len(processed_chunks)} chunks")
-
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                processed_chunks, self.checkpoint_name, self.current_stage
-            )
-
-        self.stages_completed.append(self.current_stage)
         return processed_chunks
 
+    @with_checkpoint("filter")
     def _stage_filter(self, chunks: List[str]) -> List[str]:
         """Stage 5: Filter responses"""
-        self.current_stage = "filter"
-        ConsoleOutput.section("Stage 5: Filtering responses")
-
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            if checkpoint and isinstance(checkpoint, list): # Should be list of strings
-                self.logger.info("Loaded filtering checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
         if not self.config.remove_thinking:
             self.logger.info("Skipping filtering (remove_thinking=False)")
-            self.stages_completed.append(self.current_stage)
-            return chunks # Return the input chunks directly
+            return chunks  # Return input chunks directly
 
         filtered_paragraph_chunks = []
         total_removed_chars = 0
@@ -536,11 +507,8 @@ class ProcessingPipeline:
 
         with LoggingProgress(self.logger, "Filtering chunks", len(chunks)) as progress:
             for i, chunk in enumerate(chunks):
-                is_first = (i == 0)
-                is_last = (i == len(chunks) - 1)
-
-                # Filter individual chunk (might remove thinking tags)
-                filter_result: FilterResult = self.response_filter.filter.filter(chunk) # Use the base filter here
+                # Filter individual chunk
+                filter_result: FilterResult = self.response_filter.filter.filter(chunk)
                 filtered_text = filter_result.filtered_text
                 total_removed_chars += filter_result.removal_ratio * len(chunk)
 
@@ -551,51 +519,31 @@ class ProcessingPipeline:
         # Use the ChunkedResponseFilter's merge logic to smooth boundaries
         merged_text = self.response_filter.merge_chunks(filtered_paragraph_chunks)
 
-        # Re-split into paragraphs for consistency with potential checkpoint format
+        # Re-split into paragraphs for consistency
         final_paragraphs = merged_text.split('\n\n')
-        final_paragraphs = [p.strip() for p in final_paragraphs if p.strip()] # Clean empty paragraphs
+        final_paragraphs = [p.strip() for p in final_paragraphs if p.strip()]
 
         ConsoleOutput.info(f"Filtered ~{total_removed_chars:.0f} characters of thinking/artifacts "
                            f"({(total_removed_chars / max(original_total_chars, 1)) * 100:.1f}%)")
 
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                final_paragraphs, self.checkpoint_name, self.current_stage
-            )
+        return final_paragraphs
 
-        self.stages_completed.append(self.current_stage)
-        return final_paragraphs # Return list of filtered paragraphs
-
-    def _stage_format(self, text_to_format: str) -> str: # Takes joined text now
+    @with_checkpoint("format")
+    def _stage_format(self, text_to_format: str) -> str:
         """Stage 6: Format output"""
-        self.current_stage = "format"
-        ConsoleOutput.section("Stage 6: Formatting output")
-
-        if self.config.enable_checkpoints:
-            checkpoint = self.file_handler.load_checkpoint(
-                self.checkpoint_name, self.current_stage
-            )
-            if checkpoint and isinstance(checkpoint, str):
-                self.logger.info("Loaded formatting checkpoint")
-                self.stages_completed.append(self.current_stage)
-                return checkpoint
-
-
         # Apply formatting based on mode
         formatted_text = ""
         if self.config.mode == ProcessingMode.PODCAST:
-            # Assuming self.formatter is PodcastFormatter
             formatted_text = self.formatter.format_dialogue(
                 text_to_format,
                 auto_detect_speakers=True
             )
         elif self.config.mode == ProcessingMode.TECHNICAL:
-             # Assuming self.formatter is TechnicalFormatter
-             formatted_text = self.formatter.format_with_headers(
-                 text_to_format,
-                 auto_generate_toc=True
-             )
-        else: # Default/Narrative/Summary
+            formatted_text = self.formatter.format_with_headers(
+                text_to_format,
+                auto_generate_toc=True
+            )
+        else:  # Default/Narrative/Summary
             formatted_text = self.formatter.format_text(
                 text_to_format,
                 detect_emotions=self.config.add_emotions,
@@ -603,72 +551,58 @@ class ProcessingPipeline:
             )
 
         ConsoleOutput.info(f"Formatted output: {len(formatted_text):,} characters")
-
-        if self.config.enable_checkpoints:
-            self.file_handler.save_checkpoint(
-                formatted_text, self.checkpoint_name, self.current_stage
-            )
-
-        self.stages_completed.append(self.current_stage)
         return formatted_text
 
+    @with_checkpoint("save")
     def _stage_save(self,
                     text: str,
                     input_path: Path,
                     output_path_base: Optional[Path],
-                    pdf_metadata: Optional[PDFMetadata]) -> Path: # pdf_metadata type hint
+                    pdf_metadata: Optional[PDFMetadata]) -> Path:
         """Stage 7: Save output"""
-        self.current_stage = "save"
-        ConsoleOutput.section("Stage 7: Saving output")
-
         # Generate output path using FileHandler logic
-        # If output_path_base is provided (e.g., from CLI), use it
-        # Otherwise, generate a path based on the input file
         if output_path_base:
-             # Ensure the directory exists
-             output_path_base.parent.mkdir(parents=True, exist_ok=True)
-             # Apply suffix and extension
-             output_path = output_path_base.with_suffix(f".{self.config.output_format}")
-             # Note: This logic assumes output_path_base does *not* include the suffix/timestamp
-             # A better way might be for get_output_path to handle an optional base name
+            # Ensure the directory exists
+            output_path_base.parent.mkdir(parents=True, exist_ok=True)
+            # Apply suffix and extension
+            output_path = output_path_base.with_suffix(f".{self.config.output_format}")
         else:
-             output_path = self.file_handler.get_output_path(
+            output_path = self.file_handler.get_output_path(
                 input_path=input_path,
                 suffix=f"_{self.config.mode.value}",
                 extension=f".{self.config.output_format}"
-             )
-
+            )
 
         # Prepare metadata for the output file header
         metadata_to_save = {
             "source_file": str(input_path.resolve()),
             "processing_mode": self.config.mode.value,
-            "model_used": self.config.model_name, # Includes provider:specifier
-            "stages_run": self.stages_to_run, # Record which stages were configured to run
-            "stages_completed": self.stages_completed + [self.current_stage] # Record stages actually finished
+            "model_used": self.config.model_name,
+            "stages_run": self.stages_to_run,
+            "stages_completed": self.stages_completed + [self.current_stage]
         }
 
         # Add PDF metadata if available
         if pdf_metadata and isinstance(pdf_metadata, PDFMetadata):
-             try:
-                 if pdf_metadata.title: metadata_to_save["original_title"] = pdf_metadata.title
-                 if pdf_metadata.author: metadata_to_save["original_author"] = pdf_metadata.author
-                 metadata_to_save["original_pages"] = pdf_metadata.num_pages
-             except Exception as e:
-                 logger.warning(f"Could not parse PDF metadata for saving: {e}")
-
+            try:
+                if pdf_metadata.title:
+                    metadata_to_save["original_title"] = pdf_metadata.title
+                if pdf_metadata.author:
+                    metadata_to_save["original_author"] = pdf_metadata.author
+                metadata_to_save["original_pages"] = pdf_metadata.num_pages
+            except Exception as e:
+                logger.warning(f"Could not parse PDF metadata for saving: {e}")
 
         # Save file using FileHandler
         saved_path = self.file_handler.save_text(
             text, output_path,
-            format=self.config.output_format, # Use config format
-            metadata=metadata_to_save if INCLUDE_METADATA else None # Use base config flag
+            format=self.config.output_format,
+            metadata=metadata_to_save if INCLUDE_METADATA else None
         )
 
         if not saved_path:
-             raise IOError(f"Failed to save output file to {output_path}")
+            raise IOError(f"Failed to save output file to {output_path}")
 
-        self.stages_completed.append(self.current_stage)
         return saved_path
 
     def _gather_statistics(self, data_payload: Dict[str, Any]) -> Dict[str, Any]:

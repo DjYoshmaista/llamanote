@@ -18,7 +18,7 @@ import abc
 
 # --- LlamaNote Modules ---
 from loggerConf import LoggingProgress, get_logger_conf, log_execution_time, ConsoleOutput
-from model_hub import ModelDownloader # Keep for local models
+from model_hub import ModelHub # Keep for local models
 from config_manager import ConfigManager # Not directly needed here, but used by callers
 # Imports for local model types (conditionally imported in LocalAudioBackend)
 
@@ -297,7 +297,8 @@ class LocalAudioBackend(AudioBackend):
         self.vocoder = None # Specific to SpeechT5
         self.pipeline = None # For pipeline-based models
         self.device = self._setup_device()
-        self.model_downloader = ModelDownloader() # Handles HF downloads
+        from config import CACHE_DIR
+        self.model_downloader = ModelHub(cache_dir=CACHE_DIR / "audio_models") # Handles HF downloads
         # Lazy load datasets for speaker embeddings if needed
         self.speaker_embeddings = None
         self.embeddings_dataset = None
@@ -313,11 +314,16 @@ class LocalAudioBackend(AudioBackend):
         self.logger.info(f"Loading local TTS model: {model_id} onto {self.device}")
 
         try:
-            # Ensure model is downloaded
-            model_path = self.model_downloader.download_model(model_id)
-            if not model_path:
-                self.logger.error(f"Failed to download model: {model_id}")
-                return False
+            # Check if model is already cached
+            if not self.model_hub.is_model_cached(model_id):
+                self.logger.info(f"Model not cached, downloading: {model_id}")
+                model_path = self.model_hub.download_model(model_id)
+                if not model_path:
+                    self.logger.error(f"Failed to download model: {model_id}")
+                    return False
+                self.logger.info(f"Model downloaded to: {model_path}")
+            else:
+                self.logger.info(f"Using cached model: {model_id}")
 
             # Detect model type and load
             model_id_lower = model_id.lower()

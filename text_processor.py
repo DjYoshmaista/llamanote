@@ -19,6 +19,42 @@ from config import (
 
 logger = get_logger_conf(__name__)
 
+def _apply_overlap_and_create_chunks(self, 
+                                     initial_chunks: List[str], 
+                                     strategy: ChunkingStrategy) -> List[TextChunk]:
+    """
+    Helper method to apply overlap and create TextChunk objects.
+    
+    Args:
+        initial_chunks: List of raw text chunks
+        strategy: The chunking strategy used
+        
+    Returns:
+        List of TextChunk objects with overlap applied
+    """
+    if not initial_chunks:
+        return []
+    
+    final_chunks = []
+    
+    for i, chunk_text in enumerate(initial_chunks):
+        # Apply overlap from previous chunk
+        if i > 0 and self.overlap_size > 0:
+            prev_chunk = initial_chunks[i - 1]
+            overlap_text = prev_chunk[-self.overlap_size:] if len(prev_chunk) > self.overlap_size else prev_chunk
+            chunk_text = overlap_text + " " + chunk_text
+        
+        # Create TextChunk object
+        text_chunk = TextChunk(
+            text=chunk_text,
+            index=i,
+            char_count=len(chunk_text),
+            word_count=len(chunk_text.split()),
+            strategy=strategy
+        )
+        final_chunks.append(text_chunk)
+    
+    return final_chunks
 
 class ChunkingStrategy(Enum):
     """Different strategies for chunking text"""
@@ -215,118 +251,113 @@ class TextChunker:
         return self._chunk_with_accumulator(sentences, sizes, join_str=' ')
 
     def _chunk_by_paragraphs(self, text: str) -> List[TextChunk]:
-        """Chunk text at paragraph boundaries"""
-        paragraphs = text.split('\n\n')
+        """Chunk by paragraphs, combining small ones to reach target size."""
+        # Split into paragraphs (double newline or single newline followed by indent)
+        paragraphs = re.split(r'\n\s*\n|\n(?=\s{4,})', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        # Combine small paragraphs
+        chunks = []
+        current_chunk = ""
+        
+        for para in paragraphs:
+            if len(current_chunk) + len(para) + 2 <= self.target_size:  # +2 for newlines
+                current_chunk = current_chunk + "\n\n" + para if current_chunk else para
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = para
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return self._apply_overlap_and_create_chunks(chunks, ChunkingStrategy.PARAGRAPH)
+
+    def _chunk_semantically(self, text: str) -> List[TextChunk]:
+        """Chunk by semantic units (sentences grouped by topic similarity)."""
+        # Split into sentences
+        sentences = self._split_sentences(text)
+        
+        if not sentences:
+            return []
+        
+        # Group sentences into chunks
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for sentence in sentences:
+            sentence_size = len(sentence)
+            
+            # Check if adding this sentence exceeds target
+            if current_size + sentence_size > self.target_size and current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_size = sentence_size
+            else:
+                current_chunk.append(sentence)
+                current_size += sentence_size + 1  # +1 for space
+        
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+        
+        return self._apply_overlap_and_create_chunks(chunks, ChunkingStrategy.SEMANTIC)
+
+    def _chunk_by_sliding_window(self, text: str) -> List[TextChunk]:
+        """Create overlapping chunks using a sliding window approach."""
+        if len(text) <= self.target_size:
+            return self._apply_overlap_and_create_chunks([text], ChunkingStrategy.SLIDING_WINDOW)
+        
+        chunks = []
+        stride = self.target_size - self.overlap_size  # Step size
+        
+        if stride <= 0:
+            stride = self.target_size // 2  # Fallback to 50% overlap
+        
+        position = 0
+        while position < len(text):
+            end_position = min(position + self.target_size, len(text))
+            chunk = text[position:end_position]
+            chunks.append(chunk)
+            
+            if end_position >= len(text):
+                break
+                
+            position += stride
+        
+        # Note: overlap is already built into the sliding window, so we pass it
+        # directly but the helper will add extra overlap between chunks
+        return self._apply_overlap_and_create_chunks(chunks, ChunkingStrategy.SLIDING_WINDOW)
+
+    def _chunk_by_tokens(self, text: str) -> List[TextChunk]:
+        """Chunk by approximate token count (rough estimation)."""
+        # Rough token estimate: ~4 chars per token
+        chars_per_token = 4
+        target_chars = self.target_size * chars_per_token
+        
+        # Split by sentences for cleaner boundaries
+        sentences = self._split_sentences(text)
         
         chunks = []
         current_chunk = []
-        current_length = 0
-        start_pos = 0
+        current_size = 0
         
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-                
-            para_length = len(para) + 2  # +2 for double newline
+        for sentence in sentences:
+            sentence_size = len(sentence)
             
-            if current_length + para_length > self.target_size and current_chunk:
-                # Create chunk
-                chunk_text = '\n\n'.join(current_chunk)
-                chunks.append(TextChunk(
-                    text=chunk_text,
-                    index=len(chunks),
-                    start_pos=start_pos,
-                    end_pos=start_pos + len(chunk_text),
-                    word_count=len(chunk_text.split()),
-                    char_count=len(chunk_text)
-                ))
-                
-                current_chunk = []
-                current_length = 0
-                start_pos += len(chunk_text) + 2
-                
-            # If single paragraph is too large, split it
-            if para_length > self.max_size:
-                # Recursively chunk the paragraph
-                sub_chunker = TextChunker(
-                    target_size=self.target_size,
-                    strategy=ChunkingStrategy.SENTENCE_BOUNDARY
-                )
-                sub_result = sub_chunker.chunk_text(para)
-                
-                for sub_chunk in sub_result.chunks:
-                    chunks.append(TextChunk(
-                        text=sub_chunk.text,
-                        index=len(chunks),
-                        start_pos=start_pos,
-                        end_pos=start_pos + sub_chunk.char_count,
-                        word_count=sub_chunk.word_count,
-                        char_count=sub_chunk.char_count
-                    ))
-                    start_pos += sub_chunk.char_count + 1
+            if current_size + sentence_size > target_chars and current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_size = sentence_size
             else:
-                current_chunk.append(para)
-                current_length += para_length
-                
-        # Add remaining paragraphs
+                current_chunk.append(sentence)
+                current_size += sentence_size + 1
+        
         if current_chunk:
-            chunk_text = '\n\n'.join(current_chunk)
-            chunks.append(TextChunk(
-                text=chunk_text,
-                index=len(chunks),
-                start_pos=start_pos,
-                end_pos=start_pos + len(chunk_text),
-                word_count=len(chunk_text.split()),
-                char_count=len(chunk_text)
-            ))
-            
-        return chunks
+            chunks.append(" ".join(current_chunk))
         
-    def _chunk_semantically(self, text: str) -> List[TextChunk]:
-        """
-        Chunk text based on semantic similarity (simplified version)
-        In production, this would use embeddings and clustering
-        """
-        # For now, fall back to paragraph chunking with topic detection
-        # This is a placeholder for more sophisticated semantic chunking
-        logger.debug("Semantic chunking not fully implemented, using paragraph strategy")
-        return self._chunk_by_paragraphs(text)
-        
-    def _chunk_sliding_window(self, text: str) -> List[TextChunk]:
-        """Chunk text using sliding window approach"""
-        chunks = []
-        step_size = self.target_size - self.overlap
-        
-        for i in range(0, len(text), step_size):
-            chunk_text = text[i:i + self.target_size]
-            
-            # Skip if chunk is too small (except last chunk)
-            if len(chunk_text) < self.min_size and i + self.target_size < len(text):
-                continue
-                
-            chunks.append(TextChunk(
-                text=chunk_text,
-                index=len(chunks),
-                start_pos=i,
-                end_pos=i + len(chunk_text),
-                word_count=len(chunk_text.split()),
-                char_count=len(chunk_text)
-            ))
-            
-        return chunks
-        
-    def _chunk_by_tokens(self, text: str) -> List[TextChunk]:
-        """
-        Chunk text by approximate token count
-        (Simplified - assumes ~4 chars per token)
-        """
-        chars_per_token = 4
-        target_chars = self.target_size
-        
-        # Convert to approximate token boundaries
-        return self._chunk_by_words(text)
-        
+        return self._apply_overlap_and_create_chunks(chunks, ChunkingStrategy.TOKEN_BASED)
+           
     def merge_small_chunks(self, chunks: List[TextChunk]) -> List[TextChunk]:
         """Merge chunks that are too small"""
         merged = []

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
-import torch # Import needed for MemoryConfig dtype, if used
+import torch  # Import needed for MemoryConfig dtype, if used
 
 # Import base config (no circular dependencies)
 from config_base import (
@@ -15,7 +15,7 @@ from config_base import (
     QUANTIZATION_OPTIONS, DEFAULT_QUANTIZATION,
     ENABLE_LAYER_SPLITTING, DEFAULT_GPU_LAYERS,
     CHUNK_SIZE_MIN, CHUNK_SIZE_MAX, CHUNK_SIZE_DEFAULT, CHUNK_OVERLAP,
-    DEFAULT_MODEL, FALLBACK_MODEL, # DEFAULT_MODEL is now just a key string
+    DEFAULT_MODEL, FALLBACK_MODEL,
     MAX_PDF_SIZE_MB, MAX_CHARS_PER_FILE, SUPPORTED_FORMATS,
     BATCH_PROCESSING_ENABLED, MAX_PARALLEL_FILES,
     OUTPUT_FORMAT_OPTIONS, DEFAULT_OUTPUT_FORMAT,
@@ -27,7 +27,6 @@ from config_base import (
 
 # Type checking imports (not evaluated at runtime)
 if TYPE_CHECKING:
-    # Use the centralized types now
     from pipeline_types import QuantizationConfig, LayerSplitConfig
     from hyperparameters import HyperparameterConfig
     from model_registry import ModelEntry
@@ -46,7 +45,7 @@ ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS 
 Here's the text:
 """
 
-MODELS: Dict[str, str] = {} # Initialize as empty
+MODELS: Dict[str, str] = {}  # Initialize as empty
 
 def reload_models():
     """Reload MODELS dict from registry's predefined models"""
@@ -60,18 +59,18 @@ def reload_models():
             if entry.short_key:
                 MODELS[entry.short_key] = entry.model_id
             else:
-                # Fallback key if short_key is missing (should not happen for predefined)
+                # Fallback key if short_key is missing
                 fallback_key = entry.model_id.split('/')[-1].lower().replace('-', '').replace('.', '')
                 MODELS[fallback_key] = entry.model_id
         # Ensure default and fallback keys exist if possible
         if DEFAULT_MODEL not in MODELS:
-             entry = registry.get_by_key(DEFAULT_MODEL)
-             if entry: MODELS[DEFAULT_MODEL] = entry.model_id
+            entry = registry.get_by_key(DEFAULT_MODEL)
+            if entry:
+                MODELS[DEFAULT_MODEL] = entry.model_id
         if FALLBACK_MODEL not in MODELS:
-             entry = registry.get_by_key(FALLBACK_MODEL)
-             if entry: MODELS[FALLBACK_MODEL] = entry.model_id
-
-        # print(f"Reloaded MODELS dict: {list(MODELS.keys())}") # Debug print
+            entry = registry.get_by_key(FALLBACK_MODEL)
+            if entry:
+                MODELS[FALLBACK_MODEL] = entry.model_id
     except Exception as e:
         print(f"Warning: Could not reload MODELS dict from registry: {e}")
         # Provide minimal fallback if registry fails
@@ -83,28 +82,26 @@ def reload_models():
 # Initial population
 reload_models()
 
-
 # Memory optimization settings (Legacy - may be replaced by LayerSplitConfig/QuantizationConfig)
 @dataclass
 class MemoryConfig:
     """(LEGACY) Memory optimization configuration - Prefer direct QuantizationConfig/LayerSplitConfig"""
     use_quantization: bool = True
-    quantization_type: str = "4bit" # Should match DEFAULT_QUANTIZATION
-    max_gpu_memory: str = "10GB" # Example default
-    max_cpu_memory: str = "30GB" # Example default
-    use_flash_attention: bool = False # Specific to transformers backend
-    use_gradient_checkpointing: bool = True # Usually for training
-    offload_to_disk: bool = True # Maps to LayerSplitConfig offload folder
-    batch_size: int = 128 # Relevant for batch processing
+    quantization_type: str = "4bit"
+    max_gpu_memory: str = "10GB"
+    max_cpu_memory: str = "30GB"
+    use_flash_attention: bool = False
+    use_gradient_checkpointing: bool = True
+    offload_to_disk: bool = True
+    batch_size: int = 128
 
-
-# Example memory profiles (Can be used to create Quantization/LayerSplit configs)
+# Example memory profiles
 MEMORY_PROFILES = {
     "low_vram": {
         "quantization": "4bit",
         "max_gpu_memory": "4GB",
         "max_cpu_memory": "16GB",
-        "gpu_layers": -1 # Auto layers for GGUF
+        "gpu_layers": -1
     },
     "medium_vram": {
         "quantization": DEFAULT_QUANTIZATION,
@@ -113,21 +110,20 @@ MEMORY_PROFILES = {
         "gpu_layers": DEFAULT_GPU_LAYERS
     },
     "high_vram": {
-        "quantization": "none", # Or maybe 8bit
+        "quantization": "none",
         "max_gpu_memory": "24GB",
         "max_cpu_memory": "64GB",
         "gpu_layers": -1
     },
     "cpu_only": {
-        "quantization": "none", # BNB Quantization usually needs GPU
+        "quantization": "none",
         "max_gpu_memory": "0GB",
         "max_cpu_memory": "64GB",
-        "gpu_layers": 0 # Explicitly CPU only for GGUF
+        "gpu_layers": 0
     }
 }
 
-
-# Markdown formatting options (Kept as is)
+# Markdown formatting options
 @dataclass
 class MarkdownStyle:
     """Markdown formatting style configuration"""
@@ -166,8 +162,7 @@ MARKDOWN_STYLES = {
     )
 }
 
-
-# Response filtering patterns (Kept as is, filter uses registry info now)
+# Response filtering patterns
 THINKING_PATTERNS = [
     (r"<think>(.*?)</think>", ""),
     (r"<\|thinking\|>(.*?)<\|/thinking\|>", ""),
@@ -181,8 +176,7 @@ THINKING_PATTERNS = [
     (r"\[internal:.*?\]", ""),
 ]
 
-
-# Logging configuration (Kept as is)
+# Logging configuration
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -203,9 +197,7 @@ LOGGING_CONFIG = {
     "root": {"level": "INFO", "handlers": ["console", "file"]}
 }
 
-# --- Lazy Loading Helpers ---
-# These now correctly point to the moved/centralized definitions
-
+# Lazy Loading Helpers
 def get_default_hyperparams():
     """Lazy load default hyperparameters"""
     from hyperparameters import HyperparameterConfig
@@ -216,13 +208,11 @@ def get_model_hyperparams(model_identifier: str):
     from hyperparameters import HyperparameterConfig
     from model_registry import get_model_config
 
-    model_entry = get_model_config(model_identifier) # Use registry function
+    model_entry = get_model_config(model_identifier)
     if model_entry:
-        # Create HyperparameterConfig from ModelEntry defaults
         return HyperparameterConfig(
             temperature=model_entry.temperature,
             top_p=model_entry.top_p,
-            max_new_tokens=model_entry.max_new_tokens or 2048 # Default if None
-            # Add other relevant mappings if ModelEntry stores more defaults
+            max_new_tokens=model_entry.max_new_tokens or 2048
         )
-    return HyperparameterConfig() # Return default if not found
+    return HyperparameterConfig()

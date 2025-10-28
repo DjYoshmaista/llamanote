@@ -230,7 +230,7 @@ class LocalTransformerBackend(LLMBackend):
         # The constructor only takes 'model_config'.
         # The 'model_max_context' argument was incorrect and caused the TypeError.
         self.token_calculator = DynamicTokenLimitCalculator(
-            self.model_config 
+            self.model_config
         )
 
         self.logger.info(f"Initialized LocalTransformerBackend for {self.model_id}")
@@ -1369,75 +1369,63 @@ class AnthropicBackend(LLMBackend):
 
 
 # --- Backend Factory ---
-
 def get_llm_backend(provider: str,
-                      model_specifier: str,
-                      api_keys: Dict[str, str],
-                      hyperparameters: HyperparameterConfig,
-                      # Kwargs for local-specific configs
-                      # Add model_config required by LocalTransformerBackend
-                      model_config: Optional[ModelEntry] = None,
-                      quantization_config: Optional[QuantizationConfig] = None,
-                      layer_split_config: Optional[LayerSplitConfig] = None,
-                      memory_config: Optional[MemoryConfig] = None # Keep for legacy compatibility
-                      ) -> Optional[LLMBackend]:
+                    model_specifier: str,
+                    api_keys: Dict[str, str],
+                    hyperparameters: HyperparameterConfig,
+                    model_config: Optional[ModelEntry] = None,
+                    quantization_config: Optional[QuantizationConfig] = None,
+                    layer_split_config: Optional[LayerSplitConfig] = None,
+                    memory_config: Optional[MemoryConfig] = None) -> Optional[LLMBackend]:
     """Factory function to create the appropriate LLM backend."""
     provider_lower = provider.lower()
     logger.info(f"Attempting to create backend for provider: {provider_lower}, model: {model_specifier}")
 
     try:
         if provider_lower == "local":
-            # This is a local Hugging Face Transformers model
             # Ensure model_config is provided
             if model_config is None:
-                 logger.warning(f"ModelEntry not provided for local model {model_specifier}. Attempting to fetch from registry.")
-                 model_entry = get_model_config(model_specifier)
-                 if model_entry:
-                      # Use the found ModelEntry
-                      model_config = model_entry
-                 else:
-                      logger.error(f"Model {model_specifier} not found in registry and no ModelEntry provided.")
-                      raise ValueError(f"Missing ModelEntry for local model {model_specifier}")
-
+                logger.warning(f"ModelEntry not provided for local model {model_specifier}. Attempting to fetch from registry.")
+                model_entry = get_model_config(model_specifier)
+                if model_entry:
+                    model_config = model_entry
+                else:
+                    logger.error(f"Model {model_specifier} not found in registry and no ModelEntry provided.")
+                    raise ValueError(f"Missing ModelEntry for local model {model_specifier}")
 
             return LocalTransformerBackend(
                 model_id=model_specifier,
-                model_config=model_config, # Pass the resolved ModelEntry
+                model_config=model_config,  # Pass the resolved ModelEntry
                 quantization_config=quantization_config,
                 layer_split_config=layer_split_config,
                 hyperparameters=hyperparameters,
-                memory_config=memory_config # Pass legacy if needed
+                memory_config=memory_config
             )
 
         elif provider_lower == "local_gguf":
-             if not LLAMACPP_AVAILABLE:
-                 raise ImportError("llama-cpp-python not found. Cannot use GGUF backend.")
+            if not LLAMACPP_AVAILABLE:
+                raise ImportError("llama-cpp-python not found. Cannot use GGUF backend.")
 
-             # model_specifier is the path for GGUF
-             gguf_model_path = Path(model_specifier)
-             if not gguf_model_path.is_file():
-                 raise FileNotFoundError(f"GGUF model file not found: {gguf_model_path}")
+            gguf_model_path = Path(model_specifier)
+            if not gguf_model_path.is_file():
+                raise FileNotFoundError(f"GGUF model file not found: {gguf_model_path}")
 
-             # Create LlamaCppConfig - use LayerSplitConfig if available for n_gpu_layers
-             gpu_layers = layer_split_config.gpu_layers if layer_split_config else -1
+            gpu_layers = layer_split_config.gpu_layers if layer_split_config else -1
 
-             gguf_config = LlamaCppConfig(
-                 model_path=gguf_model_path,
-                 n_ctx=hyperparameters.max_length or 2048, # Use max_length from hyperparams
-                 n_gpu_layers=gpu_layers,
-                 n_batch=512, # Default, make configurable?
-                 # Add other relevant LlamaCpp settings if needed
-             )
-             # Directly return the LlamaCppBackend instance (from llamacpp_backend.py)
-             return LlamaCppBackend(
-                 config=gguf_config,
-                 hyperparameters=hyperparameters
-             )
-
+            gguf_config = LlamaCppConfig(
+                model_path=gguf_model_path,
+                n_ctx=hyperparameters.max_length or 2048,
+                n_gpu_layers=gpu_layers,
+                n_batch=512,
+            )
+            return LlamaCppBackend(
+                config=gguf_config,
+                hyperparameters=hyperparameters
+            )
 
         elif provider_lower == "openai":
             if not OPENAI_AVAILABLE:
-                 raise ImportError("OpenAI library not found. Please run 'pip install openai'")
+                raise ImportError("OpenAI library not found. Please run 'pip install openai'")
             api_key = api_keys.get("openai")
             if not api_key:
                 raise ValueError("OpenAI API key not configured.")
@@ -1449,7 +1437,7 @@ def get_llm_backend(provider: str,
 
         elif provider_lower == "google":
             if not GOOGLE_AI_AVAILABLE:
-                 raise ImportError("Google Generative AI library not found. Please run 'pip install google-generativeai'")
+                raise ImportError("Google Generative AI library not found. Please run 'pip install google-generativeai'")
             api_key = api_keys.get("google")
             if not api_key:
                 raise ValueError("Google API key not configured.")
@@ -1461,7 +1449,7 @@ def get_llm_backend(provider: str,
 
         elif provider_lower == "anthropic":
             if not ANTHROPIC_AVAILABLE:
-                 raise ImportError("Anthropic library not found. Please run 'pip install anthropic'")
+                raise ImportError("Anthropic library not found. Please run 'pip install anthropic'")
             api_key = api_keys.get("anthropic")
             if not api_key:
                 raise ValueError("Anthropic API key not configured.")
@@ -1471,21 +1459,14 @@ def get_llm_backend(provider: str,
                 hyperparameters=hyperparameters
             )
 
-        # --- Add other cloud providers here ---
-        # elif provider_lower == "cohere":
-        #     # ... implementation ...
-        # elif provider_rower == "openrouter":
-        #     # ... implementation ...
-
         else:
             logger.error(f"Unsupported provider: '{provider_lower}'.")
             raise ValueError(f"Unsupported provider: {provider}")
 
     except (ImportError, ValueError, TypeError, FileNotFoundError) as e:
-        logger.error(f"Failed to create backend for {provider}: {e}", exc_info=False) # Reduce noise for common errors
+        logger.error(f"Failed to create backend for {provider}: {e}", exc_info=False)
         ConsoleOutput.error(f"Error initializing backend '{provider}': {e}")
-        return None # Return None on failure
-
+        return None
 
 # --- BatchProcessor (Now uses LLMBackend) ---
 class BatchProcessor:
