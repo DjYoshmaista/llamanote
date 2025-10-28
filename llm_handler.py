@@ -4,7 +4,11 @@ Manages model loading, optimization, and response generation with advanced quant
 Supports local (Transformers, GGUF) and cloud (OpenAI, Google) backends.
 """
 
-import torch
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -52,9 +56,9 @@ try:
     LLAMACPP_AVAILABLE = True
 except ImportError:
     LLAMACPP_AVAILABLE = False
-    # Create dummy types for type hinting if not available
-    Llama = None
-    LlamaGrammar = None
+    # Define dummy types for type hinting if not available
+    Llama = type('Llama', (object,), {})
+    LlamaGrammar = type('LlamaGrammar', (object,), {})
     LlamaCppBackend = None # Keep this name distinct
     LlamaCppConfig = None
     LlamaCppGenerationResult = None
@@ -94,6 +98,7 @@ class LLMBackend(abc.ABC):
         self.model_specifier = model_specifier
         self.hyperparams = hyperparams or _get_default_hyperparms()
         self.logger = get_logger_conf(f"{self.__class__.__name__}")
+        self.model = None # Add model attribute to base class for easier state checking
 
     @abc.abstractmethod
     def load_model(self, **kwargs) -> bool:
@@ -153,7 +158,7 @@ class LocalTransformerBackend(LLMBackend):
             self.logger.warning("No LayerSplitConfig provided, creating from legacy MemoryConfig.")
             mem_cfg = memory_config or MemoryConfig()
             max_gpu_mem = {}
-            if torch.cuda.is_available():
+            if TORCH_AVAILABLE and torch.cuda.is_available():
                  # Check CUDA availability before iterating
                  try:
                      num_gpus = torch.cuda.device_count()
@@ -164,24 +169,26 @@ class LocalTransformerBackend(LLMBackend):
                      max_gpu_mem = {}
 
             self.split_config = LayerSplitConfig(
-                enabled=(mem_cfg.use_quantization or torch.cuda.is_available()), # Enable if GPU or quant
+                enabled=(mem_cfg.use_quantization or (TORCH_AVAILABLE and torch.cuda.is_available())), # Enable if GPU or quant
                 max_gpu_memory=max_gpu_mem,
                 max_cpu_memory=mem_cfg.max_cpu_memory,
                 offload_folder=OFFLOAD_DIR if mem_cfg.offload_to_disk else None,
                 offload_state_dict=mem_cfg.offload_to_disk
             )
 
-        self.model = None
-        self.tokenizer = None
+        self.model: Optional[AutoModelForCausalLM] = None # Type hint
+        self.tokenizer: Optional[AutoTokenizer] = None # Type hint
         self.device = None
         self.accelerator = None # Accelerator might not be needed with device_map
         self.device_map = None
 
         self.response_filter = ResponseFilter(self.model_config)
+        
+        # *** FIX 1: Correctly initialize DynamicTokenLimitCalculator ***
+        # The constructor only takes 'model_config'.
+        # The 'model_max_context' argument was incorrect and caused the TypeError.
         self.token_calculator = DynamicTokenLimitCalculator(
-            self.model_config,
-            # Use max_context from the *specific* ModelEntry passed to init
-            model_max_context=self.model_config.max_context
+            self.model_config 
         )
 
         self.logger.info(f"Initialized LocalTransformerBackend for {self.model_id}")
@@ -201,7 +208,11 @@ class LocalTransformerBackend(LLMBackend):
         Args:
             trust_remote_code: Whether to trust remote code in model
         """
-        self.logger.info(f"Loading model: {self.model_id}") # Use self.model_id
+        if self.model is not None:
+            self.logger.info("Model is already loaded.")
+            return True
+            
+        self.logger.info(f"Loading model: {self.model_id}")
 
         # Determine device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -235,16 +246,10 @@ class LocalTransformerBackend(LLMBackend):
         """Load model with quantization"""
         self.logger.info(f"Loading with {self.quant_config.method} quantization")
 
-        bnb_config_dict = self.quant_config.to_bnb_config()
-        if bnb_config_dict is None:
+        # *** FIX 2: Use the bnb_config object directly, not as **kwargs ***
+        bnb_config = self.quant_config.to_bnb_config()
+        if bnb_config is None:
             self.logger.warning(f"Quantization method '{self.quant_config.method}' selected but config is None. Loading standard model.")
-            return self._load_standard_model(trust_remote_code)
-
-        try:
-            # Create BitsAndBytesConfig object here
-            bnb_config = BitsAndBytesConfig(**bnb_config_dict)
-        except Exception as e:
-            self.logger.error(f"Failed to create BitsAndBytesConfig: {e}. Loading standard model.", exc_info=True)
             return self._load_standard_model(trust_remote_code)
 
         device_map = "auto"
@@ -261,7 +266,7 @@ class LocalTransformerBackend(LLMBackend):
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
-                quantization_config=bnb_config,
+                quantization_config=bnb_config,  # Pass the object directly
                 device_map=device_map,
                 max_memory=max_memory if device_map != "cpu" else None, # Don't pass max_memory if mapping to CPU
                 torch_dtype=self.quant_config.compute_dtype,
@@ -296,7 +301,7 @@ class LocalTransformerBackend(LLMBackend):
         """Load model with layer splitting (no quantization)"""
         self.logger.info("Loading model with layer splitting")
 
-        if not torch.cuda.is_available():
+        if not (TORCH_AVAILABLE and torch.cuda.is_available()):
              self.logger.error("Layer splitting requires CUDA, but it's not available. Falling back.")
              return self._load_cpu_model(trust_remote_code) # Fallback to CPU
 
@@ -340,7 +345,7 @@ class LocalTransformerBackend(LLMBackend):
         """Load model without special optimizations (full precision on GPU/auto)"""
         self.logger.info("Loading model in standard mode (no quantization/splitting)")
 
-        device_map_setting = "auto" if torch.cuda.is_available() else "cpu"
+        device_map_setting = "auto" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
         try:
             model = AutoModelForCausalLM.from_pretrained(
@@ -364,7 +369,7 @@ class LocalTransformerBackend(LLMBackend):
             if hasattr(model, 'hf_device_map'):
                 self.device_map = model.hf_device_map
             elif device_map_setting == "cpu":
-                self.device_map = {"model": "cpu"} # Explicitly set for CPU load
+                self.device_map = {"": "cpu"} # Explicitly set for CPU load
 
             self.logger.info(f"Successfully loaded model in standard mode on {device_map_setting}")
             return True
@@ -390,7 +395,8 @@ class LocalTransformerBackend(LLMBackend):
                 cache_dir=str(CACHE_DIR),
                 low_cpu_mem_usage=False,
                 trust_remote_code=trust_remote_code
-            ).to('cpu') # Ensure it's moved to CPU if loaded elsewhere initially
+            )
+            model.to('cpu') # Ensure it's on CPU
 
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
@@ -450,7 +456,7 @@ class LocalTransformerBackend(LLMBackend):
 
     def _create_device_map(self) -> Dict[str, Any]:
         """Create optimal device map for layer splitting"""
-        if not self.split_config.enabled or not torch.cuda.is_available():
+        if not self.split_config.enabled or not (TORCH_AVAILABLE and torch.cuda.is_available()):
             return "auto" # Let transformers handle CPU if CUDA not available
 
         if self.split_config.gpu_layers == 0:
@@ -478,9 +484,15 @@ class LocalTransformerBackend(LLMBackend):
             return
 
         try:
-            param_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad) # Count trainable params
+            param_count = sum(p.numel() for p in self.model.parameters()) # Counts all params, not just trainable
+            
             # Estimate size based on effective precision
-            param_dtype = next(self.model.parameters()).dtype
+            param_dtype = None
+            try:
+                param_dtype = next(self.model.parameters()).dtype
+            except StopIteration:
+                pass # No parameters found, e.g., empty model
+
             bytes_per_param = 4 # Default float32
             if self.quant_config.method == "4bit":
                 bytes_per_param = 0.5
@@ -488,7 +500,7 @@ class LocalTransformerBackend(LLMBackend):
                  bytes_per_param = 1
             elif param_dtype in [torch.float16, torch.bfloat16]:
                  bytes_per_param = 2
-
+            
             param_size_gb = (param_count * bytes_per_param) / (1024 ** 3)
             self.logger.info(f"Model loaded: ~{param_count:,} parameters (~{param_size_gb:.2f} GB effective size)")
         except Exception as e:
@@ -515,7 +527,7 @@ class LocalTransformerBackend(LLMBackend):
 
 
         # Log memory usage
-        if torch.cuda.is_available():
+        if TORCH_AVAILABLE and torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 try:
                     allocated = torch.cuda.memory_allocated(i) / (1024**3)  # GB
@@ -663,7 +675,7 @@ class LocalTransformerBackend(LLMBackend):
 
         # Get memory usage
         memory_used = 0
-        if torch.cuda.is_available():
+        if TORCH_AVAILABLE and torch.cuda.is_available():
             try:
                 # Use max_memory_allocated for peak usage if available
                 memory_used = torch.cuda.max_memory_allocated() / (1024 * 1024)  # Peak MB
@@ -712,7 +724,7 @@ class LocalTransformerBackend(LLMBackend):
             return torch.device(self.device)
 
         # Ultimate fallback
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
 
 
     @log_execution_time()
@@ -790,7 +802,7 @@ class LocalTransformerBackend(LLMBackend):
         self.device_map = None
 
         # Clear CUDA cache if available
-        if torch.cuda.is_available():
+        if TORCH_AVAILABLE and torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
                 self.logger.debug("CUDA cache cleared.")
@@ -836,6 +848,7 @@ class OpenAIBackend(LLMBackend):
         try:
             self.client = openai.OpenAI(api_key=self.api_key)
             self.client.models.list() # Test API key by listing models
+            self.model = self.client # Use the client object as the 'model' handle
             self.logger.info("OpenAI API client initialized and key verified.")
             return True
         except openai.AuthenticationError:
@@ -1013,6 +1026,7 @@ class OpenAIBackend(LLMBackend):
              del self.client
              self.client = None
              self.logger.debug("OpenAI client reference cleared.")
+        self.model = None # Set base class model attribute to None
         pass
 
 # --- Google Gemini Cloud Backend ---
@@ -1027,7 +1041,7 @@ class GoogleAIBackend(LLMBackend):
         self.api_key = api_key
         self.model = None # Will be initialized in load_model
         # Store system prompt separately as it's part of model init for Google
-        self._system_prompt: Optional[str] = None
+        self._system_prompt: Optional[str] = None 
 
     @property
     def provider_identifier(self) -> str:
@@ -1239,6 +1253,7 @@ class AnthropicBackend(LLMBackend):
             self.client = anthropic.Anthropic(api_key=self.api_key) # Pass client if created: http_client=http_client
             # Test API key by counting tokens (simple and cheap)
             self.client.count_tokens("test connection")
+            self.model = self.client # Use the client object as the 'model' handle
             self.logger.info(f"Anthropic API client initialized for model {self.model_specifier} and key verified.")
             return True
         except anthropic.AuthenticationError:
@@ -1337,9 +1352,9 @@ class AnthropicBackend(LLMBackend):
 
             if generation_time > 0 and output_tokens > 0:
                  tokens_per_sec = output_tokens / generation_time
-                 self.logger.info(f"Anthropic generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
+                 self.logger.info(f"Anthropic (chat) generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
             elif output_tokens > 0:
-                 self.logger.info(f"Anthropic generated {output_tokens} tokens")
+                 self.logger.info(f"Anthropic (chat) generated {output_tokens} tokens")
             else:
                  self.logger.warning(f"Anthropic generated 0 tokens. Finish Reason: {response.stop_reason}")
 
@@ -1350,6 +1365,7 @@ class AnthropicBackend(LLMBackend):
             try: input_tokens = len(system_prompt.split()) + len(user_message.split())
             except: input_tokens = 0
             output_tokens = 0
+
 
         return GenerationResult(
             raw_output=raw_output,
@@ -1367,6 +1383,7 @@ class AnthropicBackend(LLMBackend):
              del self.client
              self.client = None
              self.logger.debug("Anthropic client reference cleared.")
+        self.model = None # Set base class model attribute to None
         pass
 
 
@@ -1395,17 +1412,8 @@ def get_llm_backend(provider: str,
                  logger.warning(f"ModelEntry not provided for local model {model_specifier}. Attempting to fetch from registry.")
                  model_entry = get_model_config(model_specifier)
                  if model_entry:
-                      # Convert ModelEntry to ModelEntry
-                      model_config = ModelEntry(
-                          name=model_entry.name, model_id=model_entry.model_id,
-                          supports_thinking=model_entry.supports_thinking,
-                          thinking_tokens=model_entry.thinking_tokens or [],
-                          max_context=model_entry.max_context,
-                          optimal_chunk_size=model_entry.optimal_chunk_size,
-                          temperature=model_entry.temperature, top_p=model_entry.top_p,
-                          max_new_tokens=model_entry.max_new_tokens,
-                          quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
-                      )
+                      # Use the found ModelEntry
+                      model_config = model_entry
                  else:
                       logger.error(f"Model {model_specifier} not found in registry and no ModelEntry provided.")
                       raise ValueError(f"Missing ModelEntry for local model {model_specifier}")
@@ -1485,7 +1493,7 @@ def get_llm_backend(provider: str,
         # --- Add other cloud providers here ---
         # elif provider_lower == "cohere":
         #     # ... implementation ...
-        # elif provider_lower == "openrouter":
+        # elif provider_rower == "openrouter":
         #     # ... implementation ...
 
         else:
@@ -1569,8 +1577,8 @@ class BatchProcessor:
                     ))
 
                 # Optional: Clear cache between items (if local GPU and memory is tight)
-                # if self.llm_backend.provider_identifier.startswith("local") and torch.cuda.is_available():
-                #    torch.cuda.empty_cache()
+                if self.llm_backend.provider_identifier.startswith("local") and TORCH_AVAILABLE and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 progress.update(1, f"Item {i+1}/{len(texts)} completed")
                 # ConsoleOutput.progress_bar(i+1, len(texts), prefix="Processing") # Can be noisy with LoggingProgress

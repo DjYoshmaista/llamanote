@@ -46,7 +46,7 @@ from model_registry import get_registry, get_model_config
 from model_registry import ModelEntry
 
 logger = get_logger_conf(__name__)
-TIMESTAMP_OUTPUTS = str(datetime.now())
+# Removed TIMESTAMP_OUTPUTS from here, should be handled by FileHandler/config_base
 
 class ProcessingPipeline:
     """Main processing pipeline for PDF to formatted text"""
@@ -61,7 +61,7 @@ class ProcessingPipeline:
         self.config = config or PipelineConfig() # Use PipelineConfig from types
         self.logger = get_logger_conf(f"{__name__}.Pipeline")
 
-        # Backends are now injected *after* initialization
+        # Backend is now injected, not created here.
         self.llm_backend: Optional[LLMBackend] = None
 
         # Initialize components
@@ -93,29 +93,23 @@ class ProcessingPipeline:
         )
 
         # Response filter - needs ModelEntry potentially
+        # *** FIX 3: Assign model_entry directly, don't re-construct ***
         model_config_for_filter = None
-        if self.config.model_provider == "local":
-             model_entry = get_model_config(self.config.model_specifier)
-             if model_entry:
-                  # Convert ModelEntry to ModelEntry (from config.py)
-                  model_config_for_filter = ModelEntry(
-                       name=model_entry.name, model_id=model_entry.model_id,
-                       supports_thinking=model_entry.supports_thinking,
-                       thinking_tokens=model_entry.thinking_tokens or [],
-                       max_context=model_entry.max_context,
-                       optimal_chunk_size=model_entry.optimal_chunk_size,
-                       temperature=model_entry.temperature, top_p=model_entry.top_p,
-                       max_new_tokens=model_entry.max_new_tokens,
-                       quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
-                  )
-             else:
-                 # Create a default ModelEntry if not found in registry
-                 model_config_for_filter = ModelEntry(name="unknown", model_id=self.config.model_specifier)
-
+        if self.config.model_provider in ["local", "local_gguf"]: # Check for both local types
+            model_config_for_filter = get_model_config(self.config.model_specifier) # Get from registry
+            if model_config_for_filter is None:
+                logger.warning(f"Model {self.config.model_specifier} not in registry. Filter may not work correctly.")
+                # Create a basic default so it doesn't crash, including the required 'author'
+                model_config_for_filter = ModelEntry(
+                    name=Path(self.config.model_specifier).name,
+                    model_id=self.config.model_specifier,
+                    author="unknown" # Add the missing required argument
+                )
 
         self.response_filter = ChunkedResponseFilter(
-            model_config=model_config_for_filter # Will use defaults if None
+            model_config=model_config_for_filter # Pass the correct ModelEntry object or None
         )
+
 
         # Markdown formatter
         if self.config.mode == ProcessingMode.PODCAST:
@@ -123,7 +117,12 @@ class ProcessingPipeline:
         elif self.config.mode == ProcessingMode.TECHNICAL:
             self.formatter = TechnicalFormatter()
         else:
-            self.formatter = MarkdownFormatter(style=self.config.markdown_style)
+            # Default to podcast style if not recognized, or use a new 'default' style
+            style_name = self.config.markdown_style
+            if style_name not in MARKDOWN_STYLES:
+                logger.warning(f"Markdown style '{style_name}' not found, falling back to 'podcast'.")
+                style_name = "podcast"
+            self.formatter = MarkdownFormatter(style=style_name)
 
         # Memory monitor
         self.memory_monitor = MemoryMonitor(self.logger)
@@ -234,6 +233,12 @@ class ProcessingPipeline:
                 if self.llm_backend is None:
                      ConsoleOutput.error("Cannot run 'process' stage, LLM backend is not set.")
                      return self._create_error_result(input_path, "LLMBackend not set.")
+                
+                # Check if backend is loaded
+                if self.llm_backend.model is None:
+                    self.logger.info(f"Loading LLM backend {self.llm_backend.model_identifier} for processing...")
+                    if not self.llm_backend.load_model():
+                        return self._create_error_result(input_path, "Failed to load LLM backend for processing.")
 
                 processed_chunks = self._stage_process(data_payload['chunks'])
                 data_payload['processed_chunks'] = processed_chunks # List of strings
@@ -251,7 +256,7 @@ class ProcessingPipeline:
                               chunks_to_filter = [text_to_filter] # Treat as one chunk
                          else:
                               return self._missing_data_error(input_path, "filter", "processed_chunks or chunks or text")
-
+                
                 filtered_chunks = self._stage_filter(chunks_to_filter) # Returns List[str] (paragraphs)
                 data_payload['filtered_chunks'] = filtered_chunks
 
@@ -288,7 +293,7 @@ class ProcessingPipeline:
                     text_to_save = last_available_text
                     self.logger.warning("Formatting stage skipped or failed, saving last available text content.")
 
-
+                
                 saved_path = self._stage_save(text_to_save, input_path, output_path, data_payload.get('metadata'))
                 data_payload['output_file'] = saved_path
 
@@ -341,6 +346,7 @@ class ProcessingPipeline:
         finally:
             self.memory_monitor.check(f"pipeline completion for {input_path.name}")
             # Do NOT unload model here, caller manages backend lifecycle
+            pass
 
 
     def _stage_extract(self, input_path: Path) -> Optional[ExtractionResult]:
@@ -453,6 +459,13 @@ class ProcessingPipeline:
 
         if self.llm_backend is None:
              raise RuntimeError("LLM Backend not set in pipeline. Cannot process.")
+        
+        # Ensure model is loaded (it should be, but check)
+        if self.llm_backend.model is None:
+            self.logger.warning("LLM backend model was not loaded. Attempting to load now.")
+            if not self.llm_backend.load_model():
+                self.logger.error("Failed to load LLM backend model during processing stage.")
+                raise RuntimeError("Failed to load LLM backend model.")
 
         system_prompt = self.config.system_prompt or PREPROCESS_PROMPT
 
@@ -627,14 +640,21 @@ class ProcessingPipeline:
         ConsoleOutput.section("Stage 7: Saving output")
 
         # Generate output path using FileHandler logic
-        output_path = self.file_handler.get_output_path(
-            input_path=input_path,
-            suffix=f"_{self.config.mode.value}",
-            extension=f".{self.config.output_format}"
-        )
-        # If output_path_base was provided, override the directory and base name
+        # If output_path_base is provided (e.g., from CLI), use it
+        # Otherwise, generate a path based on the input file
         if output_path_base:
-             output_path = output_path_base.parent / output_path.name
+             # Ensure the directory exists
+             output_path_base.parent.mkdir(parents=True, exist_ok=True)
+             # Apply suffix and extension
+             output_path = output_path_base.with_suffix(f".{self.config.output_format}")
+             # Note: This logic assumes output_path_base does *not* include the suffix/timestamp
+             # A better way might be for get_output_path to handle an optional base name
+        else:
+             output_path = self.file_handler.get_output_path(
+                input_path=input_path,
+                suffix=f"_{self.config.mode.value}",
+                extension=f".{self.config.output_format}"
+             )
 
 
         # Prepare metadata for the output file header
@@ -751,13 +771,11 @@ class ProcessingPipeline:
 
             # --- Important: Unload local models between files ---
             if self.llm_backend and self.llm_backend.provider_identifier.startswith("local"):
-                ConsoleOutput.info("Unloading local model to conserve memory...")
+                ConsoleOutput.info("Unloading local text model to conserve memory...")
                 self.llm_backend.unload_model()
                 self.memory_monitor.check(f"after unloading model from file {i}")
-                # Reload model for the next file IF needed (process_file expects loaded model)
-                # This reload logic should be outside process_file, perhaps here or in caller (_execute_pipeline)
-                # For now, let's assume _execute_pipeline re-initializes the backend if needed.
-                # If running purely programmatically, the user needs to manage backend lifecycle.
+                # The model will be reloaded (if needed) in the next call to process_file
+                # inside _stage_process, if the 'process' stage is active.
 
         # Restore original output dir if it was overridden
         self.file_handler.output_dir = original_output_dir
