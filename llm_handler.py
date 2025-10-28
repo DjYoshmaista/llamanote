@@ -1,1695 +1,1579 @@
 """
-Menu System Module - Refacted
-Interactive menu interface for LlamaNote Enhanced
+LLM Handler Module - Enhanced Version
+Manages model loading, optimization, and response generation with advanced quantization and layer splitting
+Supports local (Transformers, GGUF) and cloud (OpenAI, Google) backends.
 """
 
+import torch
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    GenerationConfig
+)
+from accelerate import Accelerator, init_empty_weights, infer_auto_device_map
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass, field, asdict
+import gc
 import os
 import sys
-import json
-import time
-import re 
-import argparse 
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable, Union
-from dataclasses import dataclass, field, asdict
-from enum import Enum
+import time
+import abc
+import httpx # Required for Anthropic proxy setting
 
 # --- LlamaNote Modules ---
-from loggerConf import ConsoleOutput, get_logger_conf
-from config_manager import ConfigManager
+from loggerConf import get_logger_conf, log_execution_time, log_resource_usage, ConsoleOutput, LoggingProgress
+from config import ModelConfig, MemoryConfig # Keep ModelConfig for local filter/calc, MemoryConfig legacy
 from config_base import (
-    BASE_DIR, OUTPUT_DIR, CACHE_DIR, OFFLOAD_DIR,
-    DEFAULT_MODEL, FALLBACK_MODEL, 
-    ENABLE_LAYER_SPLITTING, DEFAULT_GPU_LAYERS,
-    DEFAULT_QUANTIZATION, QUANTIZATION_OPTIONS,
-    SUPPORTED_FORMATS, PIPELINE_STAGES
+    FALLBACK_MODEL,
+    DEFAULT_MODEL,
+    CACHE_DIR,
+    OFFLOAD_DIR,
+    QUANTIZATION_OPTIONS,
+    DEFAULT_QUANTIZATION,
+    ENABLE_LAYER_SPLITTING,
+    DEFAULT_GPU_LAYERS
 )
-from model_hub import InteractiveModelBrowser, ModelHub, ModelInfo as HFModelInfo
-from audio_generator import (
-    AudioConfig, AudioResult, AudioBackend, 
-    LocalAudioBackend, OpenAITTSBackend, get_audio_backend
+# Import shared types from the new file
+from pipeline_types import (
+    QuantizationConfig,
+    LayerSplitConfig,
+    GenerationResult
 )
-from processing_pipeline import (
-    ProcessingPipeline, PipelineConfig, ProcessingMode, 
-    PipelineResult
-)
-from text_processor import ChunkingStrategy
-from model_registry import get_registry, ModelEntry
-from hyperparameters import HyperparameterConfig, InteractiveHyperparameterEditor, get_hyperparameter_help
-from llm_handler import (
-    LLMBackend, get_llm_backend, QuantizationConfig, LayerSplitConfig
-)
-from huggingface_search import HuggingFaceSearch # Import fix
-from file_handler import BatchFileManager
+from hyperparameters import HyperparameterConfig
+from response_filter import ResponseFilter, DynamicTokenLimitCalculator
+from model_registry import get_model_config
 
-# --- GGUF Backend (Optional) ---
+# --- Backend-specific Imports (Conditional) ---
 try:
-    from llamacpp_backend import LlamaCppBackend, LlamaCppConfig, GGUFModelManager
+    from llama_cpp import Llama, LlamaGrammar
+    from llamacpp_backend import LlamaCppBackend, LlamaCppConfig, LlamaCppGenerationResult # Import from its file
     LLAMACPP_AVAILABLE = True
 except ImportError:
     LLAMACPP_AVAILABLE = False
-    LlamaCppBackend = None
+    # Create dummy types for type hinting if not available
+    Llama = None
+    LlamaGrammar = None
+    LlamaCppBackend = None # Keep this name distinct
     LlamaCppConfig = None
-    GGUFModelManager = None
+    LlamaCppGenerationResult = None
 
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    openai = None
+    OPENAI_AVAILABLE = False
+
+try:
+    import google.generativeai as genai
+    GOOGLE_AI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GOOGLE_AI_AVAILABLE = False
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    anthropic = None
+    ANTHROPIC_AVAILABLE = False
 
 logger = get_logger_conf(__name__)
 
-# --- Menu Data Structures ---
+def _get_default_hyperparms():
+    """Lazy load default hyperparameters"""
+    return HyperparameterConfig()
 
-class MenuAction(Enum):
-    BACK = "back"
-    EXIT = "exit"
-    CONTINUE = "continue"
-    RUN = "run"
+# --- Backend Interface ---
+class LLMBackend(abc.ABC):
+    """Abstract base class for LLM backends (local or cloud)."""
 
-@dataclass
-class MenuItem:
-    key: str
-    label: Union[str, Callable[[], str]] # Allow label to be a function
-    action: Optional[Callable] = None
-    submenu: Optional['Menu'] = None
-    description: Optional[Union[str, Callable[[], str]]] = None # Allow description to be a function
+    def __init__(self, model_specifier: str, hyperparams: HyperparameterConfig):
+        self.model_specifier = model_specifier
+        self.hyperparams = hyperparams or _get_default_hyperparms()
+        self.logger = get_logger_conf(f"{self.__class__.__name__}")
 
+    @abc.abstractmethod
+    def load_model(self, **kwargs) -> bool:
+        """Load or initialize the backend (might be no-op for APIs)."""
+        pass
 
-class Menu:
-    def __init__(self, title: str, items: List[MenuItem], parent: Optional['Menu'] = None):
-        self.title = title
-        self.items = items
-        self.parent = parent
+    @abc.abstractmethod
+    @log_execution_time()
+    def generate(self, prompt: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text from a prompt."""
+        pass
 
-    def display(self) -> MenuAction:
-        while True:
-            ConsoleOutput.header(self.title)
-            for item in self.items:
-                # --- FIX for lambda display ---
-                # Resolve dynamic labels and descriptions
-                label_text = item.label() if callable(item.label) else item.label
-                desc_text = item.description() if callable(item.description) else item.description
-                
-                desc_str = f" - {desc_text}" if desc_text else ""
-                print(f"  {item.key}. {label_text}{desc_str}")
-            # --- End FIX ---
+    @abc.abstractmethod
+    @log_execution_time()
+    def process_with_chat_template(self, system_prompt: str, user_message: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using a chat format."""
+        pass
 
-            nav_options = []
-            if self.parent:
-                nav_options.append("b. Back")
-            nav_options.append("q. Quit")
-            print("\n  " + " | ".join(nav_options))
-            print("-" * 60)
+    @abc.abstractmethod
+    def unload_model(self):
+        """Unload or clean up resources (might be no-op for APIs)."""
+        pass
 
-            choice = input("Select option: ").strip().lower()
+    @property
+    @abc.abstractmethod
+    def provider_identifier(self) -> str:
+        """Return provider name (e.g., 'local', 'openai')."""
+        pass
 
-            if choice == 'q':
-                confirm_quit = input("Are you sure you want to quit? (y/n): ").strip().lower()
-                if confirm_quit == 'y':
-                    return MenuAction.EXIT
-                else:
-                    continue
-            if choice == 'b' and self.parent:
-                return MenuAction.BACK
+    @property
+    def model_identifier(self) -> str:
+        """Return full model identifier including provider."""
+        return f"{self.provider_identifier}:{self.model_specifier}"
 
-            selected_item = next((item for item in self.items if item.key.lower() == choice), None)
+# --- Local Hugging Face Transformers Backend ---
+class LocalTransformerBackend(LLMBackend):
+    """Implementation for local Hugging Face Transformers models."""
 
-            if selected_item:
-                result = MenuAction.CONTINUE
-                if selected_item.submenu:
-                    result = selected_item.submenu.display()
-                elif selected_item.action:
-                    action_result = selected_item.action()
-                    result = action_result if isinstance(action_result, MenuAction) else MenuAction.CONTINUE
+    def __init__(self,
+                 model_id: str,
+                 model_config: ModelConfig, # Needs the specific ModelConfig for filter/calc
+                 quantization_config: Optional[QuantizationConfig] = None,
+                 layer_split_config: Optional[LayerSplitConfig] = None,
+                 hyperparameters: Optional[HyperparameterConfig] = None,
+                 memory_config: Optional[MemoryConfig] = None): # memory_config is legacy, prefer split_config
 
-                if result == MenuAction.EXIT:
-                    return MenuAction.EXIT # Propagate EXIT up
-                elif result == MenuAction.RUN:
-                    return MenuAction.RUN # Propagate RUN up
-                elif result == MenuAction.BACK:
-                    continue
+        super().__init__(model_specifier=model_id, hyperparams=hyperparameters)
 
-            else:
-                ConsoleOutput.warning("Invalid selection")
-            # time.sleep(0.5) # Removed for faster interaction
+        self.model_config = model_config # Store the specific config
+        self.model_id = model_id # Alias for clarity, already in self.model_specifier
+        self.quant_config = quantization_config or QuantizationConfig(method="none")
 
-    def add_item(self, item: MenuItem):
-        self.items.append(item)
+        # Use layer_split_config if provided, else derive from legacy memory_config
+        if layer_split_config:
+            self.split_config = layer_split_config
+        else:
+            self.logger.warning("No LayerSplitConfig provided, creating from legacy MemoryConfig.")
+            mem_cfg = memory_config or MemoryConfig()
+            max_gpu_mem = {}
+            if torch.cuda.is_available():
+                 # Check CUDA availability before iterating
+                 try:
+                     num_gpus = torch.cuda.device_count()
+                     for i in range(num_gpus):
+                         max_gpu_mem[i] = mem_cfg.max_gpu_memory
+                 except Exception as e:
+                     self.logger.warning(f"Could not get CUDA device count: {e}. Assuming 0 GPUs for split config.")
+                     max_gpu_mem = {}
 
-# --- Menu System State ---
+            self.split_config = LayerSplitConfig(
+                enabled=(mem_cfg.use_quantization or torch.cuda.is_available()), # Enable if GPU or quant
+                max_gpu_memory=max_gpu_mem,
+                max_cpu_memory=mem_cfg.max_cpu_memory,
+                offload_folder=OFFLOAD_DIR if mem_cfg.offload_to_disk else None,
+                offload_state_dict=mem_cfg.offload_to_disk
+            )
 
-SUPPORTED_CLOUD_PROVIDERS = [
-    "openai",
-    "anthropic",
-    "google",
-    "cohere",
-    "huggingface_token", 
-    "openrouter",
-]
-TTS_PROVIDERS = ["local", "openai"] # Add more as backends are implemented
+        self.model = None
+        self.tokenizer = None
+        self.device = None
+        self.accelerator = None # Accelerator might not be needed with device_map
+        self.device_map = None
 
-@dataclass
-class AppState:
-    """Holds the current configuration state of the application menu."""
-    input_files: List[Path] = field(default_factory=list)
-    output_dir: Path = Path(OUTPUT_DIR)
-    output_filename: Optional[str] = None
-    processing_mode: ProcessingMode = ProcessingMode.PODCAST
-    text_model_provider: str = "local"
-    text_model_specifier: str = DEFAULT_MODEL
-    audio_model_provider: str = "local"
-    audio_model_specifier: str = "microsoft/speecht5_tts"
-    hyperparameters: HyperparameterConfig = field(default_factory=HyperparameterConfig)
-    audio_config: AudioConfig = field(default_factory=AudioConfig)
-    stages_to_run: List[str] = field(default_factory=lambda: list(PIPELINE_STAGES))
-    run_audio_generation: bool = False
-    cloud_api_keys: Dict[str, str] = field(default_factory=dict)
-    
-    # --- Local model compute settings ---
-    quantization: str = DEFAULT_QUANTIZATION
-    gpu_layers: int = DEFAULT_GPU_LAYERS
-    max_gpu_memory: str = "10GB"
-    max_cpu_memory: str = "30GB"
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes the app state to a dictionary for saving."""
-        return {
-            "input_files": [str(f) for f in self.input_files], # Save as strings
-            "output_dir": str(self.output_dir),
-            "output_filename": self.output_filename,
-            "processing_mode": self.processing_mode.value, # Save enum value
-            "text_model_provider": self.text_model_provider,
-            "text_model_specifier": self.text_model_specifier,
-            "audio_model_provider": self.audio_model_provider,
-            "audio_model_specifier": self.audio_model_specifier,
-            "hyperparameters": asdict(self.hyperparameters),
-            "audio_config": asdict(self.audio_config),
-            "stages_to_run": self.state.stages_to_run,
-            "run_audio_generation": self.state.run_audio_generation,
-            "quantization": self.quantization,
-            "gpu_layers": self.gpu_layers,
-            "max_gpu_memory": self.max_gpu_memory,
-            "max_cpu_memory": self.max_cpu_memory
-        }
-
-    def from_dict(self, data: Dict[str, Any]):
-        """Deserializes a dictionary into the app state."""
-        try:
-            self.input_files = [Path(p) for p in data.get("input_files", [])]
-            self.output_dir = Path(data.get("output_dir", "output"))
-            self.output_filename = data.get("output_filename")
-            self.processing_mode = ProcessingMode(data.get("processing_mode", "podcast"))
-            self.text_model_provider = data.get("text_model_provider", "local")
-            self.text_model_specifier = data.get("text_model_specifier", DEFAULT_MODEL)
-            self.audio_model_provider = data.get("audio_model_provider", "local")
-            self.audio_model_specifier = data.get("audio_model_specifier", "microsoft/speecht5_tts")
-            self.hyperparameters = HyperparameterConfig(**data.get("hyperparameters", {}))
-            self.audio_config = AudioConfig(**data.get("audio_config", {}))
-            self.stages_to_run = data.get("stages_to_run", list(PIPELINE_STAGES))
-            self.run_audio_generation = data.get("run_audio_generation", False)
-            self.quantization = data.get("quantization", DEFAULT_QUANTIZATION)
-            self.gpu_layers = data.get("gpu_layers", DEFAULT_GPU_LAYERS)
-            self.max_gpu_memory = data.get("max_gpu_memory", "10GB")
-            self.max_cpu_memory = data.get("max_cpu_memory", "30GB")
-            
-            ConsoleOutput.success("Configuration loaded successfully.")
-        except Exception as e:
-            logger.error(f"Error loading configuration state: {e}", exc_info=True)
-            ConsoleOutput.error(f"Error loading configuration: {e}. State may be partial.")
-
-    def get_pipeline_config(self) -> PipelineConfig:
-        """Creates a PipelineConfig based on current AppState."""
-        model_name_meta = f"{self.text_model_provider}:{self.text_model_specifier}"
-
-        # Create mock args namespace just for the helpers
-        mock_args = argparse.Namespace(
-            quantization=self.quantization,
-            compute_dtype='bfloat16', # TODO: Make this configurable in AppState
-            gpu_layers=self.gpu_layers,
-            no_layer_split=False, # TODO: Make this configurable in AppState
-            max_gpu_memory=self.max_gpu_memory,
-            max_cpu_memory=self.max_cpu_memory
+        self.response_filter = ResponseFilter(self.model_config)
+        self.token_calculator = DynamicTokenLimitCalculator(
+            self.model_config,
+            # Use max_context from the *specific* ModelConfig passed to init
+            model_max_context=self.model_config.max_context
         )
 
-        return PipelineConfig(
-            mode=self.processing_mode,
-            model_name=model_name_meta,
-            model_provider=self.text_model_provider,
-            model_specifier=self.text_model_specifier,
-            quantization_config=create_quantization_config(mock_args),
-            layer_split_config=create_layer_split_config(mock_args),
-            memory_profile="medium_vram", # TODO: This is now redundant, remove later
-            chunking_strategy=ChunkingStrategy.WORD_BOUNDARY, # TODO: Make configurable in AppState
-            chunk_size=1000, # TODO: Make configurable in AppState
-            markdown_style=self.processing_mode.value,
-            output_format="markdown", # TODO: Make configurable in AppState
-            hyperparameters=self.hyperparameters
+        self.logger.info(f"Initialized LocalTransformerBackend for {self.model_id}")
+        self.logger.info(f"  Quantization: {self.quant_config.method}")
+        self.logger.info(f"  Layer splitting enabled: {self.split_config.enabled}")
+
+    @property
+    def provider_identifier(self) -> str:
+        return "local"
+
+    @log_execution_time()
+    @log_resource_usage()
+    def load_model(self, trust_remote_code: bool = True, **kwargs) -> bool:
+        """
+        Load model with optimizations
+
+        Args:
+            trust_remote_code: Whether to trust remote code in model
+        """
+        self.logger.info(f"Loading model: {self.model_id}") # Use self.model_id
+
+        # Determine device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        success = False # Initialize success flag
+        if self.device == "cpu":
+            self.logger.warning("No GPU detected, loading on CPU (will be slower)")
+            self.split_config.enabled = False # Force no splitting if no CUDA
+            self.quant_config.method = "none" # Force no BNB quantization on CPU
+            success = self._load_cpu_model(trust_remote_code)
+        else:
+            try:
+                if self.quant_config.method != "none":
+                    success = self._load_quantized_model(trust_remote_code)
+                elif self.split_config.enabled:
+                    success = self._load_split_model(trust_remote_code)
+                else:
+                    success = self._load_standard_model(trust_remote_code)
+            except Exception as e:
+                self.logger.error(f"Failed to load model {self.model_id}: {e}", exc_info=True)
+                self.unload_model() # Ensure cleanup on failure
+                return False
+
+        if success:
+            self._post_load_setup()
+            self._log_model_info()
+
+        return success
+
+    def _load_quantized_model(self, trust_remote_code: bool) -> bool:
+        """Load model with quantization"""
+        self.logger.info(f"Loading with {self.quant_config.method} quantization")
+
+        bnb_config_dict = self.quant_config.to_bnb_config()
+        if bnb_config_dict is None:
+            self.logger.warning(f"Quantization method '{self.quant_config.method}' selected but config is None. Loading standard model.")
+            return self._load_standard_model(trust_remote_code)
+
+        try:
+            # Create BitsAndBytesConfig object here
+            bnb_config = BitsAndBytesConfig(**bnb_config_dict)
+        except Exception as e:
+            self.logger.error(f"Failed to create BitsAndBytesConfig: {e}. Loading standard model.", exc_info=True)
+            return self._load_standard_model(trust_remote_code)
+
+        device_map = "auto"
+        max_memory = None
+        if self.split_config.enabled and torch.cuda.is_available(): # Ensure split config is only used with CUDA
+            device_map = self._create_device_map()
+            max_memory = self.split_config.get_max_memory_dict()
+            self.logger.debug(f"Using device_map='{device_map}' and max_memory={max_memory}")
+        elif not torch.cuda.is_available():
+            device_map = "cpu" # Force CPU if CUDA not available despite config
+            self.logger.warning("CUDA not available, forcing device_map='cpu' for quantized load.")
+
+
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                quantization_config=bnb_config,
+                device_map=device_map,
+                max_memory=max_memory if device_map != "cpu" else None, # Don't pass max_memory if mapping to CPU
+                torch_dtype=self.quant_config.compute_dtype,
+                low_cpu_mem_usage=True if device_map != "cpu" else False, # Only use if not fully on CPU
+                cache_dir=str(CACHE_DIR), # Ensure string
+                offload_folder=str(self.split_config.offload_folder or OFFLOAD_DIR) if self.split_config.enabled and device_map != "cpu" else None,
+                offload_state_dict=self.split_config.offload_state_dict if self.split_config.enabled and device_map != "cpu" else False,
+                trust_remote_code=trust_remote_code
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                cache_dir=str(CACHE_DIR),
+                use_fast=True,
+                trust_remote_code=trust_remote_code
+            )
+
+            self.model = model
+            self.tokenizer = tokenizer
+            if hasattr(model, 'hf_device_map'):
+                self.device_map = model.hf_device_map
+
+            self.logger.info(f"Successfully loaded quantized model")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to load quantized model: {e}", exc_info=True)
+            self.logger.info("Falling back to standard loading")
+            return self._load_standard_model(trust_remote_code) # Attempt fallback
+
+    def _load_split_model(self, trust_remote_code: bool) -> bool:
+        """Load model with layer splitting (no quantization)"""
+        self.logger.info("Loading model with layer splitting")
+
+        if not torch.cuda.is_available():
+             self.logger.error("Layer splitting requires CUDA, but it's not available. Falling back.")
+             return self._load_cpu_model(trust_remote_code) # Fallback to CPU
+
+        device_map = self._create_device_map()
+        max_memory = self.split_config.get_max_memory_dict()
+
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                device_map=device_map,
+                max_memory=max_memory,
+                torch_dtype=torch.bfloat16, # Default to bfloat16
+                low_cpu_mem_usage=True,
+                cache_dir=str(CACHE_DIR),
+                offload_folder=str(self.split_config.offload_folder or OFFLOAD_DIR),
+                offload_state_dict=self.split_config.offload_state_dict,
+                trust_remote_code=trust_remote_code
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                cache_dir=str(CACHE_DIR),
+                use_fast=True,
+                trust_remote_code=trust_remote_code
+            )
+
+            if hasattr(model, 'hf_device_map'):
+                self.device_map = model.hf_device_map
+
+            self.model = model
+            self.tokenizer = tokenizer
+            self.logger.info("Successfully loaded model with layer splitting")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to load split model: {e}", exc_info=True)
+            self.logger.info("Falling back to standard loading")
+            return self._load_standard_model(trust_remote_code) # Attempt fallback
+
+    def _load_standard_model(self, trust_remote_code: bool) -> bool:
+        """Load model without special optimizations (full precision on GPU/auto)"""
+        self.logger.info("Loading model in standard mode (no quantization/splitting)")
+
+        device_map_setting = "auto" if torch.cuda.is_available() else "cpu"
+
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                torch_dtype=torch.bfloat16 if device_map_setting != "cpu" else torch.float32, # Use bfloat16 on GPU, float32 on CPU
+                device_map=device_map_setting,
+                cache_dir=str(CACHE_DIR),
+                low_cpu_mem_usage=True if device_map_setting != "cpu" else False,
+                trust_remote_code=trust_remote_code
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                cache_dir=str(CACHE_DIR),
+                use_fast=True,
+                trust_remote_code=trust_remote_code
+            )
+
+            self.model = model
+            self.tokenizer = tokenizer
+            if hasattr(model, 'hf_device_map'):
+                self.device_map = model.hf_device_map
+            elif device_map_setting == "cpu":
+                self.device_map = {"model": "cpu"} # Explicitly set for CPU load
+
+            self.logger.info(f"Successfully loaded model in standard mode on {device_map_setting}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to load standard model: {e}", exc_info=True)
+            # Try CPU fallback if standard GPU/auto failed
+            if device_map_setting != "cpu":
+                self.logger.info("Attempting fallback to CPU loading...")
+                return self._load_cpu_model(trust_remote_code)
+            return False # Final fallback failed
+
+    def _load_cpu_model(self, trust_remote_code: bool) -> bool:
+        """Load model on CPU only"""
+        self.logger.info("Loading model explicitly on CPU")
+
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_id,
+                torch_dtype=torch.float32, # CPU usually prefers float32
+                # Explicitly avoid device_map='cpu' which can cause issues with from_pretrained
+                # Let transformers handle placing it on CPU by default when no CUDA visible
+                cache_dir=str(CACHE_DIR),
+                low_cpu_mem_usage=False,
+                trust_remote_code=trust_remote_code
+            ).to('cpu') # Ensure it's moved to CPU if loaded elsewhere initially
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                cache_dir=str(CACHE_DIR),
+                use_fast=True,
+                trust_remote_code=trust_remote_code
+            )
+
+            self.model = model
+            self.tokenizer = tokenizer
+            self.device_map = {"": "cpu"} # Set map manually for CPU
+            self.device = "cpu" # Update internal device state
+
+            self.logger.info("Successfully loaded model on CPU")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to load CPU model: {e}", exc_info=True)
+            return False
+
+    def _post_load_setup(self):
+        """Common setup tasks after model/tokenizer are loaded."""
+        if self.tokenizer and self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.logger.debug("Set pad_token to eos_token")
+            else:
+                # Default pad token id for models without eos/pad
+                default_pad_id = 0
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                self.model.resize_token_embeddings(len(self.tokenizer)) # Resize model embeddings
+                self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids('[PAD]')
+                if self.tokenizer.pad_token_id is None: # Fallback if adding fails somehow
+                    self.tokenizer.pad_token_id = default_pad_id
+                self.logger.warning(f"Tokenizer missing pad_token and eos_token. Added '[PAD]' token with id {self.tokenizer.pad_token_id}.")
+
+
+        # Update hyperparameters with tokenizer info if not already set
+        if self.tokenizer:
+            # Check for None before assigning, respect existing values if set
+            if self.hyperparams.pad_token_id is None and self.tokenizer.pad_token_id is not None:
+                self.hyperparams.pad_token_id = self.tokenizer.pad_token_id
+            if self.hyperparams.eos_token_id is None and self.tokenizer.eos_token_id is not None:
+                # Handle cases where eos_token_id might be a list
+                if isinstance(self.tokenizer.eos_token_id, list):
+                     self.hyperparams.eos_token_id = self.tokenizer.eos_token_id[0] # Take the first one
+                else:
+                     self.hyperparams.eos_token_id = self.tokenizer.eos_token_id
+            if self.hyperparams.bos_token_id is None and self.tokenizer.bos_token_id is not None:
+                self.hyperparams.bos_token_id = self.tokenizer.bos_token_id
+
+        # Update token calculator with model config's max context (using the specific config)
+        self.token_calculator.model_max_context = self.model_config.max_context
+
+        # Update response filter with model config (using the specific config)
+        self.response_filter.model_config = self.model_config
+
+    def _create_device_map(self) -> Dict[str, Any]:
+        """Create optimal device map for layer splitting"""
+        if not self.split_config.enabled or not torch.cuda.is_available():
+            return "auto" # Let transformers handle CPU if CUDA not available
+
+        if self.split_config.gpu_layers == 0:
+            return {"": "cpu"}
+
+        # For transformers, 'auto' with max_memory constraints is generally preferred
+        # over trying to manually count layers, which is complex.
+        # n_gpu_layers is more relevant for llama.cpp
+
+        if self.split_config.gpu_layers > 0:
+             # Accelerate's infer_auto_device_map can sometimes use n_gpu_layers hint,
+             # but max_memory is the primary driver. We log a warning.
+             self.logger.warning("Manual 'gpu_layers' for Transformers backend is less reliable; "
+                               "using 'auto' with 'max_gpu_memory' constraint is preferred.")
+
+        return "auto" # Let accelerate handle it based on max_memory
+
+    def _get_max_memory_dict(self) -> Dict:
+        """Get max memory dictionary for device mapping"""
+        return self.split_config.get_max_memory_dict()
+
+    def _log_model_info(self):
+        """Log information about loaded model"""
+        if self.model is None:
+            return
+
+        try:
+            param_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad) # Count trainable params
+            # Estimate size based on effective precision
+            param_dtype = next(self.model.parameters()).dtype
+            bytes_per_param = 4 # Default float32
+            if self.quant_config.method == "4bit":
+                bytes_per_param = 0.5
+            elif self.quant_config.method == "8bit":
+                 bytes_per_param = 1
+            elif param_dtype in [torch.float16, torch.bfloat16]:
+                 bytes_per_param = 2
+
+            param_size_gb = (param_count * bytes_per_param) / (1024 ** 3)
+            self.logger.info(f"Model loaded: ~{param_count:,} parameters (~{param_size_gb:.2f} GB effective size)")
+        except Exception as e:
+             self.logger.warning(f"Could not calculate model parameter count/size: {e}")
+
+        # Log device map if available
+        if self.device_map:
+            self.logger.info(f"Device map: {self.device_map}")
+            # More detailed breakdown
+            device_counts = {}
+            total_modules = 0
+            # Iterate through values which represent devices
+            for device in self.device_map.values():
+                 device_str = str(device) # Convert device object/index to string
+                 device_counts[device_str] = device_counts.get(device_str, 0) + 1
+                 total_modules += 1 # Count modules based on map entries
+
+            if total_modules > 0: # Check if map is not empty
+                 for device, count in device_counts.items():
+                     self.logger.info(f"  {device}: {count} modules assigned")
+                 self.logger.info(f"  (Total modules in device map: {total_modules})")
+            else:
+                 self.logger.info("  Device map is empty or not detailed.")
+
+
+        # Log memory usage
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    allocated = torch.cuda.memory_allocated(i) / (1024**3)  # GB
+                    reserved = torch.cuda.memory_reserved(i) / (1024**3)  # GB
+                    logger.info(f"  GPU {i} Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                except Exception as e:
+                    logger.warning(f"Could not get memory info for GPU {i}: {e}")
+
+    @log_execution_time()
+    def generate(self,
+                prompt: str,
+                hyperparams: Optional[HyperparameterConfig] = None,
+                remove_thinking: bool = True,
+                **kwargs) -> GenerationResult:
+        """
+        Generate text from prompt
+
+        Args:
+            prompt: Input prompt
+            hyperparams: Override hyperparameters (uses instance config if None)
+            remove_thinking: Whether to filter thinking tokens
+
+        Returns:
+            GenerationResult with generated text and metadata
+        """
+        if self.model is None or self.tokenizer is None:
+            self.logger.error("Attempted to generate text but model or tokenizer is not loaded.")
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        hp = hyperparams or self.hyperparams
+
+        # Calculate max_new_tokens dynamically if needed
+        calculated_max_new_tokens = self.token_calculator.calculate_max_new_tokens(
+            input_text=prompt
+            # model_max_context is already set in the calculator instance
         )
 
-
-class MenuSystem:
-    def __init__(self):
-        self.state = AppState()
-        self.config_manager = ConfigManager()
-        self.hf_search = HuggingFaceSearch(cache_dir=CACHE_DIR / "hf_search") # Use main cache dir
-        self.model_hub = ModelHub(cache_dir=CACHE_DIR / "model_hub") # Use main cache dir
-        self.registry = get_registry() # Get registry instance
-
-        self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
-        logger.info(f"Loaded API keys for providers: {list(self.state.cloud_api_keys.keys())}")
-
-        self.main_menu = self._build_main_menu()
-        logger.info("Initialized MenuSystem")
-
-    def run(self):
-        """Starts the main menu loop."""
-        result = self.main_menu.display()
-        if result == MenuAction.EXIT:
-            ConsoleOutput.info("Exiting LlamaNote.")
-        elif result == MenuAction.RUN:
-             self._execute_pipeline()
-             ConsoleOutput.info("Processing finished. Returning to main menu.")
-             self.run() # Loop back to main menu after running
+        if hp.max_new_tokens is None:
+            final_max_new_tokens = calculated_max_new_tokens
         else:
-             ConsoleOutput.info("Exiting LlamaNote.")
+            final_max_new_tokens = min(hp.max_new_tokens, calculated_max_new_tokens)
 
-    # --- Build Menus ---
 
-    def _build_main_menu(self) -> Menu:
-        """Builds the top-level menu."""
-        items = [
-            MenuItem("1", "Select Input & Stages", self._select_input_menu, description=lambda: f"{len(self.state.input_files)} file(s) selected"),
-            MenuItem("2", "Model Settings", submenu=self._build_model_settings_menu(), description="Configure text and audio models"),
-            MenuItem("3", "Cloud Provider Settings", submenu=self._build_cloud_settings_menu(), description="Manage API keys"),
-            MenuItem("4", "Output Settings", self._output_settings_menu, description=lambda: f"Saving to: {self.state.output_dir.name}"),
-            MenuItem("5", "Load Configuration", self._load_configuration, description="Load a saved settings preset"),
-            MenuItem("6", "Save Configuration", self._save_configuration, description="Save current settings as a preset"),
-            MenuItem("7", "View Current Setup", self._view_current_setup, description="Review selections"),
-            MenuItem("8", "Run Processing", self._confirm_and_run, description="Execute the pipeline"),
-        ]
-        main_menu = Menu("LlamaNote Enhanced - Main Menu", items, parent=None)
+        self.logger.debug(f"Generating with max_new_tokens={final_max_new_tokens}, "
+                    f"temperature={hp.temperature}, top_p={hp.top_p}")
+
+        # Tokenize input, ensure truncation respects the calculated output length
+        max_input_length = self.model_config.max_context - final_max_new_tokens - 10 # Add safety buffer
+        if max_input_length <= 0:
+             self.logger.error(f"Calculated max input length is too small ({max_input_length}). "
+                               f"Model context {self.model_config.max_context}, requested new tokens {final_max_new_tokens}. Prompt might be too long.")
+             # Handle error gracefully - maybe return empty result or raise specific error
+             return GenerationResult(raw_output="Error: Prompt too long for model context.", filtered_output="Error: Prompt too long.",
+                                     input_tokens=0, output_tokens=0, generation_time=0, memory_used=0)
+
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True,
+                                max_length=max_input_length)
+        input_tokens = inputs['input_ids'].shape[1]
+
+        # Move to correct device
+        first_device = self._get_model_device()
+        inputs = {k: v.to(first_device) for k, v in inputs.items()}
+
+        # Create generation config from hyperparameters, using the final max_new_tokens
+        gen_config_dict = hp.to_dict()
+        gen_config_dict['max_new_tokens'] = final_max_new_tokens
         
-        for item in items:
-            if item.submenu:
-                item.submenu.parent = main_menu
-        return main_menu
-
-    def _build_model_settings_menu(self) -> Menu:
-        """Builds the menu for configuring models."""
-        items = [
-            MenuItem(
-                "1",
-                "Set Text Processing Model",
-                self._set_text_model_menu,
-                description=lambda: f"Current: {self.state.text_model_provider} - {self.state.text_model_specifier}"
-            ),
-            MenuItem(
-                "2",
-                "Set Text Model Hyperparameters",
-                self._set_text_hyperparameters,
-                description="Configure generation settings"
-            ),
-            MenuItem( # New item for local model settings
-                "3",
-                "Set Local Model Hardware Settings", 
-                self._set_local_hardware_config,
-                description=lambda: f"Quant: {self.state.quantization}, GPUs: {self.state.gpu_layers}"
-            ),
-            MenuItem(
-                "4",
-                "Set Audio Generation Model",
-                self._set_audio_model_menu,
-                description=lambda: f"Current: {self.state.audio_model_provider} - {self.state.audio_model_specifier}"
-            ),
-            MenuItem(
-                "5",
-                "Configure Audio Settings",
-                self._set_audio_config, 
-                description="Set sample rate, format, voice, etc."
-            ),
-        ]
-        menu = Menu("Model Settings", items, parent=self.main_menu)
-        return menu
-
-    def _build_cloud_settings_menu(self) -> Menu:
-        """Builds the menu for managing API keys."""
-        items = []
-        for i, provider in enumerate(SUPPORTED_CLOUD_PROVIDERS):
-            items.append(MenuItem(
-                key=str(i + 1),
-                label=lambda p=provider: f"Set/Update {p.replace('_', ' ').title()} Key {'(Set)' if p in self.state.cloud_api_keys else '(Not Set)'}",
-                action=lambda p=provider: self._set_provider_key(p)
-            ))
-        items.append(MenuItem(str(len(SUPPORTED_CLOUD_PROVIDERS) + 1), "View Configured Keys", self._view_keys))
-        menu = Menu("Cloud Provider API Keys", items, parent=self.main_menu)
-        return menu
-
-
-    # --- Menu Actions ---
-    
-    def _save_configuration(self):
-        """Saves the current AppState to a named preset."""
-        ConsoleOutput.section("Save Configuration Preset")
-        
-        presets = self.config_manager.list_configs(dir_type="preset")
-        if presets:
-            print("Existing presets:")
-            for p in presets:
-                print(f"  - {p}")
-        else:
-            print("No existing presets found.")
-
-        name = input("\nEnter name for this configuration (e.g., 'my_podcast_setup'): ").strip()
-        if not name:
-            ConsoleOutput.warning("Save cancelled. No name provided.")
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
-            
-        name = re.sub(r'[\\/*?:"<>|]', '', name).replace(" ", "_")
-        if not name:
-            ConsoleOutput.error("Invalid name. Save cancelled.")
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
-            
-        try:
-            config_data = self.state.to_dict()
-            # Remove input files from saved preset
-            config_data["input_files"] = []
-            success = self.config_manager.save_config(name, config_data, dir_type="preset")
-            if success:
-                ConsoleOutput.success(f"Configuration '{name}' saved successfully.")
-            else:
-                ConsoleOutput.error(f"Failed to save configuration '{name}'.")
-        except Exception as e:
-            ConsoleOutput.error(f"Error saving configuration: {e}")
-            logger.error(f"Failed to save config '{name}'", exc_info=True)
-            
-        input("Press Enter to continue...")
-        return MenuAction.CONTINUE
-
-    def _load_configuration(self):
-        """Loads an AppState from a saved preset."""
-        ConsoleOutput.section("Load Configuration Preset")
-        
-        presets = self.config_manager.list_configs(dir_type="preset")
-        if not presets:
-            ConsoleOutput.warning("No saved presets found.")
-            print(f"(Looked in: {self.config_manager.get_dir('preset')})")
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
-
-        print("Available presets:")
-        for i, name in enumerate(presets):
-            print(f"  {i+1}. {name}")
-        print("\n  b. Back")
-        print("-" * 60)
-        
-        choice = input(f"Select preset to load (1-{len(presets)} or b): ").strip().lower()
-        
-        if choice == 'b':
-            return MenuAction.CONTINUE
-            
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(presets):
-                selected_name = presets[idx]
-                config_data = self.config_manager.load_config(selected_name, dir_type="preset")
-                if config_data:
-                    # Save current input files, as they are not part of the preset
-                    current_inputs = self.state.input_files
-                    self.state.from_dict(config_data)
-                    self.state.input_files = current_inputs # Restore input files
-                    
-                    ConsoleOutput.success(f"Loaded preset '{selected_name}'.")
-                    # Re-load API keys as they are not saved in presets
-                    self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
-                else:
-                    ConsoleOutput.error(f"Failed to load preset '{selected_name}'.")
-            else:
-                ConsoleOutput.warning("Invalid selection.")
-        except ValueError:
-            ConsoleOutput.warning("Invalid input. Please enter a number.")
-        except Exception as e:
-            ConsoleOutput.error(f"Error loading preset: {e}")
-            logger.error(f"Failed to load preset", exc_info=True)
-
-        input("Press Enter to continue...")
-        return MenuAction.CONTINUE # Return to main menu
-
-    def _select_input_menu(self):
-        """Handles selection of input file(s) or directory."""
-        ConsoleOutput.section("Select Input Source")
-        path_str = input("Enter PDF file path OR folder path containing files: ").strip()
-        if not path_str:
-            return MenuAction.CONTINUE
-
-        path_str = os.path.expanduser(path_str) # Handle ~/ paths
-        path = Path(path_str)
-        
-        selected_files = []
-        if not path.exists():
-            ConsoleOutput.error(f"Path does not exist: {path_str}")
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
-            
-        if path.is_file():
-             if path.suffix.lower() in SUPPORTED_FORMATS:
-                selected_files = [path]
-                ConsoleOutput.success(f"Selected single file: {path.name}")
-             else:
-                 ConsoleOutput.error(f"Unsupported file type: {path.suffix}. Supported: {SUPPORTED_FORMATS}")
-                 input("Press Enter to continue...")
-                 return MenuAction.CONTINUE
-                 
-        elif path.is_dir():
-            ConsoleOutput.info(f"Scanning directory (recursive): {path}")
-            fm = BatchFileManager()
-            
-            all_files_in_dir = []
-            for ext in SUPPORTED_FORMATS:
-                 all_files_in_dir.extend(path.rglob(f"*{ext}"))
-            
-            supported_files = sorted(list(set(all_files_in_dir)))
-
-            if not supported_files:
-                ConsoleOutput.warning("No supported files found in this directory or subdirectories.")
-                self.state.input_files = []
-                input("Press Enter to continue...")
-                return MenuAction.CONTINUE
-
-            print(f"Found {len(supported_files)} supported files.")
-            print("  1. Process ALL files found")
-            print("  2. Select specific files from the list")
-            print("\n  b. Back")
-            choice = input("Select option (1-2 or b): ").strip().lower()
-
-            if choice == '1':
-                selected_files = supported_files
-                ConsoleOutput.success(f"Selected {len(selected_files)} files for batch processing.")
-            elif choice == '2':
-                 print("\nAvailable files:")
-                 for i, file_path in enumerate(supported_files):
-                     try: display_path = file_path.relative_to(path)
-                     except ValueError: display_path = file_path
-                     print(f"  {i+1:3d}. {display_path}")
-                 
-                 file_choices_str = input(f"Enter file numbers to process (comma-separated, e.g., 1,3,5): ").strip()
-                 try:
-                     indices = [int(n.strip()) - 1 for n in file_choices_str.split(',') if n.strip().isdigit()]
-                     valid_indices = [idx for idx in indices if 0 <= idx < len(supported_files)]
-                     if valid_indices:
-                         selected_files = [supported_files[idx] for idx in valid_indices]
-                         ConsoleOutput.success(f"Selected {len(selected_files)} specific file(s):")
-                         for f in selected_files[:5]: print(f"  - {f.name}")
-                         if len(selected_files) > 5: print("  ...")
-                     else:
-                         ConsoleOutput.warning("No valid file numbers selected.")
-                 except ValueError:
-                     ConsoleOutput.warning("Invalid input format for file numbers.")
-            elif choice == 'b':
-                 return MenuAction.CONTINUE
-            else:
-                 ConsoleOutput.warning("Invalid choice.")
-        else:
-            ConsoleOutput.error(f"Path is not a file or directory: {path_str}")
-
-        self.state.input_files = selected_files
-
-        if self.state.input_files:
-            return self._select_stages_menu() 
-        else:
-            return MenuAction.CONTINUE
-
-
-    def _select_stages_menu(self):
-        """Allows user to toggle which pipeline stages run."""
-        all_text_stages = list(PIPELINE_STAGES) 
-
-        while True:
-            ConsoleOutput.header("Select Stages")
-            print("Text Processing Stages:")
-            for i, stage in enumerate(all_text_stages):
-                 included = "[X]" if stage in self.state.stages_to_run else "[ ]"
-                 print(f"  {i+1}. {included} {stage}")
-
-            audio_included = "[X]" if self.state.run_audio_generation else "[ ]"
-            print(f"\nAudio Generation Stage:")
-            print(f"  A. {audio_included} Generate Audio (Runs after text processing if 'save' is enabled)")
-
-            print("\nOptions:")
-            print("  Enter number (1-7) or 'A' to toggle a stage.")
-            print("  'text'   - Select all text stages.")
-            print("  'none'   - Deselect all text stages.")
-            print("  'done'   - Confirm selection and go back.")
-            print("-" * 60)
-
-            choice = input("Toggle stage or command: ").strip().lower()
-
-            if choice == 'done':
-                break 
-            elif choice == 'text':
-                self.state.stages_to_run = list(PIPELINE_STAGES)
-                ConsoleOutput.info("All text stages selected.")
-            elif choice == 'none':
-                self.state.stages_to_run = []
-                ConsoleOutput.info("All text stages deselected.")
-            elif choice == 'a':
-                self.state.run_audio_generation = not self.state.run_audio_generation
-                status = "ENABLED" if self.state.run_audio_generation else "DISABLED"
-                ConsoleOutput.info(f"Audio Generation {status}.")
-            elif choice.isdigit():
-                try:
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(all_text_stages):
-                        stage_name = all_text_stages[idx]
-                        if stage_name in self.state.stages_to_run:
-                            self.state.stages_to_run.remove(stage_name)
-                        else:
-                            temp_stages = []
-                            stages_set = set(self.state.stages_to_run)
-                            stages_set.add(stage_name)
-                            for s in PIPELINE_STAGES:
-                                if s in stages_set:
-                                    temp_stages.append(s)
-                            self.state.stages_to_run = temp_stages
-                    else:
-                        ConsoleOutput.warning("Invalid stage number.")
-                except ValueError:
-                    ConsoleOutput.warning("Invalid input.")
-            else:
-                ConsoleOutput.warning("Invalid command.")
-
-        ConsoleOutput.success("Stages selection confirmed.")
-        return MenuAction.CONTINUE # Go back to main menu
-
-
-    def _set_provider_key(self, provider: str):
-        """Sets or clears an API key for a given provider."""
-        ConsoleOutput.section(f"Set API Key for {provider.replace('_', ' ').title()}")
-        current_key = self.state.cloud_api_keys.get(provider)
-        if current_key:
-            masked_key = '*' * (len(current_key) - 4) + current_key[-4:] if len(current_key) > 4 else '*' * len(current_key)
-            print(f"Current key: {masked_key}")
-        else:
-            print("Current key: Not set")
-
-        new_key = input("Enter new API key (leave blank to clear, 'keep' to keep current): ").strip()
-
-        if new_key.lower() == 'keep':
-            return MenuAction.CONTINUE
-        
-        if not new_key:
-            # Clear the key
-            if self.config_manager.save_cloud_key(provider, None):
-                if provider in self.state.cloud_api_keys:
-                    del self.state.cloud_api_keys[provider]
-                ConsoleOutput.success(f"API key for {provider} cleared.")
-            else:
-                ConsoleOutput.error(f"Failed to clear key for {provider}.")
-        else:
-            # Save the new key
-            if self.config_manager.save_cloud_key(provider, new_key):
-                self.state.cloud_api_keys[provider] = new_key # Update runtime state
-                ConsoleOutput.success(f"API key for {provider} saved.")
-            else:
-                ConsoleOutput.error(f"Failed to save key for {provider}.")
-
-        # Force reload keys from file to ensure state is sync
-        self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
-        return MenuAction.CONTINUE
-
-
-    def _view_keys(self):
-        """Displays which providers have keys configured."""
-        ConsoleOutput.section("Configured API Keys")
-        configured_keys = self.config_manager.load_cloud_keys()
-        self.state.cloud_api_keys = configured_keys # Update state
-
-        if not configured_keys:
-            print("No API keys are currently configured in the file.")
-            print(f"(Config file location: {self.config_manager.cloud_keys_file})")
-        else:
-            print("Providers with keys configured:")
-            for provider, key in configured_keys.items():
-                 masked_key = '*' * (len(key) - 4) + key[-4:] if len(key) > 4 else '*' * len(key)
-                 print(f"  - {provider.replace('_', ' ').title()}: {masked_key}")
-        input("\nPress Enter to continue...")
-        return MenuAction.CONTINUE
-
-    # --- Model Selection ---
-    def _set_text_model_menu(self):
-         """Top-level menu to choose between local and cloud text models."""
-         while True: 
-             ConsoleOutput.section("Set Text Processing Model")
-             print("  1. Use Local Model (Hugging Face / GGUF)")
-             print("  2. Use Cloud Model (OpenAI, Anthropic, Google, etc.)")
-             current_model_display = f"{self.state.text_model_provider}: {self.state.text_model_specifier}"
-             print(f"\nCurrent Model: {current_model_display}")
-             print("\n  b. Back")
-             print("-" * 60)
-
-             choice = input("Select option (1-2, or b): ").strip().lower()
-
-             if choice == '1':
-                 self._select_local_text_model() # This is now its own loop
-             elif choice == '2':
-                 self._select_cloud_text_model() # This is now its own loop
-             elif choice == 'b':
-                 return MenuAction.BACK # Go back to Model Settings Menu
-             else:
-                 ConsoleOutput.warning("Invalid choice.")
-
-
-    def _select_local_text_model(self):
-        """Handles selection of a local HF model or GGUF."""
-        while True:
-            ConsoleOutput.subsection("Select Local Text Model")
-            print("  1. Select from Predefined List (Recommended)")
-            print("  2. Browse Hugging Face Hub (Transformers)")
-            print("  3. Enter Hugging Face Model ID directly (Transformers)")
-            if LLAMACPP_AVAILABLE:
-                print("  4. Select GGUF Model from cache")
-                print("  5. Enter path to GGUF Model file")
-            
-            current_local = self.state.text_model_specifier if self.state.text_model_provider in ['local', 'local_gguf'] else 'N/A'
-            print(f"\nCurrent Local Model: {current_local}")
-            print("\n  b. Back")
-            print("-" * 60)
-
-            choice = input("Select option: ").strip().lower()
-            new_model_id = None
-            new_provider = "local" # Default for HF models
-
-            if choice == '1':
-                predefined = self.registry.list_models(predefined_only=True, sort_by="name")
-                if not predefined:
-                    ConsoleOutput.warning("No predefined models found in registry.")
-                    input("Press Enter...")
-                    continue
-                print("\nAvailable predefined models:")
-                for i, entry in enumerate(predefined):
-                    print(f"  {i+1}. {entry.name} ({entry.model_id})")
-                
-                model_choice = input(f"Select model (1-{len(predefined)} or b): ").strip()
-                if model_choice == 'b': continue
-                try:
-                    idx = int(model_choice) - 1
-                    if 0 <= idx < len(predefined):
-                        new_model_id = predefined[idx].model_id
-                        new_provider = "local" # Predefined are transformers models
-                    else:
-                        ConsoleOutput.warning("Invalid number.")
-                except ValueError:
-                    ConsoleOutput.warning("Invalid input.")
-
-            elif choice == '2':
-                browser = InteractiveModelBrowser(self.model_hub)
-                selected_hf_model: Optional[HFModelInfo] = browser.browse(task="text-generation", library="transformers")
-                if selected_hf_model:
-                    new_model_id = selected_hf_model.model_id
-                    new_provider = "local"
-                    if not self.registry.get_model(new_model_id):
-                        self.registry.add_from_model_info(selected_hf_model)
-                        ConsoleOutput.info(f"Added {new_model_id} to local registry.")
-
-            elif choice == '3':
-                model_id_input = input("Enter Hugging Face Model ID: ").strip()
-                if model_id_input:
-                     if '/' not in model_id_input:
-                         ConsoleOutput.warning("Invalid HF Model ID format (expected 'Org/ModelName').")
-                     else:
-                        new_model_id = model_id_input
-                        new_provider = "local"
-                        if not self.registry.get_model(new_model_id):
-                            hf_info = self.model_hub.get_model_info(new_model_id)
-                            if hf_info: self.registry.add_from_model_info(hf_info)
-                            else: self.registry.add_model(ModelEntry(model_id=model_id_input, name=model_id_input.split('/')[-1], author="Unknown"))
-
-            elif choice == '4' and LLAMACPP_AVAILABLE:
-                manager = GGUFModelManager(cache_dir=CACHE_DIR / "gguf_models")
-                gguf_models = manager.list_available_models()
-                if not gguf_models:
-                    ConsoleOutput.warning("No GGUF models found in cache.")
-                    input("Press Enter to continue...")
-                    continue
-                print("\nAvailable GGUF models:")
-                for i, p in enumerate(gguf_models): print(f"  {i+1}. {p.name}")
-                gguf_choice = input(f"Select GGUF model number (1-{len(gguf_models)} or b): ").strip()
-                if gguf_choice == 'b': continue
-                try:
-                    idx = int(gguf_choice) - 1
-                    if 0 <= idx < len(gguf_models):
-                        new_model_id = str(gguf_models[idx].resolve())
-                        new_provider = "local_gguf"
-                    else: ConsoleOutput.warning("Invalid number.")
-                except ValueError: ConsoleOutput.warning("Invalid input.")
-
-            elif choice == '5' and LLAMACPP_AVAILABLE:
-                gguf_path_str = input("Enter full path to GGUF model file: ").strip()
-                gguf_path = Path(os.path.expanduser(gguf_path_str))
-                if gguf_path.is_file() and gguf_path.suffix.lower() in ['.gguf', '.ggml', '.bin']:
-                    new_model_id = str(gguf_path.resolve())
-                    new_provider = "local_gguf"
-                else:
-                    ConsoleOutput.error("Invalid GGUF file path or extension.")
-                    input("Press Enter to continue...")
-
-            elif choice == 'b':
-                return # Go back to the text model type selection
-
-            else:
-                ConsoleOutput.warning("Invalid choice.")
-                continue # Re-prompt this menu
-
-            # If a new model was selected, update state
-            if new_model_id:
-                old_provider = self.state.text_model_provider
-                old_specifier = self.state.text_model_specifier
-                self.state.text_model_provider = new_provider
-                self.state.text_model_specifier = new_model_id
-                ConsoleOutput.success(f"Text model set to: {new_provider}: {self.state.text_model_specifier}")
-                
-                if old_provider != new_provider or old_specifier != new_model_id:
-                     reset_hp = input("Reset hyperparameters to default for new model? (y/n) [y]: ").strip().lower()
-                     if reset_hp != 'n':
-                         self.state.hyperparameters = HyperparameterConfig() 
-                         ConsoleOutput.info("Hyperparameters reset to defaults.")
-                return # Go back after successful selection
-
-
-    def _select_cloud_text_model(self):
-        """Handles selection of a cloud provider and model."""
-        while True:
-            ConsoleOutput.subsection("Select Cloud Text Model")
-            # Filter providers with keys
-            configured_providers = [p for p in SUPPORTED_CLOUD_PROVIDERS if p in self.state.cloud_api_keys and p != "huggingface_token"]
-
-            if not configured_providers:
-                ConsoleOutput.warning("No cloud providers configured with API keys.")
-                print("Please configure keys in the 'Cloud Provider Settings' menu.")
-                input("Press Enter to continue...")
-                return # Back to text model type selection
-
-            print("Configured Cloud Providers:")
-            provider_map = {}
-            # Start numbering from 1
-            for i, provider in enumerate(configured_providers):
-                print(f"  {i+1}. {provider.replace('_', ' ').title()}")
-                provider_map[str(i+1)] = provider
-            
-            print("\n  b. Back to Text Model Type Selection")
-            print("-" * 60)
-
-            provider_choice = input(f"Select provider (1-{len(provider_map)} or b): ").strip().lower()
-
-            if provider_choice == 'b':
-                return
-            elif provider_choice in provider_map:
-                selected_provider = provider_map[provider_choice]
-                
-                example_prompt = "e.g., "
-                if selected_provider == "openai":
-                    example_prompt += "gpt-4o / gpt-4-turbo / gpt-3.5-turbo"
-                elif selected_provider == "anthropic":
-                    example_prompt += "claude-3-opus-20240229"
-                elif selected_provider == "google":
-                    example_prompt += "models/gemini-1.5-pro-latest"
-                elif selected_provider == "openrouter":
-                    example_prompt += "anthropic/claude-3-haiku"
-                else:
-                    example_prompt = "Enter model name/ID"
-                
-                model_specifier = input(f"Enter model name/ID for {selected_provider.title()} ({example_prompt}): ").strip()
-                
-                if model_specifier:
-                    old_provider = self.state.text_model_provider
-                    old_specifier = self.state.text_model_specifier
-                    self.state.text_model_provider = selected_provider
-                    self.state.text_model_specifier = model_specifier
-                    ConsoleOutput.success(f"Text model set to: {selected_provider}: {model_specifier}")
-                    
-                    if old_provider != selected_provider or old_specifier != model_specifier:
-                        reset_hp = input("Reset hyperparameters to default? (y/n) [y]: ").strip().lower()
-                        if reset_hp != 'n':
-                            self.state.hyperparameters = HyperparameterConfig()
-                            ConsoleOutput.info("Hyperparameters reset to defaults.")
-                    return # Go back after success
-                else:
-                    ConsoleOutput.warning("Model name cannot be empty.")
-            else:
-                ConsoleOutput.warning("Invalid provider selection.")
-            
-            input("Press Enter to continue...") # Pause before re-prompting
-
-
-    def _set_text_hyperparameters(self):
-        """Opens the interactive hyperparameter editor."""
-        ConsoleOutput.section(f"Configure Text Hyperparameters for {self.state.text_model_provider}: {self.state.text_model_specifier}")
-        editor = InteractiveHyperparameterEditor(self.state.hyperparameters)
-        self.state.hyperparameters = editor.edit() # This starts the interactive editing loop
-        ConsoleOutput.success("Text hyperparameters updated for this session.")
-        return MenuAction.CONTINUE # Stay in Model Settings menu
-
-    def _set_local_hardware_config(self):
-        """Interactive configuration for local model hardware settings."""
-        ConsoleOutput.section("Configure Local Model Hardware Settings")
-        
-        while True:
-            ConsoleOutput.header("Local Hardware Settings")
-            print(f"  Provider: {self.state.text_model_provider}")
-            print(f"  Model: {self.state.text_model_specifier}")
-            print("-" * 60)
-            
-            is_gguf = (self.state.text_model_provider == 'local_gguf')
-            
-            if is_gguf:
-                print("  Note: Settings for GGUF model (via llama-cpp-python)")
-                print(f"  1. GPU Layers (n_gpu_layers) : {self.state.gpu_layers} (-1 = all, 0 = CPU only)")
-                # Quantization is baked into GGUF, but we can show it
-                print(f"  2. Quantization (inferred) : (Set by GGUF file)") 
-            else: # Transformers
-                print("  Note: Settings for Hugging Face Transformers model")
-                print(f"  1. Quantization           : {self.state.quantization} (Options: none, 4bit, 8bit)")
-                print(f"  2. Max GPU Memory         : {self.state.max_gpu_memory} (e.g., 8GB, 10000MB)")
-                print(f"  3. Max CPU Memory (Offload) : {self.state.max_cpu_memory} (e.g., 30GB)")
-                
-            print("\n  b. Back to Model Settings")
-            print("-" * 60)
-            
-            choice = input("Select setting to change (or b to back): ").strip().lower()
-            
-            try:
-                if choice == 'b':
-                    return MenuAction.BACK
-                
-                if is_gguf:
-                    if choice == '1':
-                        val = input(f"Enter number of GPU layers (-1 for all) [current: {self.state.gpu_layers}]: ").strip()
-                        if not val: continue
-                        self.state.gpu_layers = int(val)
-                        ConsoleOutput.success(f"GPU Layers set to: {self.state.gpu_layers}")
-                    else:
-                        ConsoleOutput.warning("Invalid selection for GGUF model.")
-                
-                else: # Transformers settings
-                    if choice == '1':
-                        val = input(f"Enter quantization (none, 4bit, 8bit) [current: {self.state.quantization}]: ").strip().lower()
-                        if not val: continue
-                        if val in QUANTIZATION_OPTIONS:
-                            self.state.quantization = val
-                            ConsoleOutput.success(f"Quantization set to: {val}")
-                        else:
-                            ConsoleOutput.warning(f"Invalid option. Must be one of: {QUANTIZATION_OPTIONS}")
-                    elif choice == '2':
-                         val = input(f"Enter Max GPU Memory (e.g., 8GiB, 10GB) [current: {self.state.max_gpu_memory}]: ").strip()
-                         if not val: continue
-                         # Basic validation, refine as needed
-                         if val.endswith(("GB", "GiB", "MB", "MiB")):
-                             self.state.max_gpu_memory = val
-                             ConsoleOutput.success(f"Max GPU Memory set to: {val}")
-                         else:
-                             ConsoleOutput.warning("Invalid format. Use GB, GiB, MB, etc.")
-                    elif choice == '3':
-                        val = input(f"Enter Max CPU Memory (e.g., 30GB) [current: {self.state.max_cpu_memory}]: ").strip()
-                        if not val: continue
-                        if val.endswith(("GB", "GiB", "MB", "MiB")):
-                            self.state.max_cpu_memory = val
-                            ConsoleOutput.success(f"Max CPU Memory set to: {val}")
-                        else:
-                             ConsoleOutput.warning("Invalid format. Use GB, GiB, MB, etc.")
-                    else:
-                        ConsoleOutput.warning("Invalid selection for Transformers model.")
-                        
-            except ValueError:
-                ConsoleOutput.warning("Invalid input value type.")
-            except Exception as e:
-                 ConsoleOutput.error(f"Error updating setting: {e}")
-                 
-                 
-    def _set_audio_model_menu(self):
-        """Top-level menu to choose between local and cloud audio models."""
-        while True:
-            ConsoleOutput.section("Set Audio Generation Model (TTS)")
-            print("  1. Use Local Model (Hugging Face)")
-            print("  2. Use Cloud Model (e.g., OpenAI TTS)")
-            current_model_display = f"{self.state.audio_model_provider}: {self.state.audio_model_specifier}"
-            print(f"\nCurrent Model: {current_model_display}")
-            print("\n  b. Back to Model Settings")
-            print("-" * 60)
-
-            choice = input("Select option (1-2, or b): ").strip().lower()
-
-            if choice == '1':
-                self._select_local_audio_model()
-            elif choice == '2':
-                self._select_cloud_audio_model()
-            elif choice == 'b':
-                return MenuAction.BACK 
-            else:
-                ConsoleOutput.warning("Invalid choice.")
-
-    def _select_local_audio_model(self):
-        """Handles selection of a local HF TTS model."""
-        while True:
-            ConsoleOutput.subsection("Select Local Audio Model (TTS)")
-            print("  1. Browse Hugging Face Hub (text-to-speech)")
-            print("  2. Enter Hugging Face Model ID directly")
-            current_local = self.state.audio_model_specifier if self.state.audio_model_provider == 'local' else 'N/A'
-            print(f"\nCurrent Local Model: {current_local}")
-            print("\n  b. Back to Audio Model Type Selection")
-            print("-" * 60)
-
-            choice = input("Select option: ").strip().lower()
-            new_model_id = None
-
-            if choice == '1':
-                browser = InteractiveModelBrowser(self.model_hub)
-                selected_hf_model: Optional[HFModelInfo] = browser.browse(task="text-to-speech")
-                if selected_hf_model:
-                     new_model_id = selected_hf_model.model_id
-            elif choice == '2':
-                 model_id_input = input("Enter Hugging Face Model ID (TTS): ").strip()
-                 if model_id_input:
-                     if '/' in model_id_input and len(model_id_input) > 3:
-                         new_model_id = model_id_input
-                     else:
-                         ConsoleOutput.warning("Invalid model ID format.")
-            elif choice == 'b':
-                 return
-
-            else:
-                ConsoleOutput.warning("Invalid choice.")
-                continue
-
-            if new_model_id:
-                self.state.audio_model_provider = "local"
-                self.state.audio_model_specifier = new_model_id
-                self.state.audio_config.model_id = new_model_id 
-                ConsoleOutput.success(f"Audio model set to: local: {self.state.audio_model_specifier}")
-                return
-
-
-    def _select_cloud_audio_model(self):
-        """Handles selection of a cloud TTS provider and model."""
-        while True:
-            ConsoleOutput.subsection("Select Cloud Audio Model (TTS)")
-            available_tts_providers = [p for p in TTS_PROVIDERS if p != 'local' and p in self.state.cloud_api_keys]
-
-            if not available_tts_providers:
-                ConsoleOutput.warning("No cloud TTS providers configured with API keys.")
-                print(f"Supported & Configurable TTS Providers: {', '.join(p for p in TTS_PROVIDERS if p != 'local')}")
-                print("Please configure keys in the 'Cloud Provider Settings' menu.")
-                input("Press Enter to continue...")
-                return
-
-            print("Configured & Supported Cloud TTS Providers:")
-            provider_map = {}
-            for i, provider in enumerate(available_tts_providers):
-                print(f"  {i+1}. {provider.replace('_', ' ').title()}")
-                provider_map[str(i+1)] = provider
-            print("\n  b. Back to Audio Model Type Selection")
-            print("-" * 60)
-
-            provider_choice = input(f"Select provider (1-{len(provider_map)} or b): ").strip().lower()
-
-            if provider_choice == 'b':
-                return
-            elif provider_choice in provider_map:
-                selected_provider = provider_map[provider_choice]
-                model_specifier = ""
-                
-                if selected_provider == "openai":
-                    model_specifier = input(f"Enter model name for {selected_provider.title()} (e.g., tts-1, tts-1-hd) [default: tts-1]: ").strip()
-                    if not model_specifier: model_specifier = "tts-1"
-                else:
-                    model_specifier = input(f"Enter model name/ID for {selected_provider.title()}: ").strip()
-
-                if model_specifier:
-                    self.state.audio_model_provider = selected_provider
-                    self.state.audio_model_specifier = model_specifier
-                    self.state.audio_config.model_id = None 
-                    ConsoleOutput.success(f"Audio model set to: {selected_provider}: {model_specifier}")
-                    return
-                else:
-                    ConsoleOutput.warning("Model name cannot be empty.")
-            else:
-                ConsoleOutput.warning("Invalid provider selection.")
-            
-            input("Press Enter to continue...")
-
-
-    def _set_audio_config(self):
-        """Interactive configuration for AudioConfig."""
-        ConsoleOutput.section("Configure Audio Settings")
-        cfg = self.state.audio_config
-
-        while True:
-            ConsoleOutput.header("Audio Settings")
-            is_local = self.state.audio_model_provider == 'local'
-            print(f"  Provider: {self.state.audio_model_provider}")
-            print(f"  Model: {self.state.audio_model_specifier}")
-            print("-" * 60)
-            print(f"  1. Output Format : {cfg.output_format} (wav, mp3, flac)")
-            print(f"  2. Sample Rate   : {cfg.sample_rate} Hz (Target SR; cloud models may have fixed output SR)")
-            print(f"  3. Speed Factor  : {cfg.speed} (1.0 = normal; applied via post-processing or API if supported)")
-            print(f"  4. Pitch Shift   : {cfg.pitch_shift} semitones (0 = normal; post-processing only)")
-            print(f"  5. Volume Norm.  : {'Enabled' if cfg.volume_normalize else 'Disabled'} (Post-processing)")
-
-            if not is_local:
-                 print(f"  6. Cloud Voice   : {cfg.cloud_voice} (Provider-specific, e.g., 'alloy', 'echo' for OpenAI)")
-                 print("  7. (Local setting N/A)")
-                 print("  8. (Local setting N/A)")
-            else:
-                 print(f"  6. Half Precision: {'Enabled' if cfg.use_half_precision else 'Disabled'} (Local CUDA only)")
-                 print(f"  7. Speaker Embed.: {cfg.speaker_embedding or 'Default/Not Used'} (Local SpeechT5)")
-                 print(f"  8. Text Chunk Size:{cfg.chunk_size} chars (Local processing)")
-            
-            print("\n  s. Save audio settings to preset")
-            print("  l. Load audio settings from preset")
-            print("  b. Back to Model Settings")
-            print("-" * 60)
-
-            choice = input("Select setting to change (or b, s, l): ").strip().lower()
-
-            try:
-                if choice == 'b':
-                    return MenuAction.BACK 
-                elif choice == 's':
-                    preset_name = input("Enter name for audio preset: ").strip()
-                    if preset_name:
-                        self.config_manager.save_config(preset_name, cfg.to_dict(), dir_type="audio")
-                        ConsoleOutput.success(f"Audio preset '{preset_name}' saved.")
-                    else:
-                        ConsoleOutput.warning("Invalid name, save cancelled.")
-                elif choice == 'l':
-                    presets = self.config_manager.list_configs(dir_type="audio")
-                    if not presets:
-                        ConsoleOutput.warning("No saved audio presets found.")
-                        continue
-                    print("Available audio presets:")
-                    for i, name in enumerate(presets): print(f"  {i+1}. {name}")
-                    preset_choice = input(f"Select preset (1-{len(presets)} or b): ").strip()
-                    if preset_choice == 'b': continue
-                    if preset_choice.isdigit():
-                         idx = int(preset_choice) - 1
-                         if 0 <= idx < len(presets):
-                              loaded_data = self.config_manager.load_config(presets[idx], dir_type="audio")
-                              if loaded_data:
-                                   self.state.audio_config = AudioConfig(**loaded_data)
-                                   ConsoleOutput.success(f"Loaded audio preset '{presets[idx]}'.")
-                              else:
-                                   ConsoleOutput.error("Failed to load preset.")
-                         else: ConsoleOutput.warning("Invalid selection.")
-                    else: ConsoleOutput.warning("Invalid input.")
-
-                elif choice == '1':
-                    fmt = input(f"Enter new format (wav, mp3, flac) [current: {cfg.output_format}]: ").strip().lower()
-                    if fmt in ["wav", "mp3", "flac"]: cfg.output_format = fmt
-                    elif fmt: ConsoleOutput.warning("Invalid format.")
-                elif choice == '2':
-                    sr = input(f"Enter new target sample rate (e.g., 16000) [current: {cfg.sample_rate}]: ").strip()
-                    if sr and sr.isdigit() and int(sr) > 0: cfg.sample_rate = int(sr)
-                    elif sr: ConsoleOutput.warning("Invalid sample rate.")
-                elif choice == '3':
-                    spd = input(f"Enter new speed factor (0.5-2.0) [current: {cfg.speed}]: ").strip()
-                    if spd:
-                        spd_f = float(spd)
-                        if 0.5 <= spd_f <= 2.0: cfg.speed = spd_f
-                        else: ConsoleOutput.warning("Speed factor out of range (0.5-2.0).")
-                elif choice == '4':
-                    pitch = input(f"Enter pitch shift in semitones (-12 to 12) [current: {cfg.pitch_shift}]: ").strip()
-                    if pitch:
-                        pitch_i = int(pitch)
-                        if -12 <= pitch_i <= 12: cfg.pitch_shift = pitch_i
-                        else: ConsoleOutput.warning("Pitch shift out of range (-12 to 12).")
-                elif choice == '5':
-                    cfg.volume_normalize = not cfg.volume_normalize
-                    ConsoleOutput.info(f"Volume normalization {'Enabled' if cfg.volume_normalize else 'Disabled'}.")
-                elif choice == '6':
-                     if not is_local: # Cloud Voice
-                          voice = input(f"Enter provider-specific voice (current: {cfg.cloud_voice}): ").strip()
-                          if voice: cfg.cloud_voice = voice
-                     else: # Local model precision
-                          if torch.cuda.is_available():
-                               cfg.use_half_precision = not cfg.use_half_precision
-                               ConsoleOutput.info(f"Half precision {'Enabled' if cfg.use_half_precision else 'Disabled'}.")
-                          else:
-                               ConsoleOutput.warning("Half precision requires CUDA.")
-                               cfg.use_half_precision = False
-                elif choice == '7' and is_local: # Speaker Embedding
-                     spk = input(f"Enter path/ID for speaker embedding (current: {cfg.speaker_embedding or 'Default'}, blank to clear): ").strip()
-                     cfg.speaker_embedding = spk if spk else None
-                     ConsoleOutput.info(f"Speaker embedding set to: {cfg.speaker_embedding or 'Default'}")
-                elif choice == '8' and is_local: # Chunk size
-                     cs = input(f"Enter text chunk size (current: {cfg.chunk_size}): ").strip()
-                     if cs and cs.isdigit() and 500 <= int(cs) <= 10000: cfg.chunk_size = int(cs)
-                     elif cs: ConsoleOutput.warning("Invalid chunk size (use 500-10000).")
-                else:
-                    ConsoleOutput.warning("Invalid selection.")
-
-            except ValueError:
-                ConsoleOutput.warning("Invalid input value type.")
-            except Exception as e:
-                 ConsoleOutput.error(f"Error updating setting: {e}")
-                 input("Press Enter...")
-
-
-    def _output_settings_menu(self):
-        """Sets the output directory and optional base filename."""
-        ConsoleOutput.section("Output Settings")
-        try:
-             if not self.state.output_dir.is_absolute():
-                  self.state.output_dir = BASE_DIR / self.state.output_dir
-             self.state.output_dir = self.state.output_dir.resolve()
-             self.state.output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-             ConsoleOutput.warning(f"Could not resolve output directory '{self.state.output_dir}', defaulting to 'output'. Error: {e}")
-             self.state.output_dir = (BASE_DIR / "output").resolve()
-             self.state.output_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"Current Output Directory: {self.state.output_dir}")
-        if self.state.output_filename:
-             print(f"Current Base Filename: {self.state.output_filename} (Timestamps/suffixes added automatically)")
-        else:
-             print("Current Base Filename: Default (derived from input filename)")
-
-        new_dir_str = input(f"Enter new output directory path (leave blank to keep current): ").strip()
-        if new_dir_str:
-            try:
-                new_dir_path = Path(os.path.expanduser(new_dir_str)).resolve()
-                new_dir_path.mkdir(parents=True, exist_ok=True) 
-                # Test writability
-                test_file = new_dir_path / f".llamanote_test_{int(time.time())}"
-                test_file.touch()
-                test_file.unlink()
-                self.state.output_dir = new_dir_path
-                ConsoleOutput.success(f"Output directory set to: {self.state.output_dir}")
-            except Exception as e:
-                ConsoleOutput.error(f"Invalid or unwritable directory path: {e}")
-                input("Press Enter to continue...")
-
-        num_inputs = len(self.state.input_files)
-        if num_inputs == 1:
-             current_name_prompt = f"(current: {self.state.output_filename})" if self.state.output_filename else "(leave blank for default)"
-             new_name = input(f"Enter base output filename (WITHOUT extension, {current_name_prompt}): ").strip()
-             if new_name:
-                 new_name = re.sub(r'[\\/*?:"<>|]', '', new_name) # Sanitize
-                 self.state.output_filename = new_name
-                 ConsoleOutput.success(f"Base output filename set to: {self.state.output_filename}")
-             elif new_name == "" and self.state.output_filename:
-                 ConsoleOutput.info("Keeping current base filename.")
-             elif new_name == "":
-                 ConsoleOutput.info("Using default output filename based on input.")
-                 self.state.output_filename = None # Explicitly set to default
-        elif num_inputs > 1:
-             ConsoleOutput.info("Base output filename is ignored during batch processing (uses input names).")
-             self.state.output_filename = None 
-
-        return MenuAction.CONTINUE
-
-
-    def _view_current_setup(self):
-        """Displays the current configuration state."""
-        ConsoleOutput.section("Current Processing Setup Summary")
-        
-        # Reload keys just in case they were changed outside
-        self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
-
-        # Input Files
-        print(f"Input File(s):")
-        if self.state.input_files:
-             max_files_to_show = 5
-             for i, f in enumerate(self.state.input_files):
-                 if i < max_files_to_show:
-                     print(f"  - {f.name}")
-                 elif i == max_files_to_show:
-                     print(f"  ... and {len(self.state.input_files) - max_files_to_show} more.")
-                     break
-        else:
-             print("  ⚠️ None selected. Please select input file(s).")
-
-        # Output Settings
-        print(f"\nOutput Directory: {self.state.output_dir.resolve()}")
-        # Get format from pipeline config (which needs AppState)
-        temp_pipeline_config = self.state.get_pipeline_config()
-        text_output_format = temp_pipeline_config.output_format or 'md'
-
-        if len(self.state.input_files) == 1 and self.state.output_filename:
-             example_suffix = f"_{self.state.processing_mode.value}"
-             example_ext = f".{text_output_format}"
-             print(f"Base Output Filename: {self.state.output_filename}")
-             print(f"  (Example text output: {self.state.output_filename}{example_suffix}_<timestamp>{example_ext})")
-        else:
-             print(f"Base Output Filename: Default (based on input filename)")
-
-        # Text Processing
-        print(f"\n--- Text Processing ---")
-        print(f"Mode: {self.state.processing_mode.value}")
-        print(f"Provider: {self.state.text_model_provider}")
-        print(f"Model: {self.state.text_model_specifier}")
-        
-        # Show local hardware settings if local
-        if self.state.text_model_provider == "local":
-            print(f"Local Hardware Config:")
-            print(f"  - Quantization: {self.state.quantization}")
-            print(f"  - Max GPU Mem: {self.state.max_gpu_memory} | Max CPU Mem: {self.state.max_cpu_memory}")
-        elif self.state.text_model_provider == "local_gguf":
-            print(f"Local Hardware Config (GGUF):")
-            print(f"  - GPU Layers: {self.state.gpu_layers}")
-
-        print(f"Hyperparameters:")
-        hp_dict = self.state.hyperparameters.to_dict()
-        print(f"  - temperature: {hp_dict.get('temperature', 'Default')}")
-        print(f"  - top_p: {hp_dict.get('top_p', 'Default')}")
-        print(f"  - max_new_tokens: {hp_dict.get('max_new_tokens') or 'Auto'}")
-        print(f"  (Use 'Model Settings -> Hyperparameters' menu to see/edit all)")
-
-        # Stages
-        print(f"\n--- Pipeline Stages ---")
-        text_stages_to_run = [s for s in PIPELINE_STAGES if s in self.state.stages_to_run]
-        print(f"Text Stages to Run: {', '.join(text_stages_to_run) if text_stages_to_run else 'None'}")
-        print(f"Generate Audio After Text: {'✅ Yes' if self.state.run_audio_generation else '❌ No'}")
-
-        # Audio Generation (if enabled)
-        if self.state.run_audio_generation:
-             print(f"\n--- Audio Generation ---")
-             print(f"Provider: {self.state.audio_model_provider}")
-             print(f"Model: {self.state.audio_model_specifier}")
-             cfg = self.state.audio_config
-             print(f"Output Format: {cfg.output_format}")
-             print(f"Sample Rate: {cfg.sample_rate} Hz")
-             if self.state.audio_model_provider != 'local':
-                  print(f"Cloud Voice: {cfg.cloud_voice}")
-             else:
-                  print(f"Half Precision: {'Enabled' if cfg.use_half_precision else 'Disabled'}")
-             print(f"  (Use 'Model Settings -> Configure Audio' menu to see/edit all)")
-
-        # Warnings
-        print("-" * 60)
-        has_warnings = False
-        if not self.state.input_files:
-             ConsoleOutput.warning("Setup incomplete: Input files are missing.")
-             has_warnings = True
-        if not text_stages_to_run and not self.state.run_audio_generation:
-             ConsoleOutput.warning("Setup incomplete: No processing or audio stages selected.")
-             has_warnings = True
-        if text_stages_selected:
-            if not self.state.text_model_specifier:
-                 ConsoleOutput.warning("Setup incomplete: No text model specified.")
-                 has_warnings = True
-            elif self.state.text_model_provider != 'local' and self.state.text_model_provider != 'local_gguf' and self.state.text_model_provider not in self.state.cloud_api_keys:
-                 ConsoleOutput.warning(f"API key for text provider '{self.state.text_model_provider}' is missing.")
-                 has_warnings = True
-        if self.state.run_audio_generation:
-            if not self.state.audio_model_specifier:
-                 ConsoleOutput.warning("Setup incomplete: No audio model specified.")
-                 has_warnings = True
-            elif self.state.audio_model_provider != 'local' and self.state.audio_model_provider not in self.state.cloud_api_keys:
-                 ConsoleOutput.warning(f"API key for audio provider '{self.state.audio_model_provider}' is missing.")
-                 has_warnings = True
-        
-        if not has_warnings:
-             ConsoleOutput.info("Setup appears complete.")
-
-        input("\nPress Enter to continue...")
-        return MenuAction.CONTINUE
-
-
-    def _confirm_and_run(self) -> MenuAction:
-        """Confirms the setup and returns RUN action if confirmed."""
-        ConsoleOutput.section("Confirm and Run Processing")
-        
-        # Validation Checks
-        text_stages_selected = any(s in self.state.stages_to_run for s in PIPELINE_STAGES)
-        runnable = True
-        warnings = []
-        errors = []
-
-        if not self.state.input_files:
-             errors.append("No input files selected.")
-             runnable = False
-        if not text_stages_selected and not self.state.run_audio_generation:
-             errors.append("No processing or audio stages selected.")
-             runnable = False
-        
-        # Text Backend Checks
-        if text_stages_selected:
-            if not self.state.text_model_specifier:
-                 errors.append("No text model specified.")
-                 runnable = False
-            elif self.state.text_model_provider != 'local' and self.state.text_model_provider != 'local_gguf' and self.state.text_model_provider not in self.state.cloud_api_keys:
-                 errors.append(f"API key for text provider '{self.state.text_model_provider}' is missing.")
-                 runnable = False
-
-        # Audio Backend Checks
-        if self.state.run_audio_generation:
-            if not self.state.audio_model_specifier:
-                 errors.append("No audio model specified.")
-                 runnable = False
-            elif self.state.audio_model_provider != 'local' and self.state.audio_model_provider not in self.state.cloud_api_keys:
-                 errors.append(f"API key for audio provider '{self.state.audio_model_provider}' is missing.")
-                 runnable = False
-            
-            # Check dependency on 'save' stage
-            if 'save' not in self.state.stages_to_run:
-                 if not all(f.suffix.lower() in ['.md', '.txt'] for f in self.state.input_files):
-                      warnings.append("Audio generation requested, but 'save' stage is not selected. Audio may fail if input files are not text.")
-
-        # Display current setup *before* asking to proceed
-        self._view_current_setup()
-
-        if not runnable:
-             ConsoleOutput.error("Cannot run due to errors:")
-             for err in errors:
-                 print(f"  - {err}")
-             input("\nPlease correct the setup. Press Enter to return to the main menu...")
-             return MenuAction.CONTINUE # Go back if validation fails
+        # Ensure essential token IDs are present, use tokenizer's if available
+        if 'pad_token_id' not in gen_config_dict and self.tokenizer.pad_token_id is not None:
+             gen_config_dict['pad_token_id'] = self.tokenizer.pad_token_id
+        # Handle cases where EOS might be a list
+        eos_token_id_to_use = self.tokenizer.eos_token_id
+        if isinstance(eos_token_id_to_use, list):
+            eos_token_id_to_use = eos_token_id_to_use[0] # Use the first one
+        if 'eos_token_id' not in gen_config_dict and eos_token_id_to_use is not None:
+             gen_config_dict['eos_token_id'] = eos_token_id_to_use
              
-        if warnings:
-            ConsoleOutput.warning("Potential issues detected:")
-            for warn in warnings:
-                print(f"  - {warn}")
-
-        confirm = input("\n➡️ Proceed with processing? (y/n): ").strip().lower()
-        if confirm == 'y':
-            return MenuAction.RUN # Signal to the main loop to execute
-        else:
-            ConsoleOutput.info("Processing cancelled.")
-            return MenuAction.CONTINUE
+        # Ensure pad_token_id and eos_token_id are not None before creating GenerationConfig
+        # Fallback if still None after checking tokenizer (should be rare after post_load_setup)
+        if gen_config_dict.get('pad_token_id') is None:
+            gen_config_dict['pad_token_id'] = 0 # Arbitrary fallback
+            self.logger.warning("pad_token_id is None, falling back to 0.")
+        if gen_config_dict.get('eos_token_id') is None:
+             # Need a valid EOS, trying pad token as last resort
+             gen_config_dict['eos_token_id'] = gen_config_dict['pad_token_id']
+             self.logger.warning("eos_token_id is None, falling back to pad_token_id.")
 
 
-    def _execute_pipeline(self):
-         """Executes the text and/or audio pipeline based on the current state."""
-         ConsoleOutput.header("🚀 Starting Processing Pipeline 🚀")
+        gen_config = GenerationConfig(**gen_config_dict)
 
-         if not self.state.input_files:
-             ConsoleOutput.error("Execution failed: No input files specified.")
-             return
+        # Generate
+        start_time = time.time()
+        output_tokens = 0 # Initialize
+        raw_output = "" # Initialize
+        full_output = "" # Initialize
 
-         text_backend: Optional[LLMBackend] = None
-         audio_backend: Optional[AudioBackend] = None
-         pipeline: Optional[ProcessingPipeline] = None
-         all_results: List[PipelineResult] = [] # Store text processing results
-         
-         # Reload keys just in case
-         self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    generation_config=gen_config
+                )
 
-         try:
-             # --- Get Pipeline Config ---
-             pipeline_config = self.state.get_pipeline_config()
+            generation_time = time.time() - start_time
 
-             # --- Text Processing Setup ---
-             text_stages_selected = any(s in self.state.stages_to_run for s in PIPELINE_STAGES)
-             if text_stages_selected:
-                 ConsoleOutput.info(f"Initializing Text Processing Backend ({pipeline_config.model_provider})...")
-                 start_init = time.time()
-                 try:
-                     local_kwargs = {}
-                     if pipeline_config.model_provider == "local":
-                         local_kwargs['quantization_config'] = pipeline_config.quantization_config
-                         local_kwargs['layer_split_config'] = pipeline_config.layer_split_config
-                         # We need the original model config from the registry for the filter/calculator
-                         model_entry = self.registry.get_model(pipeline_config.model_specifier)
-                         if not model_entry:
-                             # This should ideally not happen if selected via menu, but handle anyway
-                             raise ValueError(f"Model {pipeline_config.model_specifier} not found in registry for local processing.")
-                         # Convert ModelEntry to the old ModelConfig dataclass
-                         from config import ModelConfig # Ensure this is imported
-                         model_conf_for_local = ModelConfig(
-                             name=model_entry.name, model_id=model_entry.model_id,
-                             supports_thinking=model_entry.supports_thinking,
-                             thinking_tokens=model_entry.thinking_tokens or [],
-                             max_context=model_entry.max_context,
-                             optimal_chunk_size=model_entry.optimal_chunk_size,
-                             temperature=model_entry.temperature,
-                             top_p=model_entry.top_p,
-                             max_new_tokens=model_entry.max_new_tokens,
-                             quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
-                         )
-                         local_kwargs['model_config'] = model_conf_for_local
-                         
-                         text_backend = get_llm_backend(
-                             provider=pipeline_config.model_provider,
-                             model_specifier=pipeline_config.model_specifier,
-                             api_keys=self.state.cloud_api_keys,
-                             hyperparameters=pipeline_config.hyperparameters,
-                             **local_kwargs
-                         )
-                     elif pipeline_config.model_provider == "local_gguf":
-                         if not (LLAMACPP_AVAILABLE and LlamaCppConfig and LlamaCppBackend):
-                             raise ImportError("llama-cpp-python is not installed, cannot use GGUF model.")
-                         gguf_config = LlamaCppConfig(
-                             model_path=Path(pipeline_config.model_specifier),
-                             n_ctx=pipeline_config.hyperparameters.max_length or 2048,
-                             n_gpu_layers=pipeline_config.layer_split_config.gpu_layers if pipeline_config.layer_split_config else -1,
-                             n_batch=pipeline_config.hyperparameters.batch_size if hasattr(pipeline_config.hyperparameters, 'batch_size') else 512, # Example of mapping
-                             # Add other LlamaCppConfig settings if needed, potentially from AppState
-                         )
-                         text_backend = LlamaCppBackend(
-                             config=gguf_config,
-                             hyperparameters=pipeline_config.hyperparameters
-                         )
-                     else: # Cloud providers
-                          text_backend = get_llm_backend(
-                              provider=pipeline_config.model_provider,
-                              model_specifier=pipeline_config.model_specifier,
-                              api_keys=self.state.cloud_api_keys,
-                              hyperparameters=pipeline_config.hyperparameters
-                          )
+            # Decode output
+            full_output = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
-                     if text_backend is None:
-                          raise ValueError(f"Could not create text backend for provider {pipeline_config.model_provider}. Check API keys and model names.")
-
-                     ConsoleOutput.info(f"Loading/Initializing {text_backend.model_identifier}...")
-                     if not text_backend.load_model(trust_remote_code=True): # Pass trust_remote_code
-                         raise RuntimeError(f"Failed to load/initialize backend: {text_backend.model_identifier}")
-
-                     init_time = time.time() - start_init
-                     ConsoleOutput.success(f"Text backend initialized successfully in {init_time:.2f}s.")
-
-                 except Exception as e:
-                     ConsoleOutput.error(f"Failed to initialize text backend: {e}")
-                     logger.error("Text backend initialization failed", exc_info=True)
-                     input("Press Enter to return to menu...")
-                     return # Stop execution if backend fails
-
-             # --- Audio Generation Setup ---
-             if self.state.run_audio_generation:
-                 ConsoleOutput.info(f"Initializing Audio Generation Backend ({self.state.audio_model_provider})...")
-                 start_init_audio = time.time()
-                 try:
-                     audio_backend = get_audio_backend(
-                         provider=self.state.audio_model_provider,
-                         model_specifier=self.state.audio_model_specifier,
-                         api_keys=self.state.cloud_api_keys,
-                         config=self.state.audio_config 
-                     )
-
-                     if audio_backend is None:
-                         raise ValueError(f"Could not create audio backend for provider {self.state.audio_model_provider}.")
-
-                     ConsoleOutput.info(f"Loading/Initializing {audio_backend.model_identifier}...")
-                     if not audio_backend.load_model():
-                         raise RuntimeError(f"Failed to load/initialize audio backend.")
-
-                     init_time_audio = time.time() - start_init_audio
-                     ConsoleOutput.success(f"Audio backend initialized successfully in {init_time_audio:.2f}s.")
-
-                 except Exception as e:
-                     ConsoleOutput.error(f"Failed to initialize audio backend: {e}")
-                     logger.error("Audio backend initialization failed", exc_info=True)
-                     audio_backend = None # Ensure audio is skipped if init fails
-                     input("Press Enter to continue...")
-
-
-             # --- Run Text Processing ---
-             pipeline = ProcessingPipeline(pipeline_config)
-             if text_backend:
-                 pipeline.llm_backend = text_backend # Inject the backend
-             
-             pipeline.set_stages_to_run(self.state.stages_to_run) # Tell pipeline which stages to run
-
-             if text_stages_selected:
-                  if not text_backend:
-                      ConsoleOutput.error("Text processing stages skipped as backend is not available.")
-                  else:
-                      ConsoleOutput.header("📝 Starting Text Processing 📝")
-                      ConsoleOutput.info(f"Running stages: {', '.join(self.state.stages_to_run)}")
-                      
-                      if len(self.state.input_files) == 1:
-                          output_base = self.state.output_filename or self.state.input_files[0].stem
-                          output_p_base = self.state.output_dir / output_base # Base path without suffix
-                          result = pipeline.process_file(self.state.input_files[0], output_path=output_p_base)
-                          all_results.append(result)
-                      else:
-                          # output_filename is ignored in batch mode
-                          batch_results = pipeline.process_batch(self.state.input_files, output_dir=self.state.output_dir)
-                          all_results.extend(batch_results)
-             else:
-                  ConsoleOutput.info("No text processing stages selected. Skipping.")
-                  # If only audio is selected, we need to populate all_results with input files
-                  # if they are text, so the audio stage can find them.
-                  if self.state.run_audio_generation:
-                       for f in self.state.input_files:
-                            if f.suffix.lower() in ['.md', '.txt']:
-                                 # Create a dummy result object
-                                 all_results.append(PipelineResult(
-                                      success=True,
-                                      input_file=f,
-                                      output_file=f, # Use the input file as the "output" text file
-                                      processing_time=0,
-                                      stages_completed=[],
-                                      error_message=None,
-                                      statistics=None
-                                 ))
-
-
-             # --- Run Audio Generation ---
-             if self.state.run_audio_generation:
-                 if not audio_backend:
-                     ConsoleOutput.error("Audio generation selected, but backend failed to initialize. Skipping audio.")
+            # Extract just the generated portion
+            # Find the prompt in the output (it might not be an exact prefix)
+            prompt_in_output_idx = full_output.find(prompt)
+            if prompt_in_output_idx == 0: # Exact prefix match
+                 raw_output = full_output[len(prompt):].strip()
+            else:
+                 # Fallback: decode only the new tokens
+                 # Ensure output tensor has more tokens than input
+                 if outputs.shape[1] > input_tokens:
+                      output_tokens_tensor = outputs[0][input_tokens:]
+                      raw_output = self.tokenizer.decode(output_tokens_tensor, skip_special_tokens=True).strip()
                  else:
-                     ConsoleOutput.header("🔊 Starting Audio Generation 🔊")
-                     
-                     text_files_to_convert = [res.output_file for res in all_results if res.success and res.output_file and res.output_file.exists()]
+                      # Handle case where no new tokens were generated
+                      raw_output = ""
+                      self.logger.warning("Generation resulted in no new tokens.")
 
-                     if not text_files_to_convert:
-                         ConsoleOutput.warning("No valid text output files found to generate audio from.")
-                     else:
-                         ConsoleOutput.info(f"Found {len(text_files_to_convert)} file(s) to convert to audio...")
-                         successful_audio_count = 0
-                         with LoggingProgress(logger, "Generating audio files", len(text_files_to_convert)) as progress:
-                             for i, text_file in enumerate(text_files_to_convert):
-                                 ConsoleOutput.subsection(f"Audio for: {text_file.name} ({i+1}/{len(text_files_to_convert)})")
-                                 try:
-                                     with open(text_file, 'r', encoding='utf-8') as f:
-                                         text_content = f.read()
-                                         
-                                     # Clean text for TTS: remove markdown metadata
-                                     text_content = re.sub(r'^---.*?---', '', text_content, flags=re.DOTALL | re.MULTILINE).strip()
-                                     
-                                     # Clean for podcast mode: remove speaker tags
-                                     if self.state.processing_mode == ProcessingMode.PODCAST:
-                                          text_content = re.sub(r'^\*\*\[Speaker.*?\]:\*\*\n*', '', text_content, flags=re.MULTILINE)
-                                     
-                                     # Clean for technical mode: remove note/warning emojis/prefixes
-                                     if self.state.processing_mode == ProcessingMode.TECHNICAL:
-                                         text_content = re.sub(r'📝 \*\*Note:\*\* ', '', text_content)
-                                         text_content = re.sub(r'⚠️ \*\*Warning:\*\* ', '', text_content)
-                                         text_content = re.sub(r'💡 \*\*Tip:\*\* ', '', text_content)
-                                         text_content = re.sub(r'❗ \*\*Important:\*\* ', '', text_content)
+            output_tokens = outputs.shape[1] - input_tokens if outputs.shape[1] > input_tokens else 0
 
-                                     # Remove markdown formatting like *, **, `
-                                     text_content = re.sub(r'(\*\*|\*|`|#+\s)', '', text_content)
 
-                                     if not text_content.strip():
-                                          ConsoleOutput.warning("Text file is empty after cleaning, skipping audio generation.")
-                                          progress.update(1)
-                                          continue
+        except Exception as gen_err:
+             generation_time = time.time() - start_time
+             self.logger.error(f"Generation failed after {generation_time:.2f}s: {gen_err}", exc_info=True)
+             raw_output = f"[Generation Error: {gen_err}]"
+             # Try to estimate input tokens if possible
+             try: input_tokens = self.tokenizer(prompt, return_tensors="pt")['input_ids'].shape[1]
+             except: input_tokens = 0
+             output_tokens = 0
 
-                                     # Determine audio output path
-                                     audio_output_path = text_file.with_suffix(f".{self.state.audio_config.output_format}")
 
-                                     audio_result = audio_backend.generate_audio(
-                                         text=text_content,
-                                         output_path=audio_output_path,
-                                         chunk_text=(self.state.audio_model_provider == 'local') # Only chunk for local models
-                                     )
+        # Filter if requested
+        if remove_thinking and self.model_config.supports_thinking:
+            filter_result = self.response_filter.filter(raw_output) # Use the instance filter
+            filtered_output = filter_result.filtered_text
+            self.logger.debug(f"Filtered {filter_result.removal_ratio:.1%} of output")
+        else:
+            filtered_output = raw_output
 
-                                     if audio_result:
-                                         ConsoleOutput.success(f"Audio saved: {audio_result.audio_path.name} ({audio_result.duration_formatted})")
-                                         successful_audio_count += 1
-                                     else:
-                                         ConsoleOutput.error(f"Failed to generate audio for {text_file.name}")
+        # Get memory usage
+        memory_used = 0
+        if torch.cuda.is_available():
+            try:
+                # Use max_memory_allocated for peak usage if available
+                memory_used = torch.cuda.max_memory_allocated() / (1024 * 1024)  # Peak MB
+                torch.cuda.reset_peak_memory_stats() # Reset for next call
+            except Exception:
+                try:
+                    memory_used = torch.cuda.memory_allocated() / (1024 * 1024) # Current MB as fallback
+                except Exception:
+                    pass # Ignore if fails
 
-                                 except FileNotFoundError:
-                                     ConsoleOutput.error(f"Text file not found: {text_file}")
-                                 except Exception as audio_err:
-                                      ConsoleOutput.error(f"Error during audio generation for {text_file.name}: {audio_err}")
-                                      logger.error(f"Audio generation error for {text_file.name}", exc_info=True)
-                                 finally:
-                                     progress.update(1)
+        if generation_time > 0 and output_tokens > 0:
+            self.logger.info(f"Generated {output_tokens} tokens in {generation_time:.2f}s "
+                        f"({output_tokens/generation_time:.1f} tokens/s)")
+        elif output_tokens > 0:
+            self.logger.info(f"Generated {output_tokens} tokens (generation time < 0.01s)")
+        else:
+             self.logger.warning("Generation produced 0 output tokens.")
 
-                         ConsoleOutput.info(f"Audio generation finished. Successfully generated {successful_audio_count} audio file(s).")
-             
-             # --- Final Summary ---
-             ConsoleOutput.header("✅ Processing Run Finished ✅")
-             success_count = sum(1 for r in all_results if r.success)
-             fail_count = len(all_results) - success_count
-             if text_stages_selected:
-                 print(f"Text Processing: {success_count} succeeded, {fail_count} failed.")
-             if self.state.run_audio_generation:
-                 print(f"Audio Generation: Check logs above for status.") # Already printed success count
-             
-             if pipeline and text_stages_selected:
-                 report_path = pipeline.file_handler.save_processing_report()
-                 print(f"Processing report saved to: {report_path}")
+        return GenerationResult(
+            raw_output=raw_output,
+            filtered_output=filtered_output,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            generation_time=generation_time,
+            memory_used=memory_used,
+            device_map=self.device_map
+        )
 
-         except KeyboardInterrupt:
-            ConsoleOutput.warning("\nProcessing interrupted by user.")
-            logger.warning("Pipeline execution interrupted by user.")
-         except Exception as e:
-             ConsoleOutput.error(f"🚨 Pipeline execution encountered a critical error: {e}")
-             logger.critical("Pipeline execution failed", exc_info=True)
-         finally:
-             # Cleanup backends and pipeline resources
-             ConsoleOutput.info("Cleaning up resources...")
-             if text_backend:
-                 try: text_backend.unload_model()
-                 except Exception as unload_err: logger.warning(f"Error unloading text backend: {unload_err}")
-             if audio_backend:
-                 try: audio_backend.unload_model()
-                 except Exception as unload_err: logger.warning(f"Error unloading audio backend: {unload_err}")
-             # Ensure file handler report is saved even if pipeline object wasn't fully used
-             if self.state.input_files and not (pipeline and 'save' in self.state.stages_to_run):
-                 # Manually save a partial report if needed, or just let pipeline's cleanup handle it
-                 if pipeline:
-                     try: pipeline.cleanup()
-                     except Exception as cleanup_err: logger.warning(f"Error during final pipeline cleanup: {cleanup_err}")
+    def _get_model_device(self) -> torch.device:
+        """Get the device of the first model parameter or the assigned device."""
+        if self.model is None:
+            # Fallback to CPU if model isn't loaded
+            return torch.device("cpu")
+
+        try:
+            # This is the most reliable way for models with device_map
+            return next(self.model.parameters()).device
+        except StopIteration:
+            # Model might have no parameters, or hasn't been moved yet
+            pass
+        except Exception as e:
+            self.logger.warning(f"Could not determine model device from parameters: {e}")
+
+        # Fallback to the device determined during load_model
+        if self.device:
+            return torch.device(self.device)
+
+        # Ultimate fallback
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+    @log_execution_time()
+    def process_with_chat_template(self,
+                                  system_prompt: str,
+                                  user_message: str,
+                                  hyperparams: Optional[HyperparameterConfig] = None,
+                                  **kwargs) -> GenerationResult:
+        """
+        Process text using chat template
+
+        Args:
+            system_prompt: System instruction
+            user_message: User input
+            hyperparams: Override hyperparameters
+            **kwargs: Additional arguments (like remove_thinking)
+
+        Returns:
+            GenerationResult
+        """
+        if self.model is None or self.tokenizer is None:
+            self.logger.error("Attempted to generate (chat) but model or tokenizer is not loaded.")
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        # Format as chat
+        conversation = []
+        if system_prompt: # Only add system prompt if provided
+             conversation.append({"role": "system", "content": system_prompt})
+        conversation.append({"role": "user", "content": user_message})
+
+        # Try to use chat template
+        prompt = ""
+        try:
+            # Check for both attribute and non-empty template string
+            if hasattr(self.tokenizer, 'apply_chat_template') and getattr(self.tokenizer, 'chat_template', None):
+                prompt = self.tokenizer.apply_chat_template(
+                    conversation,
+                    tokenize=False,
+                    add_generation_prompt=True # Important for inference
+                )
+                self.logger.debug("Applied tokenizer's chat template.")
+            else:
+                 # Fallback formatting if no template available
+                 self.logger.warning(f"Model {self.model_id} tokenizer has no chat template or it's empty. Using basic formatting.")
+                 prompt = f"SYSTEM: {system_prompt}\n\nUSER: {user_message}\n\nASSISTANT:"
+                 # For some models, just user/assistant might be better:
+                 # prompt = f"USER: {user_message}\nASSISTANT:"
+
+        except Exception as e:
+            self.logger.warning(f"Chat template application failed: {e}. Using fallback formatting.", exc_info=True)
+            prompt = f"SYSTEM: {system_prompt}\n\nUSER: {user_message}\n\nASSISTANT:"
+
+        # Pass remove_thinking flag from kwargs or default to True
+        remove_thinking = kwargs.get('remove_thinking', True)
+
+        return self.generate(prompt, hyperparams=hyperparams, remove_thinking=remove_thinking)
+
+    def unload_model(self):
+        """Unload model and free memory"""
+        self.logger.info(f"Unloading model: {self.model_id}")
+
+        # Explicitly delete model and tokenizer references
+        if hasattr(self, 'model') and self.model is not None:
+            del self.model
+            self.model = None
+
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+
+        if hasattr(self, 'accelerator') and self.accelerator is not None:
+             del self.accelerator
+             self.accelerator = None
+
+        self.device_map = None
+
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                self.logger.debug("CUDA cache cleared.")
+            except Exception as e:
+                self.logger.warning(f"Could not clear CUDA cache: {e}")
+
+        # Run garbage collection forcefully
+        collected = gc.collect()
+        self.logger.debug(f"Garbage collector ran, collected {collected} objects.")
+
+        self.logger.info("Model unloaded and memory freed")
+
+    def __del__(self):
+        """Ensure cleanup on object deletion"""
+        try:
+            self.unload_model()
+        except Exception as e:
+            # Log error during cleanup, but don't raise exception
+            print(f"Error during LocalTransformerBackend cleanup: {e}", file=sys.stderr)
+            # Use logger if available, otherwise print
+            try: self.logger.error(f"Error during __del__: {e}", exc_info=False)
+            except: pass
+
+
+# --- OpenAI Cloud Backend ---
+class OpenAIBackend(LLMBackend):
+    """Implementation for OpenAI API."""
+
+    def __init__(self, api_key: str, model_specifier: str = "gpt-4o", hyperparameters: Optional[HyperparameterConfig] = None):
+        super().__init__(model_specifier, hyperparameters)
+        if not OPENAI_AVAILABLE:
+            raise ImportError("OpenAI library not installed. Run 'pip install openai'")
+
+        self.api_key = api_key
+        self.client = None # Initialize in load_model
+
+    @property
+    def provider_identifier(self) -> str:
+        return "openai"
+
+    def load_model(self, **kwargs) -> bool:
+        """Initialize the OpenAI client and test the API key."""
+        try:
+            self.client = openai.OpenAI(api_key=self.api_key)
+            self.client.models.list() # Test API key by listing models
+            self.logger.info("OpenAI API client initialized and key verified.")
+            return True
+        except openai.AuthenticationError:
+             self.logger.error("OpenAI API key is invalid.")
+             ConsoleOutput.error("OpenAI API key is invalid. Please check your configuration.")
+             return False
+        except Exception as e:
+            self.logger.error(f"Failed to initialize OpenAI client or verify key: {e}", exc_info=True)
+            ConsoleOutput.error(f"OpenAI connection failed: {e}. Check key and network access.")
+            return False
+
+    def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
+        """Maps HyperparameterConfig to OpenAI's API parameters."""
+        params = {}
+        if hp.max_new_tokens is not None:
+            params["max_tokens"] = hp.max_new_tokens
+        if hp.temperature is not None:
+             # Ensure temperature is within valid range (0 to 2)
+             params["temperature"] = max(0.0, min(2.0, hp.temperature))
+        if hp.top_p is not None:
+             # OpenAI API often expects top_p < 1.0 or None, handle 1.0 case
+             params["top_p"] = max(0.001, min(0.999, hp.top_p)) if hp.top_p < 1.0 else None
+        # Handle do_sample implicitly: OpenAI samples if temperature > 0
+        if not hp.do_sample:
+            params["temperature"] = 0.0 # Force deterministic output
+
+        # Map repetition_penalty to presence_penalty (different concepts, but closest match)
+        if hp.repetition_penalty is not None and hp.repetition_penalty != 1.0:
+             # Scale appropriately: 1.0 (HF) -> 0.0 (OpenAI), 1.2 (HF) -> 0.2 (OpenAI)
+             # Clamp between -2.0 and 2.0 as per OpenAI docs
+             presence_penalty = max(-2.0, min(2.0, hp.repetition_penalty - 1.0))
+             # Avoid setting penalty to 0.0 if repetition_penalty was 1.0
+             if abs(presence_penalty) > 1e-6 :
+                  params["presence_penalty"] = presence_penalty
+                  self.logger.debug(f"Mapping repetition_penalty {hp.repetition_penalty} to presence_penalty {params['presence_penalty']}")
+
+        # Map no_repeat_ngram_size to frequency_penalty (also different, heuristic mapping)
+        if hp.no_repeat_ngram_size is not None and hp.no_repeat_ngram_size > 0:
+            # Higher ngram size implies stronger need to penalize frequency
+            # Clamp between -2.0 and 2.0
+            frequency_penalty = max(-2.0, min(2.0, 0.1 * hp.no_repeat_ngram_size)) # Small penalty
+            if abs(frequency_penalty) > 1e-6:
+                params["frequency_penalty"] = frequency_penalty
+                self.logger.debug(f"Mapping no_repeat_ngram_size {hp.no_repeat_ngram_size} to frequency_penalty {params['frequency_penalty']}")
+
+        # Note: OpenAI API doesn't support top_k, length_penalty, etc. directly.
+
+        return params
+
+    @log_execution_time()
+    def generate(self, prompt: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using OpenAI API (ChatCompletion with single user prompt)."""
+        if self.client is None:
+            raise RuntimeError("OpenAI client not initialized. Call load_model() first.")
+
+        hp = hyperparams or self.hyperparams
+        api_params = self._map_hyperparams(hp)
+
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+
+        start_time = time.time()
+        raw_output = ""
+        input_tokens = 0
+        output_tokens = 0
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_specifier,
+                messages=messages,
+                **api_params
+            )
+            generation_time = time.time() - start_time
+
+            raw_output = response.choices[0].message.content or ""
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+            memory_used = 0 # N/A
+
+            if generation_time > 0 and output_tokens > 0:
+                 tokens_per_sec = output_tokens / generation_time
+                 self.logger.info(f"OpenAI generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
+            elif output_tokens > 0:
+                 self.logger.info(f"OpenAI generated {output_tokens} tokens")
+            else:
+                 self.logger.warning("OpenAI generated 0 tokens.")
+
+
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self.logger.error(f"OpenAI API call failed after {generation_time:.2f}s: {e}", exc_info=True)
+            raw_output = f"[OpenAI Error: {e}]"
+            # Try to estimate input tokens
+            try: input_tokens = len(prompt.split()) # Very rough estimate
+            except: input_tokens = 0
+            output_tokens = 0
+
+
+        # Cloud models generally don't output <think> tags
+        filtered_output = raw_output
+
+        return GenerationResult(
+            raw_output=raw_output,
+            filtered_output=filtered_output,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            generation_time=generation_time,
+            memory_used=0, # N/A
+            device_map={"provider": "openai"}
+        )
+
+    @log_execution_time()
+    def process_with_chat_template(self, system_prompt: str, user_message: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using OpenAI API with system and user prompts."""
+        if self.client is None:
+            raise RuntimeError("OpenAI client not initialized. Call load_model() first.")
+
+        hp = hyperparams or self.hyperparams
+        api_params = self._map_hyperparams(hp)
+
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+
+        start_time = time.time()
+        raw_output = ""
+        input_tokens = 0
+        output_tokens = 0
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_specifier,
+                messages=messages,
+                **api_params
+            )
+            generation_time = time.time() - start_time
+
+            raw_output = response.choices[0].message.content or ""
+            input_tokens = response.usage.prompt_tokens if response.usage else 0
+            output_tokens = response.usage.completion_tokens if response.usage else 0
+            memory_used = 0 # N/A
+            filtered_output = raw_output
+
+            if generation_time > 0 and output_tokens > 0:
+                 tokens_per_sec = output_tokens / generation_time
+                 self.logger.info(f"OpenAI (chat) generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
+            elif output_tokens > 0:
+                 self.logger.info(f"OpenAI (chat) generated {output_tokens} tokens")
+            else:
+                 self.logger.warning("OpenAI (chat) generated 0 tokens.")
+
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self.logger.error(f"OpenAI API chat call failed after {generation_time:.2f}s: {e}", exc_info=True)
+            raw_output = f"[OpenAI Error: {e}]"
+            # Estimate tokens roughly
+            try: input_tokens = len(system_prompt.split()) + len(user_message.split())
+            except: input_tokens = 0
+            output_tokens = 0
+
+
+        return GenerationResult(
+            raw_output=raw_output,
+            filtered_output=filtered_output,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            generation_time=generation_time,
+            memory_used=0, # N/A
+            device_map={"provider": "openai"}
+        )
+
+    def unload_model(self):
+        # No explicit unloading needed, but clear client reference
+        if hasattr(self, 'client') and self.client is not None:
+             del self.client
+             self.client = None
+             self.logger.debug("OpenAI client reference cleared.")
+        pass
+
+# --- Google Gemini Cloud Backend ---
+class GoogleAIBackend(LLMBackend):
+    """Implementation for Google AI (Gemini) API."""
+
+    def __init__(self, api_key: str, model_specifier: str, hyperparameters: Optional[HyperparameterConfig] = None):
+        super().__init__(model_specifier, hyperparameters)
+        if not GOOGLE_AI_AVAILABLE:
+            raise ImportError("Google Generative AI library not installed. Run 'pip install google-generativeai'")
+
+        self.api_key = api_key
+        self.model = None # Will be initialized in load_model
+        # Store system prompt separately as it's part of model init for Google
+        self._system_prompt: Optional[str] = None
+
+    @property
+    def provider_identifier(self) -> str:
+        return "google"
+
+    def load_model(self, **kwargs) -> bool:
+        """Initialize the Google AI client."""
+        try:
+            genai.configure(api_key=self.api_key)
+            # Initialize the base model reference here
+            self.model = genai.GenerativeModel(self.model_specifier)
+            # Test the model/key with a simple, cheap call (count tokens)
+            self.model.count_tokens("test connection")
+            self.logger.info(f"Initialized GoogleAIBackend for model: {self.model_specifier} and key verified.")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Google AI client or verify key: {e}", exc_info=True)
+            # Check for common API key error messages
+            err_str = str(e).lower()
+            if "api_key_invalid" in err_str or "api key not valid" in err_str or "permission denied" in err_str:
+                 ConsoleOutput.error("The provided Google API key is invalid or not enabled for the Generative Language API.")
+            else:
+                 ConsoleOutput.error(f"Google API connection failed: {e}")
+            return False
+
+    def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
+        """Maps HyperparameterConfig to Google's GenerationConfig."""
+        gen_config_params = {}
+
+        # Ensure temperature is set, default to 0.0 for deterministic if sample is False
+        if not hp.do_sample:
+            gen_config_params["temperature"] = 0.0
+        elif hp.temperature is not None:
+            # Google API temperature range is typically [0.0, 1.0] (sometimes up to 2.0, check docs)
+            gen_config_params["temperature"] = max(0.0, min(1.0, hp.temperature))
+
+        if hp.max_new_tokens is not None:
+            gen_config_params["max_output_tokens"] = hp.max_new_tokens
+
+        if hp.top_p is not None:
+             # Google API accepts top_p=1.0, range [0.0, 1.0]
+             gen_config_params["top_p"] = max(0.0, min(1.0, hp.top_p))
+
+        if hp.top_k is not None and hp.top_k > 0:
+             gen_config_params["top_k"] = hp.top_k
+
+        # Map stop sequences if provided
+        # if hp.stop_sequences: # Assuming stop_sequences is added to HyperparameterConfig
+        #    gen_config_params["stop_sequences"] = hp.stop_sequences
+
+        # Note: Google API doesn't support repetition_penalty, length_penalty, etc.
+        if hasattr(hp, 'repetition_penalty') and hp.repetition_penalty != 1.0:
+            self.logger.warning("repetition_penalty is not supported by Google Gemini API.")
+
+        return gen_config_params
+
+    @log_execution_time()
+    def generate(self, prompt: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using Google AI (treating raw prompt as user message)."""
+        if self.model is None:
+            raise RuntimeError("Google AI Model not loaded. Call load_model() first.")
+
+        hp = hyperparams or self.hyperparams
+        generation_config_dict = self._map_hyperparams(hp)
+        generation_config = genai.types.GenerationConfig(**generation_config_dict)
+
+        # Use the model instance possibly configured with a system prompt
+        model_to_use = self.model
+        # Note: system_instruction is part of the model object, not generation config
+
+        start_time = time.time()
+        raw_output = ""
+        input_tokens = 0
+        output_tokens = 0
+        try:
+            # Use generate_content for flexibility (handles multimodal later if needed)
+            response = model_to_use.generate_content(
+                prompt,
+                generation_config=generation_config
+            )
+            generation_time = time.time() - start_time
+
+            # Handle potential safety blocks or empty responses
+            if not response.parts:
+                 # Check for safety ratings if available
+                 if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                      reason = response.prompt_feedback.block_reason
+                      raw_output = f"[Blocked by Google Safety Settings - Prompt: {reason}]"
+                 elif hasattr(response, 'candidates') and response.candidates and response.candidates[0].finish_reason != 'STOP':
+                      reason = response.candidates[0].finish_reason
+                      ratings = response.candidates[0].safety_ratings
+                      raw_output = f"[Blocked by Google Safety Settings - Response: {reason}, Ratings: {ratings}]"
                  else:
-                     # If pipeline never even started, just log
-                     logger.info("Pipeline did not initialize, no report to save.")
-             
-             ConsoleOutput.info("Cleanup complete. Returning to main menu.")
-             time.sleep(2) # Pause to let user see final messages
+                      raw_output = "[Blocked or Empty Response from Google API]"
+                 self.logger.warning(f"Google AI response blocked or empty. Prompt: {prompt[:100]}...")
+                 output_tokens = 0
+            else:
+                raw_output = response.text
+                # Count output tokens (API doesn't return usage counts directly in generate_content response)
+                try: output_tokens = model_to_use.count_tokens(raw_output).total_tokens
+                except: output_tokens = len(raw_output.split()) # Fallback estimate
+
+            # Count input tokens
+            try: input_tokens = model_to_use.count_tokens(prompt).total_tokens
+            except: input_tokens = len(prompt.split()) # Fallback estimate
+
+            memory_used = 0 # N/A
+
+            if generation_time > 0 and output_tokens > 0:
+                 tokens_per_sec = output_tokens / generation_time
+                 self.logger.info(f"Google AI generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
+            elif output_tokens > 0:
+                 self.logger.info(f"Google AI generated {output_tokens} tokens")
+            # Log block reason if available
+            elif hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                 self.logger.warning(f"Google AI Prompt Blocked: {response.prompt_feedback.block_reason}")
+            elif hasattr(response, 'candidates') and response.candidates and response.candidates[0].finish_reason != 'STOP':
+                 self.logger.warning(f"Google AI Response Finish Reason: {response.candidates[0].finish_reason}")
 
 
-# --- Helper Functions (Quantization, Layer Split) ---
-# (Duplicated from llamanote.py for use in menu system)
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self.logger.error(f"Google AI API call failed after {generation_time:.2f}s: {e}", exc_info=True)
+            raw_output = f"[Google API Error: {e}]"
+            try: input_tokens = len(prompt.split())
+            except: input_tokens = 0
+            output_tokens = 0
 
-def create_quantization_config(args: argparse.Namespace) -> QuantizationConfig:
-    """Create quantization configuration from arguments (for local backend)."""
-    dtype_map = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32
-    }
-    compute_dtype_str = getattr(args, 'compute_dtype', 'bfloat16')
-    compute_dtype = dtype_map.get(compute_dtype_str, torch.bfloat16)
-    quant_method = getattr(args, 'quantization', DEFAULT_QUANTIZATION)
-    
-    return QuantizationConfig(
-        method=quant_method,
-        compute_dtype=compute_dtype,
-        use_double_quant=True if quant_method == "4bit" else False,
-        quant_type="nf4",
-        bnb_4bit_use_double_quant=True if quant_method == "4bit" else False
-    )
 
-def create_layer_split_config(args: argparse.Namespace) -> LayerSplitConfig:
-    """Create layer split configuration from arguments (for local backend)."""
-    max_gpu_mem_str = getattr(args, 'max_gpu_memory', "10GB")
-    max_cpu_mem_str = getattr(args, 'max_cpu_memory', "30GB")
-    gpu_layers_count = getattr(args, 'gpu_layers', DEFAULT_GPU_LAYERS)
-    no_split = getattr(args, 'no_layer_split', not ENABLE_LAYER_SPLITTING)
+        filtered_output = raw_output # Assume no <think> tags
 
-    max_gpu_memory = {}
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        for i in range(num_gpus): 
-            max_gpu_memory[i] = max_gpu_mem_str
-    
-    return LayerSplitConfig(
-        enabled=not no_split and gpu_layers_count != 0,
-        gpu_layers=gpu_layers_count,
-        max_gpu_memory=max_gpu_memory,
-        max_cpu_memory=max_cpu_mem_str,
-        offload_folder=OFFLOAD_DIR
-    )
+        return GenerationResult(
+            raw_output=raw_output,
+            filtered_output=filtered_output,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            generation_time=generation_time,
+            memory_used=0, # N/A
+            device_map={"provider": "google"}
+        )
+
+    @log_execution_time()
+    def process_with_chat_template(self, system_prompt: str, user_message: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using Google AI with system prompt."""
+        if self.model is None:
+            raise RuntimeError("Google AI Model not loaded. Call load_model() first.")
+
+        # Re-initialize the model if the system prompt changes or wasn't set
+        # Google's API ties system_instruction to the model object instance
+        current_system_instruction = getattr(self.model, 'system_instruction', None)
+        # Handle the case where system_instruction might be a Part object
+        current_system_text = current_system_instruction.text if hasattr(current_system_instruction, 'text') else current_system_instruction
+
+        if current_system_text != system_prompt:
+            self.logger.info(f"Configuring Google AI model with new system prompt: {system_prompt[:50]}...")
+            self._system_prompt = system_prompt
+            try:
+                 # Create a new model instance with the system instruction
+                 self.model = genai.GenerativeModel(
+                     self.model_specifier,
+                     system_instruction=self._system_prompt
+                 )
+                 # Verify it works
+                 self.model.count_tokens("test prompt")
+            except Exception as e:
+                 self.logger.error(f"Failed to set system prompt for Google AI: {e}. Will prepend to user message.", exc_info=True)
+                 # Fallback: create model without system prompt and prepend
+                 self.model = genai.GenerativeModel(self.model_specifier)
+                 user_message = f"System Instruction: {system_prompt}\n\nUser Request: {user_message}"
+                 self._system_prompt = None # Clear internal state if prepending
+
+
+        # Use the generate method, which will now use the correctly configured self.model
+        return self.generate(
+            prompt=user_message,
+            hyperparams=hyperparams,
+            **kwargs
+        )
+
+    def unload_model(self):
+        # No explicit unloading needed, but clear model reference
+        if hasattr(self, 'model') and self.model is not None:
+             del self.model
+             self.model = None
+             self.logger.debug("Google AI model reference cleared.")
+        pass
+
+# --- Anthropic (Claude) Backend ---
+class AnthropicBackend(LLMBackend):
+    """Implementation for Anthropic (Claude) API."""
+
+    def __init__(self, api_key: str, model_specifier: str, hyperparameters: Optional[HyperparameterConfig] = None):
+        super().__init__(model_specifier, hyperparameters)
+        if not ANTHROPIC_AVAILABLE:
+            raise ImportError("Anthropic library not installed. Run 'pip install anthropic'")
+
+        self.api_key = api_key
+        self.client = None # Initialize in load_model
+
+    @property
+    def provider_identifier(self) -> str:
+        return "anthropic"
+
+    def load_model(self, **kwargs) -> bool:
+        """Initialize the Anthropic client and test the API key."""
+        try:
+            # Explicitly create an httpx client if needed (e.g., for proxies, timeouts)
+            # http_client = httpx.Client(proxies=None, timeout=60.0) # Example: no proxy, 60s timeout
+            self.client = anthropic.Anthropic(api_key=self.api_key) # Pass client if created: http_client=http_client
+            # Test API key by counting tokens (simple and cheap)
+            self.client.count_tokens("test connection")
+            self.logger.info(f"Anthropic API client initialized for model {self.model_specifier} and key verified.")
+            return True
+        except anthropic.AuthenticationError:
+            self.logger.error("Anthropic API key is invalid.")
+            ConsoleOutput.error("Anthropic API key is invalid. Please check your configuration.")
+            return False
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Anthropic client or verify key: {e}", exc_info=True)
+            ConsoleOutput.error(f"Anthropic connection failed: {e}. Check key and network access.")
+            return False
+
+    def _map_hyperparams(self, hp: HyperparameterConfig) -> Dict[str, Any]:
+        """Maps HyperparameterConfig to Anthropic's API parameters."""
+        params = {}
+
+        # Anthropic requires max_tokens
+        params["max_tokens"] = hp.max_new_tokens or 4096 # Use a reasonable default if None
+
+        if hp.temperature is not None:
+             # Anthropic range [0.0, 1.0]
+             params["temperature"] = max(0.0, min(1.0, hp.temperature))
+        # Handle do_sample implicitly: Anthropic samples if temperature > 0
+        if not hp.do_sample:
+             params["temperature"] = 0.0 # Force deterministic
+
+        if hp.top_p is not None:
+             # Anthropic range (0.0, 1.0] - exclude 0? Check docs. Assuming similar to OpenAI.
+             params["top_p"] = max(0.001, min(1.0, hp.top_p))
+        if hp.top_k is not None and hp.top_k > 0:
+             params["top_k"] = hp.top_k
+
+        # Map stop sequences if provided
+        # if hp.stop_sequences:
+        #    params["stop_sequences"] = hp.stop_sequences
+
+        # Note: Anthropic doesn't support repetition_penalty, length_penalty, etc.
+        if hasattr(hp, 'repetition_penalty') and hp.repetition_penalty != 1.0:
+            self.logger.warning("repetition_penalty is not supported by Anthropic API.")
+
+        return params
+
+    @log_execution_time()
+    def generate(self, prompt: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using Anthropic (treating raw prompt as user message)."""
+        if self.client is None:
+            raise RuntimeError("Anthropic client not initialized. Call load_model() first.")
+
+        # Use process_with_chat_template as the Messages API is preferred
+        # Provide a default system prompt if none is implicitly set
+        default_system = "You are a helpful assistant."
+        return self.process_with_chat_template(
+            system_prompt=default_system, # Use a basic default
+            user_message=prompt,
+            hyperparams=hyperparams,
+            **kwargs
+        )
+
+    @log_execution_time()
+    def process_with_chat_template(self, system_prompt: str, user_message: str, hyperparams: Optional[HyperparameterConfig] = None, **kwargs) -> GenerationResult:
+        """Generate text using Anthropic with system and user prompts (Messages API)."""
+        if self.client is None:
+            raise RuntimeError("Anthropic client not initialized. Call load_model() first.")
+
+        hp = hyperparams or self.hyperparams
+        api_params = self._map_hyperparams(hp)
+
+        messages=[
+            {"role": "user", "content": user_message}
+        ]
+
+        start_time = time.time()
+        raw_output = ""
+        input_tokens = 0
+        output_tokens = 0
+        try:
+            response = self.client.messages.create(
+                model=self.model_specifier,
+                system=system_prompt, # Use the dedicated system parameter
+                messages=messages,
+                **api_params
+            )
+            generation_time = time.time() - start_time
+
+            # Handle response structure (content is a list)
+            if response.content and isinstance(response.content, list) and hasattr(response.content[0], 'text'):
+                raw_output = response.content[0].text
+            else:
+                 raw_output = "[Anthropic: Empty or unexpected response content]"
+                 self.logger.warning(f"Anthropic response content was empty or malformed: {response.content}")
+
+
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
+            memory_used = 0 # N/A
+            filtered_output = raw_output
+
+            if generation_time > 0 and output_tokens > 0:
+                 tokens_per_sec = output_tokens / generation_time
+                 self.logger.info(f"Anthropic generated {output_tokens} tokens in {generation_time:.2f}s ({tokens_per_sec:.1f} tokens/s)")
+            elif output_tokens > 0:
+                 self.logger.info(f"Anthropic generated {output_tokens} tokens")
+            else:
+                 self.logger.warning(f"Anthropic generated 0 tokens. Finish Reason: {response.stop_reason}")
+
+        except Exception as e:
+            generation_time = time.time() - start_time
+            self.logger.error(f"Anthropic API call failed after {generation_time:.2f}s: {e}", exc_info=True)
+            raw_output = f"[Anthropic Error: {e}]"
+            try: input_tokens = len(system_prompt.split()) + len(user_message.split())
+            except: input_tokens = 0
+            output_tokens = 0
+
+        return GenerationResult(
+            raw_output=raw_output,
+            filtered_output=filtered_output,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            generation_time=generation_time,
+            memory_used=0, # N/A
+            device_map={"provider": "anthropic"}
+        )
+
+    def unload_model(self):
+        # No explicit unloading needed, clear client reference
+        if hasattr(self, 'client') and self.client is not None:
+             del self.client
+             self.client = None
+             self.logger.debug("Anthropic client reference cleared.")
+        pass
+
+
+# --- Backend Factory ---
+
+def get_llm_backend(provider: str,
+                      model_specifier: str,
+                      api_keys: Dict[str, str],
+                      hyperparameters: HyperparameterConfig,
+                      # Kwargs for local-specific configs
+                      # Add model_config required by LocalTransformerBackend
+                      model_config: Optional[ModelConfig] = None,
+                      quantization_config: Optional[QuantizationConfig] = None,
+                      layer_split_config: Optional[LayerSplitConfig] = None,
+                      memory_config: Optional[MemoryConfig] = None # Keep for legacy compatibility
+                      ) -> Optional[LLMBackend]:
+    """Factory function to create the appropriate LLM backend."""
+    provider_lower = provider.lower()
+    logger.info(f"Attempting to create backend for provider: {provider_lower}, model: {model_specifier}")
+
+    try:
+        if provider_lower == "local":
+            # This is a local Hugging Face Transformers model
+            # Ensure model_config is provided
+            if model_config is None:
+                 logger.warning(f"ModelConfig not provided for local model {model_specifier}. Attempting to fetch from registry.")
+                 model_entry = get_model_config(model_specifier)
+                 if model_entry:
+                      # Convert ModelEntry to ModelConfig
+                      model_config = ModelConfig(
+                          name=model_entry.name, model_id=model_entry.model_id,
+                          supports_thinking=model_entry.supports_thinking,
+                          thinking_tokens=model_entry.thinking_tokens or [],
+                          max_context=model_entry.max_context,
+                          optimal_chunk_size=model_entry.optimal_chunk_size,
+                          temperature=model_entry.temperature, top_p=model_entry.top_p,
+                          max_new_tokens=model_entry.max_new_tokens,
+                          quantization_support=model_entry.quantization_support or ["4bit", "8bit"]
+                      )
+                 else:
+                      logger.error(f"Model {model_specifier} not found in registry and no ModelConfig provided.")
+                      raise ValueError(f"Missing ModelConfig for local model {model_specifier}")
+
+
+            return LocalTransformerBackend(
+                model_id=model_specifier,
+                model_config=model_config, # Pass the resolved ModelConfig
+                quantization_config=quantization_config,
+                layer_split_config=layer_split_config,
+                hyperparameters=hyperparameters,
+                memory_config=memory_config # Pass legacy if needed
+            )
+
+        elif provider_lower == "local_gguf":
+             if not LLAMACPP_AVAILABLE:
+                 raise ImportError("llama-cpp-python not found. Cannot use GGUF backend.")
+
+             # model_specifier is the path for GGUF
+             gguf_model_path = Path(model_specifier)
+             if not gguf_model_path.is_file():
+                 raise FileNotFoundError(f"GGUF model file not found: {gguf_model_path}")
+
+             # Create LlamaCppConfig - use LayerSplitConfig if available for n_gpu_layers
+             gpu_layers = layer_split_config.gpu_layers if layer_split_config else -1
+
+             gguf_config = LlamaCppConfig(
+                 model_path=gguf_model_path,
+                 n_ctx=hyperparameters.max_length or 2048, # Use max_length from hyperparams
+                 n_gpu_layers=gpu_layers,
+                 n_batch=512, # Default, make configurable?
+                 # Add other relevant LlamaCpp settings if needed
+             )
+             # Directly return the LlamaCppBackend instance (from llamacpp_backend.py)
+             return LlamaCppBackend(
+                 config=gguf_config,
+                 hyperparameters=hyperparameters
+             )
+
+
+        elif provider_lower == "openai":
+            if not OPENAI_AVAILABLE:
+                 raise ImportError("OpenAI library not found. Please run 'pip install openai'")
+            api_key = api_keys.get("openai")
+            if not api_key:
+                raise ValueError("OpenAI API key not configured.")
+            return OpenAIBackend(
+                api_key=api_key,
+                model_specifier=model_specifier,
+                hyperparameters=hyperparameters
+            )
+
+        elif provider_lower == "google":
+            if not GOOGLE_AI_AVAILABLE:
+                 raise ImportError("Google Generative AI library not found. Please run 'pip install google-generativeai'")
+            api_key = api_keys.get("google")
+            if not api_key:
+                raise ValueError("Google API key not configured.")
+            return GoogleAIBackend(
+                api_key=api_key,
+                model_specifier=model_specifier,
+                hyperparameters=hyperparameters
+            )
+
+        elif provider_lower == "anthropic":
+            if not ANTHROPIC_AVAILABLE:
+                 raise ImportError("Anthropic library not found. Please run 'pip install anthropic'")
+            api_key = api_keys.get("anthropic")
+            if not api_key:
+                raise ValueError("Anthropic API key not configured.")
+            return AnthropicBackend(
+                api_key=api_key,
+                model_specifier=model_specifier,
+                hyperparameters=hyperparameters
+            )
+
+        # --- Add other cloud providers here ---
+        # elif provider_lower == "cohere":
+        #     # ... implementation ...
+        # elif provider_lower == "openrouter":
+        #     # ... implementation ...
+
+        else:
+            logger.error(f"Unsupported provider: '{provider_lower}'.")
+            raise ValueError(f"Unsupported provider: {provider}")
+
+    except (ImportError, ValueError, TypeError, FileNotFoundError) as e:
+        logger.error(f"Failed to create backend for {provider}: {e}", exc_info=False) # Reduce noise for common errors
+        ConsoleOutput.error(f"Error initializing backend '{provider}': {e}")
+        return None # Return None on failure
+
+
+# --- BatchProcessor (Now uses LLMBackend) ---
+class BatchProcessor:
+    """Process text in batches for efficiency"""
+
+    def __init__(self, llm_backend: LLMBackend):
+        self.llm_backend = llm_backend
+        self.logger = get_logger_conf(f"{__name__}.BatchProcessor")
+
+    def process_batch(self,
+                      texts: List[str],
+                      system_prompt: str,
+                      batch_size: int = 1, # Batching is complex with heterogeneous backends, default to 1
+                      hyperparams: Optional[HyperparameterConfig] = None,
+                      **generation_kwargs) -> List[GenerationResult]:
+        """
+        Process multiple texts in batches (currently serial)
+
+        Args:
+            texts: List of texts to process
+            system_prompt: System prompt for all texts
+            batch_size: (Note: True batching only supported by LocalTransformerBackend)
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            List of GenerationResults
+        """
+        # TODO: Implement true batching for LocalTransformerBackend if needed
+        # For API backends, batching often means parallel requests, not a single batch input
+
+        results = []
+
+        self.logger.info(f"Processing {len(texts)} texts sequentially (batch_size={batch_size} ignored for non-local-transformer backends)")
+
+        # Ensure text backend is loaded before starting the loop
+        if not self.llm_backend.model: # Check if model is loaded (relevant for local)
+             self.logger.info("Loading text backend model before batch processing...")
+             if not self.llm_backend.load_model():
+                  self.logger.error("Failed to load model for batch processing. Aborting.")
+                  # Return error results for all items
+                  return [GenerationResult(raw_output="", filtered_output=f"Error: Backend failed to load",
+                                           input_tokens=0, output_tokens=0, generation_time=0, memory_used=0,
+                                           device_map={"provider": "error"}) for _ in texts]
+
+
+        with LoggingProgress(self.logger, "Processing batch", len(texts)) as progress:
+            for i, text in enumerate(texts):
+                self.logger.debug(f"Processing item {i+1}/{len(texts)}")
+
+                try:
+                    result = self.llm_backend.process_with_chat_template(
+                        system_prompt,
+                        text,
+                        hyperparams=hyperparams,
+                        **generation_kwargs
+                    )
+                    results.append(result)
+
+                except Exception as e:
+                    self.logger.error(f"Failed to process text item {i}: {e}", exc_info=True)
+                    # Create error result
+                    results.append(GenerationResult(
+                        raw_output="",
+                        filtered_output=f"Error: {str(e)}",
+                        input_tokens=0,
+                        output_tokens=0,
+                        generation_time=0,
+                        memory_used=0,
+                        device_map={"provider": "error"}
+                    ))
+
+                # Optional: Clear cache between items (if local GPU and memory is tight)
+                # if self.llm_backend.provider_identifier.startswith("local") and torch.cuda.is_available():
+                #    torch.cuda.empty_cache()
+
+                progress.update(1, f"Item {i+1}/{len(texts)} completed")
+                # ConsoleOutput.progress_bar(i+1, len(texts), prefix="Processing") # Can be noisy with LoggingProgress
+
+        self.logger.info(f"Batch processing complete: {len(results)} results")
+        return results
