@@ -28,9 +28,9 @@ from llm_handler import ModelManager, BatchProcessor
 from response_filter import ChunkedResponseFilter
 from markdown_formatter import MarkdownFormatter, PodcastFormatter, TechnicalFormatter
 from file_handler import FileHandler
+from hyperparameters import HyperparameterConfig
 
 logger = get_logger_conf(__name__)
-
 
 class ProcessingMode(Enum):
     """Processing modes for different use cases"""
@@ -40,25 +40,24 @@ class ProcessingMode(Enum):
     SUMMARY = "summary"
     CUSTOM = "custom"
 
-
 @dataclass
 class PipelineConfig:
-    """Configuration for the processing pipeline"""
+    # Configuration for the processing pipeline
     mode: ProcessingMode = ProcessingMode.PODCAST
     model_name: str = DEFAULT_MODEL
-    memory_profile: str = "medium_vram"
+    memory_profile: str = "low_vram"
     chunking_strategy: ChunkingStrategy = ChunkingStrategy.WORD_BOUNDARY
-    chunk_size: int = 1000
+    chunk_size: int = 500
     markdown_style: str = "podcast"
     system_prompt: Optional[str] = None
     remove_thinking: bool = True
-    preserve_layout: bool = False
+    preserve_layout: bool = True
     clean_for_audio: bool = True
     add_emotions: bool = True
     enable_checkpoints: bool = ENABLE_STAGE_CHECKPOINTS
     max_retries: int = MAX_RETRIES
     output_format: str = "markdown"
-
+    hyperparameters: Optional[HyperparameterConfig] = None
 
 @dataclass
 class PipelineResult:
@@ -115,11 +114,14 @@ class ProcessingPipeline:
         
         # Model manager
         memory_config = MEMORY_PROFILES.get(self.config.memory_profile)
+        # Pass hyperparameters during initialization
         self.model_manager = ModelManager(
-            model_name=self.config.model_name,
-            memory_config=memory_config
+                model_name = self.config.model_name,
+                model_id=None, # Allow ModelManager to resolve using model_name from registry
+                hyperparameters=self.config.hyperparameters, # Pass hyperparameters
+                memory_config=memory_config
         )
-        
+
         # Response filter
         self.response_filter = ChunkedResponseFilter(
             model_config=MODELS.get(self.config.model_name)

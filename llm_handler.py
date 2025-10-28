@@ -31,6 +31,7 @@ from config_base import (
 )
 from hyperparameters import HyperparameterConfig
 from response_filter import ResponseFilter, DynamicTokenLimitCalculator
+from model_registry import get_model_config
 
 logger = get_logger_conf(__name__)
 
@@ -128,25 +129,35 @@ class AdvancedModelManager:
                 self.model_config = self._entry_to_config(model_entry)
                 self.model_id = model_entry.model_id
             else:
+                logger.warning(f"Model name '{model_name}' not found in registry.  Falling back to '{FALLBACK_MODEL}'.")
                 # Fallback
                 fallback_entry = get_model_config(FALLBACK_MODEL)
-                self.model_config = self._entry_to_config(fallback_entry)
-                self.model_id = fallback_entry.model_id
+                if fallback_entry:
+                    self.model_config = self._entry_to_config(fallback_entry)
+                    self.model_id = fallback_entry.model_id
+                    self.model_name = FALLBACK_MODEL # Update model_name to reflect fallback
+                else:
+                    # If even fallback fails, raise an error
+                    logger.critical(f"Fallback model '{FALLBACK_MODEL}' also not found in registry.  Cannot proceed.")
+                    raise ValueError(f"Default model '{model_name}' and fallback model '{FALLBACK_MODEL}' not found in registry")
         else:
             # Try to find in registry
             model_entry = get_model_config(model_id)
             if model_entry:
                 self.model_config = self._entry_to_config(model_entry)
+                self.model_name = model_entry.name # Set model_name based on entry
             else:
                 # Create basic config for unknown model
+                logger.warning(f"Model ID '{model_id}' not found in registry.  Using basic model configuration.")
                 from config import ModelConfig
                 self.model_config = ModelConfig(
                     name=model_id.split('/')[-1],
                     model_id=model_id,
-                    supports_thinking=False,
+                    supports_thinking=False, # Assuem false for unknown models
                     max_context=8192,
-                    optimal_chunk_size=1000
+                    optimal_chunk_size=500
                 )
+                self.model_name = self.model_config.name # Set model_name based on derived name
        
         # Configurations
         self.quant_config = quantization_config or QuantizationConfig(method=DEFAULT_QUANTIZATION)

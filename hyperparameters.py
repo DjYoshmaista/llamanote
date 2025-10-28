@@ -482,7 +482,7 @@ class InteractiveHyperparameterEditor:
     
     def edit(self) -> HyperparameterConfig:
         """Interactive editing session"""
-        from config_manager import ConsoleOutput
+        from loggerConf import ConsoleOutput
         
         ConsoleOutput.header("Hyperparameter Configuration Editor")
         

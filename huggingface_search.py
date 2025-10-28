@@ -13,10 +13,10 @@ from enum import Enum
 import re
 from datetime import datetime
 
-from logging_config import get_logger, ConsoleOutput
+from loggerConf import get_logger_conf, ConsoleOutput
 from config_manager import ConfigManager
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 class ModelTask(Enum):

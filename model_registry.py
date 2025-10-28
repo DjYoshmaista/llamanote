@@ -23,6 +23,7 @@ class ModelEntry:
     model_id: str
     name: str
     author: str
+    short_key: Optional[str] = None
     supports_thinking: bool = False
     thinking_tokens: List[str] = None
     max_context: int = 8192
@@ -63,6 +64,8 @@ class ModelEntry:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ModelEntry':
         """Create from dictionary"""
+        # Ensure short_key exists in data or defaults to None
+        data.setdefault('short_key', None)
         return cls(**data)
     
     @classmethod
@@ -145,9 +148,9 @@ class ModelRegistry:
                 top_p=0.9,
                 is_predefined=True
             ),
-            "gemma-270m": ModelEntry(
-                model_id="google/gemma-2-2b-it",
-                name="Gemma 2B",
+            "gemma3-270m": ModelEntry(
+                model_id="google/gemma-3-270m",
+                name="Gemma3-270m",
                 author="google",
                 supports_thinking=False,
                 max_context=8192,
@@ -174,10 +177,18 @@ class ModelRegistry:
         # Add predefined models if they don't exist
         updated = False
         for key, entry in predefined.items():
-            if entry.model_id not in self.models:
-                self.models[entry.model_id] = entry
+            # Assign the short key before adding/updating
+            entry.short_key = key
+
+            # Add or update using the full model_id as the primary key
+            if entry.model_id not in self.models or not self.models[entry.model_id]:
+                self.models(entry.model_id) == entry
                 updated = True
-        
+            # Ensure existing predefined entries also have the short key
+            elif self.models[entry.model_id].is_predefined and self.models[entry.model_id].short_key != key:
+                self.models[entry.model_id].short_key = key
+                updated = True
+                   
         if updated:
             self._save_registry()
     
@@ -230,11 +241,11 @@ class ModelRegistry:
     
     def get_by_key(self, key: str) -> Optional[ModelEntry]:
         """Get predefined model by short key (e.g., 'qwen3-4b')"""
-        # Check if this is a predefined key
-        for model_id, entry in self.models.items():
-            if entry.is_predefined and key in model_id.lower():
+        key_lower = key.lower() # Normalize key for comparison
+        for entry in self.models.values():
+            # Check if this is a predefined key
+            if entry.is_predefined and entry.short_key and entry.short_key.lower:
                 return entry
-        
         return None
     
     def list_models(self, 
@@ -425,14 +436,19 @@ def refresh_registry_from_hub(search_terms: List[str] = None, limit: int = 100) 
 def get_model_config(model_identifier: str) -> Optional[ModelEntry]:
     """Get model config by ID or key"""
     registry = get_registry()
-    
-    # Try as direct ID
+
+    # If the identifier looks like a short key (no '/') then get_by_key first
+    if '/' not in model_identifier:
+        model = registry.get_by_key(model_identifier)
+        if model:
+            return model
+
+    # Try as direct ID (this handles full HF IDs)
     model = registry.get_model(model_identifier)
     if model:
         return model
     
     # Try as predefined key
-    model = registry.get_by_key(model_identifier)
     return model
 
 

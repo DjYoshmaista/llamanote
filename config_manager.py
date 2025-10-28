@@ -11,9 +11,9 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import shutil
 
-from logging_config import get_logger
+from loggerConf import get_logger_conf
 
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 class ConfigManager:

@@ -14,12 +14,12 @@ import librosa
 from transformers import pipeline, AutoProcessor, AutoModel
 import warnings
 
-from logging_config import get_logger, log_execution_time, ConsoleOutput
+from loggerConf import get_logger_conf, log_execution_time, ConsoleOutput
 from huggingface_search import ModelDownloader, ModelInfo
 from config_manager import ConfigManager
 
 warnings.filterwarnings("ignore", category=UserWarning)
-logger = get_logger(__name__)
+logger = get_logger_conf(__name__)
 
 
 @dataclass
