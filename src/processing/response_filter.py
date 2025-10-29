@@ -145,6 +145,50 @@ class ResponseFilter:
             filter_stats=filter_stats
         )
 
+class DynamicTokenLimitCalculator:
+    """Calculate optimal token limits based on content and model constraints"""
+    
+    def __init__(self, model_config: ModelEntry):
+        self.model_config = model_config
+        self.base_prompt_tokens = 500  # Estimated tokens for system prompt
+        
+    def calculate_max_new_tokens(self, input_text: str, 
+                                 target_ratio: float = 2.0) -> int:
+        """
+        Calculate optimal max_new_tokens based on input
+        
+        Args:
+            input_text: Input text to process
+            target_ratio: Desired output/input ratio
+            
+        Returns:
+            Optimal max_new_tokens value
+        """
+        # Estimate input tokens (rough approximation)
+        estimated_input_tokens = len(input_text) // 4  # ~4 chars per token
+        
+        # Add base prompt tokens
+        total_input_tokens = estimated_input_tokens + self.base_prompt_tokens
+        
+        # Calculate available tokens
+        available_tokens = self.model_config.max_context - total_input_tokens
+        
+        # Apply target ratio
+        target_output_tokens = int(estimated_input_tokens * target_ratio)
+        
+        # Use the minimum of target and available
+        max_new_tokens = min(target_output_tokens, available_tokens)
+        
+        # Apply bounds
+        max_new_tokens = max(256, min(max_new_tokens, 8192))
+        
+        logger.debug(
+            f"Calculated max_new_tokens: {max_new_tokens} "
+            f"(input_tokens≈{estimated_input_tokens}, "
+            f"available={available_tokens})"
+        )
+        
+        return max_new_tokens
 
 class ChunkedResponseFilter:
     """

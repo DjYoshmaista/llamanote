@@ -3,6 +3,8 @@
 Custom Exception Classes for LlamaNote Enhanced
 """
 
+from typing import Optional
+
 class LlamaNoteError(Exception):
     """Base exception for all LlamaNote errors."""
     pass

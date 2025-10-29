@@ -13,12 +13,61 @@ import traceback
 from pathlib import Path
 from typing import Optional, Any, Dict, List
 from datetime import datetime
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError as e:
+    print(f"Error importing psutil: '{e}'")
+    PSUTIL_AVAILBLE = False
+    psutil = None
 
-# Import logging config function from settings
-from ..config.settings import get_logging_config, DEFAULT_LOG_DIR, SAVE_ERROR_CONTEXT
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError as e:
+    print(f"Error importing PyTorch: '{e}'")
+    TORCH_AVAILABLE = False
+    torch = None
 
 # Global flag to track if logging has been configured
 _logging_configured = False
+DEFAULT_LOG_DIR = "../../logs"
+
+SAVE_ERROR_CONTEXT = True
+
+# === Logging Configuration ===
+# Keep LOGGING_CONFIG dictionary here for easy access, ensuring LOG_DIR is resolved
+def get_logging_config(log_dir: Path) -> Dict[str, Any]:
+    """Generates the logging configuration dictionary."""
+    log_dir.mkdir(parents=True, exist_ok=True) # Ensure log dir exists
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "detailed": {"format": "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s", "datefmt": "%Y-%m-%d %H:%M:%S"},
+            "simple": {"format": "%(asctime)s - %(levelname)s - %(message)s", "datefmt": "%H:%M:%S"}
+        },
+        "handlers": {
+            "console": {"class": "logging.StreamHandler", "level": "INFO", "formatter": "simple", "stream": "ext://sys.stdout"},
+            "file": {"class": "logging.handlers.RotatingFileHandler", "level": "DEBUG", "formatter": "detailed", "filename": str(log_dir / "llamanote.log"), "maxBytes": 10485760, "backupCount": 5},
+            "error_file": {"class": "logging.handlers.RotatingFileHandler", "level": "ERROR", "formatter": "detailed", "filename": str(log_dir / "errors.log"), "maxBytes": 10485760, "backupCount": 5}
+        },
+        "loggers": {
+            # Configure specific loggers if needed, e.g., 'llamanote' base logger
+             "llamanote": {"level": "DEBUG", "handlers": ["console", "file", "error_file"], "propagate": False},
+             # Reduce noise from libraries
+             "httpx": {"level": "WARNING", "handlers": ["console", "file"]},
+             "httpcore": {"level": "WARNING", "handlers": ["console", "file"]},
+             "openai": {"level": "WARNING", "handlers": ["console", "file"]},
+             "anthropic": {"level": "WARNING", "handlers": ["console", "file"]},
+             "google": {"level": "WARNING", "handlers": ["console", "file"]},
+             "huggingface_hub": {"level": "WARNING", "handlers": ["console", "file"]},
+             "transformers": {"level": "WARNING", "handlers": ["console", "file"]},
+             "torch": {"level": "WARNING", "handlers": ["console", "file"]},
+             "accelerate": {"level": "WARNING", "handlers": ["console", "file"]},
+        },
+        "root": {"level": "INFO", "handlers": ["console"]} # Root only logs INFO+ to console by default
+    }
 
 def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None):
     """Configures logging for the application."""
@@ -55,6 +104,113 @@ def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None)
         logging.basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(message)s")
         logging.error(f"Logging setup failed, using basic config.", exc_info=True)
 
+class MemoryMonitor:
+    """ Utility to monitor RAM and GPU memory usage """
+    def __init__(self, logger: logging.Logger, threshold_mb: int = 500):
+        """
+        Initialize the monitor.
+
+        Args:
+            logger: The logger instance to use for reportin
+            threshold_mb: Minimum change in MB to log (to reduce noise)
+        """
+        self.logger = logger
+        self.threshold_bytes = threshold_mb * 1024 * 1024
+        self.process = psutil.Process() if PSUTIL_AVAILABLE else None
+        self.start_ram_bytes: Optional[int] = None
+        self.start_gpu_bytes: Optional[int] = None
+        self.last_ram_bytes: Optional[int] = None
+        self.last_gpu_bytes: Optional[int] = None
+        self.gpu_available = TORCH_AVAILABLE and torch.cuda.is_available()
+
+        if not PSUTIL_AVAILABLE:
+            self.logger.warning("psutil library not found.  RAM monitoring disabled.")
+        if not TORCH_AVAILABLE:
+            self.logger.warning("torch library not found.  GPU monitoring disabled.")
+        elif not self.gpu_available:
+            self.logger.info("CUDA not available.  GPU monitoring disabled.")
+
+    def _get_ram_usage_bytes(self) -> Optional[int]:
+        """Gets current process RAM usage (RSS)"""
+        if self.process:
+            try:
+                return self.process.memory_info().rss
+            except psutil.Error as e:
+                self.logger.warning(f"Failed to get RAM usage: {e}")
+        return None
+
+    def _get_gpu_usage_bytes(self) -> Optional[int]:
+        """Gets current allocated GPU memory (if available)."""
+        if self.gpu_available:
+            try:
+                # Use max_memory_allocated for peak since last reset, or memory_allocated for current.  Using current for deltas
+                allocated = torch.cuda.memory_allocated()
+                # Reset peak stats if measuring peak between chunks
+                torch.cuda.reset_peak_memory_state()
+                return allocated
+            except Exception as e:
+                self.logger.warning(f"Failed to get GPU VRAM usage: {e}")
+        return None
+
+    def start(self):
+        """Records the initial memory usage"""
+        self.start_ram_bytes = self._get_ram_usage_bytes()
+        self.start_gpu_bytes = self._get_gpu_usage_bytes()
+        self.last_ram_bytes = self.start_ram_bytes
+        self.last_gpu_bytes = self.start_gpu_bytes
+
+        ram_msg = f"{self.start_ram_bytes / (1024*1024):.1f} MB" if self.start_ram_bytes is not None else "N/A"
+        gpu_msg = f"{self.start_gpu_bytes / (1024*1024):.1f} MB" if self.start_gpu_bytes is not None else "N/A"
+
+        self.logger.info(f"Memory baseline: RAM={ram_msg}, VRAM={gpu_msg}")
+
+    def check(self, description: str):
+        """Logs the current memory usage and deltas from start/last check"""
+        current_ram = self._get_ram_usage_bytes()
+        current_gpu = self._get_gpu_usage_bytes()
+
+        log_messages = [f"Memory Check @ '{description}':"]
+        log_worthy = False
+
+        # RAM Check
+        if current_ram is not None:
+            ram_mb = current_ram / (1024 * 1024)
+            delta_start_mb = (current_ram - (self.start_ram_bytes or current_ram)) / (1024 * 1024)
+            delta_last_mb = (current_ram - (self.last_ram_bytes or current_ram)) / (1024 * 1024)
+            log_messages.append(
+                    f"  RAM: {ram_mb:.1f} MB (ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb:*.1f} MB)"
+                    )
+            if abs(current_ram - (self.last_ram_bytes or current_ram)) > self.threshold_bytes:
+                log_worthy = True
+            self.last_ram_bytes = current_ram
+        else:
+            log_messages.append("  RAM: N/A")
+
+        # GPU Check
+        if current_gpu is not None:
+            gpu_mb = current_gpu / (1024 * 1024)
+            delta_start_mb = (current_gpu - (self.start_gpu_bytes or current_gpu)) / (1024 * 1024)
+            delta_last_mb = (current_gpu - (self.last_gpu_bytes or current_gpu)) / (1024 * 1024)
+
+            # Optionally get peak memory since last reset
+            peak_gpu_mb = (torch.cuda.max_memory_allocated() / (1024 * 1024)) if self.gpu_available else 0
+
+            log_messages.append(
+                    f"  GPU: {gpu_mb:.1f} MB (Peak: {peak_gpu_mb:.1f} MB, ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb} MB)"
+                )
+            if abs(current_gpu - (self.last_gpu_bytes or current_gpu)) > self.threshold_bytes:
+                log_worthy = True
+            self.last_gpu_bytes = current_gpu
+            # Reset peak for next check
+            if self.gpu_available:
+                torch.cuda.reset_peak_memory_stats()
+        if self.gpu_available: # Log N/A only if GPU was expected
+            log_messages.append("  GPU: NA")
+        # Log only if memory changed significantly or it's the first check
+        if log_worthy or self.last_ram_bytes == self.start_ram_bytes:
+            self.logger.info("\n".join(log_messages))
+        else:
+            self.logger.debug(f"Memory check @ '{description}': No significant change.")
 
 class ContextLogger:
     """Enhanced logger with context tracking."""

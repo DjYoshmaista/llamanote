@@ -11,9 +11,9 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 import shutil
 
-from src.utils.logger import get_logger_conf
-from src.settings import BASE_DIR, DEFAULT_MODEL_KEY # Use central settings
-from src.cloud_keys import CloudKeyManager # Import the dedicated key manager
+from ..utils.logger import get_logger_conf
+from .settings import BASE_DIR, DEFAULT_MODEL_KEY # Use central settings
+from .cloud_keys import CloudKeyManager # Import the dedicated key manager
 
 logger = get_logger_conf(__name__)
 
