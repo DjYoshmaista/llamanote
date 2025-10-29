@@ -10,7 +10,7 @@ from .logger import setup_logging, get_logger_conf, ConsoleOutput, LoggingProgre
 from .validators import (
     validate_file_path,
     validate_directory_path,
-    vqalidate_numeric_range,
+    validate_numeric_range,
     validate_choice
 )
 from .decorators import (

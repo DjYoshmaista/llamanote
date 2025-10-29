@@ -422,7 +422,7 @@ def get_model_entry(identifier: str) -> Optional[ModelEntry]:
 
 def list_available_models(predefined_only: bool = False, **filters) -> List[ModelEntry]:
     """List all available models, with optional filters."""
-    registry = get_get_registry()
+    registry = get_registry()
     filters['predefined_only'] = predefined_only
     return registry.list_models(**filters)
 

@@ -21,14 +21,14 @@ from src.config.settings import (
     DEFAULT_OUTPUT_DIR, PREPROCESS_PROMPT_PODCAST, SUPPORTED_LLM_PROVIDERS,
     SUPPORTED_TTS_PROVIDERS
 )
-from src.core.types import ProcessingMode, PipelineConfig, ChunkingStrategy
+from src.core.types import ProcessingMode, PipelineConfig, ChunkingStrategy, PipelineResult
 from src.core.pipeline import ProcessingPipeline
 from src.models.registry import get_registry, ModelEntry
 from src.models.hyperparameters import HyperparameterConfig, InteractiveHyperparameterEditor, get_hyperparameter_help
 from src.models.hub import ModelHub, ModelHubInfo
 from src.models.backends import get_llm_backend, get_audio_backend, LLMBackend, AudioBackend
 from src.io.batch_manager import BatchFileManager
-from src.core.errors import ModelLoadError
+from src.core.errors import ModelLoadError, ConfigurationError, FileProcessingError, MissingDataError
 
 # Conditional import for GGUF
 try:
@@ -96,7 +96,32 @@ Examples:
         nargs="*",
         help="Path(s) to input PDF/text file(s) or directory. If omitted, starts interactive menu."
     )
-    
+    # Add near other related arguments in parse_arguments()
+    other_group.add_argument(
+        "-r", "--recursive",
+        action="store_true",
+        help="Recursively search input directories."
+    )
+    utility_group.add_argument( # Add to utility group
+        "--browse-models",
+        action="store_true",
+        help="Interactively browse Hugging Face Hub models (for local_hf)."
+    )
+    # Import missing items at the top
+    from src.config.settings import (
+        # ... existing imports ...
+        CACHE_DIR, CHUNK_OVERLAP, MAX_RETRIES, FALLBACK_ON_ERROR, # Add missing
+        PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT
+    )
+    from src.models.hyperparameters import get_hyperparameter_help # Add missing import
+    # Remove unused import:
+    # from src.models.hub import InteractiveModelBrowser # Not used
+    # Make sure these are imported for the error handling block:
+    from src.core.errors import ConfigurationError, FileProcessingError, MissingDataError, ModelLoadError # Ensure ModelLoadError is there
+    # Ensure PipelineResult is imported from types (Fix #4)
+    # Inside run_cli_processing, update relevant constants if needed or confirm they come from pipeline_config
+    # e.g., CHUNK_OVERLAP, MAX_RETRIES, FALLBACK_ON_ERROR are used to create PipelineConfig, which is good.
+    # CACHE_DIR might be needed for ModelHub instantiation if not handled by registry defaults. Add import if needed.    
     # --- Utility Actions (run instead of processing) ---
     utility_group = parser.add_argument_group('Utility Commands (run separately)')
     utility_group.add_argument(

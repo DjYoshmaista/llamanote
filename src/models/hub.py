@@ -409,7 +409,7 @@ class ModelHub:
     
     def is_model_cached(self, model_id: str) -> bool:
         """Check if model exists in the registry and is marked as cached."""
-        entry = self.registry.get_model(model_id)
+        entry = get_registry().get_model(model_id)
         if entry and entry.is_cached:
              # Optional: Check if path actually still exists
              if entry.cache_path and Path(entry.cache_path).exists():
@@ -419,6 +419,6 @@ class ModelHub:
                  logger.warning(f"Registry shows model {model_id} cached, but path not found. Updating status.")
                  entry.is_cached = False
                  entry.cache_path = None
-                 self.registry.add_model(entry, save=True) # Save the update
+                 get_registry().add_model(entry, save=True) # Save the update
                  return False
         return False
