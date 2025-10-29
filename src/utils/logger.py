@@ -15,7 +15,7 @@ from typing import Optional, Any, Dict, List
 from datetime import datetime
 
 # Import logging config function from settings
-from src.config.settings import get_logging_config, DEFAULT_LOG_DIR, SAVE_ERROR_CONTEXT
+from ..config.settings import get_logging_config, DEFAULT_LOG_DIR, SAVE_ERROR_CONTEXT
 
 # Global flag to track if logging has been configured
 _logging_configured = False

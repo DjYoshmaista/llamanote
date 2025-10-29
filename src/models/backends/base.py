@@ -15,6 +15,7 @@ from ...core.types import (
     AudioResult
 )
 from ..hyperparameters import HyperparameterConfig
+from ...core.errors import ModelLoadError
 from ...utils.logger import get_logger_conf, log_execution_time
 from ...utils.helpers import estimate_tokens
 

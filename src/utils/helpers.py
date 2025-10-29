@@ -5,6 +5,7 @@ Includes resource cleanup, path generation, token estimation, etc.
 """
 
 import gc
+import threading
 import re
 import os
 from pathlib import Path

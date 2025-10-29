@@ -52,6 +52,7 @@ except ImportError:
 # Local project imports
 from .base import LLMBackend
 from ...core.types import GenerationResult, QuantizationConfig, LayerSplitConfig
+from ...processing.response_filter import ResponseFilter
 from ...core.errors import ModelLoadError, GenerationError
 from ...models.hyperparameters import HyperparameterConfig
 from ...models.registry import ModelEntry

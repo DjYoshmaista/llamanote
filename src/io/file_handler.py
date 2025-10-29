@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
+from dataclasses import dataclass, field, asdict
 import time
 
 from ..utils.logger import get_logger_conf, log_execution_time
@@ -20,7 +21,7 @@ from ..config.settings import (
     DEFAULT_OUTPUT_FORMAT, TIMESTAMP_OUTPUTS, INCLUDE_METADATA
 )
 # Import core types
-from ..core.types import PipelineResult, PDFMetadata
+from ..core.types import PipelineResult, PDFMetadata, ProcessedFile
 
 logger = get_logger_conf(__name__)
 

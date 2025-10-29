@@ -10,8 +10,9 @@ import json
 import re
 import requests
 import time
+from functools import wraps
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Callable, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from huggingface_hub import HfApi, HfFolder, hf_hub_download, snapshot_download, ModelSearchArguments, ModelFilter
 from huggingface_hub.hf_api import HfApi, ModelInfo

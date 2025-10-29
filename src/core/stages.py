@@ -7,6 +7,8 @@ The ProcessingPipeline class will call these functions in order, passing
 the data payload and managing state (checkpoints, error handling).
 """
 
+import gc
+import torch
 import time
 import re
 from pathlib import Path

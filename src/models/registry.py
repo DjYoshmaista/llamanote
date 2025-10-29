@@ -6,14 +6,16 @@ Manages a local database of available models from HuggingFace and local files.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 import threading
-
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    from .hub import ModelHubInfo
 # Use config/settings.py for base paths
-from ..config.settings import CACHE_DIR, DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY
+from ..config.settings import DEFAULT_CACHE_DIR, DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY
 from ..utils.logger import get_logger_conf
+from ..config.manager import _ensure_directory
 
 logger = get_logger_conf(__name__)
 
@@ -75,7 +77,7 @@ class ModelEntry:
         return cls(**filtered_data)
     
     @classmethod
-    def from_model_info(cls, model_info: 'HFModelInfo', is_predefined: bool = False) -> 'ModelEntry':
+    def from_model_info(cls, model_info: 'ModelHubInfo', is_predefined: bool = False) -> 'ModelEntry':
         """Create from ModelInfo object (from model_hub)."""
         # 'HFModelInfo' is the dataclass from models/hub.py
         # This assumes HFModelInfo has matching attribute names
@@ -307,7 +309,7 @@ class ModelRegistry:
              
         return models
     
-    def update_from_hub_list(self, model_infos: List[HFModelInfo]) -> int:
+    def update_from_hub_list(self, model_infos: List['ModelHubInfo']) -> int:
         """Updates the registry from a list of ModelInfo objects."""
         if not model_infos: return 0
         
