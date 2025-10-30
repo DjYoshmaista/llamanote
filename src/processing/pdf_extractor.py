@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from PyPDF2 import PdfReader
 from PyPDF2.errors import PdfReadError
 import fitz  # PyMuPDF
+from load_dotenv import load_dotenv
 
 from ..utils.logger import get_logger_conf, LoggingProgress
 from ..utils.decorators import log_execution_time
@@ -17,10 +18,22 @@ from ..utils.validators import validate_file_path
 from ..config.settings import MAX_PDF_SIZE_MB, MAX_CHARS_PER_FILE
 from ..core.types import PDFMetadata, ExtractionResult
 
+dotenv_path = Path(__file__).resolve().parent.parent
+
+load_dotenv(dotenv_path=dotenv_path)
 logger = get_logger_conf(__name__)
 
-# --- Extraction Strategy Interface (Refactoring Item 9) ---
+SUPPORTED_FORMATS = os.getenv("SUPPORTED_FORMATS")
+if SUPPORTED_FORMATS:
+    ext_list = SUPPORTED_FORMATS.split(',')
+    extensions = tuple(ext_list)
+    print(f"Original string: {SUPPORTED_FORMATS}")
+    print(f"Resulting tuple: {extensions}")
+    print(f"Type of 'extensions': {type(extensions)}")
+else:
+    print("SUPPORTED_FORMATS environment variable not found.")
 
+# --- Extraction Strategy Interface ---
 class BaseExtractionStrategy(abc.ABC):
     """Abstract base class for a PDF text extraction strategy."""
     

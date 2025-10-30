@@ -48,12 +48,13 @@ def validate_file_path(path: Path,
         return False, f"Path is not a file: {path}"
 
     # Use SUPPORTED_FORMATS from env/default if allowed_extensions is not provided
-    effective_allowed_extensions = allowed_extensions if allowed_extensions is not None else SUPPORTED_FORMATS
+    effective_allowed_extensions = allowed_extensions
 
     if effective_allowed_extensions:
         extension = path.suffix.lower()
+        formatted_allowed = [f".{ext.lstrip('.')}" for ext in effective_allowed_extensions]
         if extension not in allowed_extensions:
-            return False, f"Unsupported file extension: '{extension}'. Allowed: {', '.join(allowed_extensions)}"
+            return False, f"Unsupported file extension: '{extension}'. Allowed: {', '.join(formatted_allowed)}"
 
     if max_size_mb is not None:
         try:

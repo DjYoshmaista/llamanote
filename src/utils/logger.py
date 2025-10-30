@@ -13,6 +13,8 @@ import traceback
 from pathlib import Path
 from typing import Optional, Any, Dict, List
 from datetime import datetime
+
+PSUTIL_AVAILABLE = None
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -48,8 +50,8 @@ def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None)
         return
 
     # Use DEFAULT_LOG_diR from settings as fallback
-    from ..config.settins import DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
-    effective_log_dir = Path(log_dir or SETTINGS_DEfAULT_LOG_DIR).resolve()
+    from ..config.settings import DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
+    effective_log_dir = Path(log_dir or SETTINGS_DEFAULT_LOG_DIR).resolve()
 
     try:
         effective_log_dir.mkdir(parents=True, exist_ok=True)

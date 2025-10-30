@@ -16,8 +16,8 @@ from ..utils.validators import validate_file_path
 
 # Load SUPPORTED_FORMATS from environment variable
 DEFAULT_SUPPORTED_FORMATS = ['.pdf', '.txt', '.md']
-SUPPORTED_FORMATS_STR = osgetenv("SUPPORTED_FORMATS", ".pdf,.txt,.md")
-SUPPORTED_FORMATS = [ext.strip() for ext in SUPPORTED_FORMATS_STR.split('.') if ext.strip()]
+SUPPORTED_FORMATS_STR = os.getenv("SUPPORTED_FORMATS", ".pdf,.txt,.md")
+SUPPORTED_FORMATS = [ext.strip() for ext in SUPPORTED_FORMATS_STR.split(',') if ext.strip()]
 if not SUPPORTED_FORMATS:
     print("Warning: SUPPORTED_FORMATS from .env is empty or invalid. Usin defaults.", file=sys.stderr)
     SUPPORTED_FORMATS = DEFAULT_SUPPORTED_FORMATS
@@ -36,12 +36,12 @@ class BatchFileManager:
                                If None, uses value loaded from environment/default values
         """
         # Use provided formats, otherwise use the lobally loaded ones
-        self.supported_formats = supported_formats if supported_formats is not None
+        self.supported_formats = supported_formats if supported_formats is not None else DEFAULT_SUPPORTED_FORMATS
         self.logger = get_logger_conf(f"{__name__}.BatchManager")
         # Ensure self.supported_formats is always a list
         if not isinstance(self.supported_formats, list):
             self.logger.warning(f"Invalid supported_formats provided:\n`{self.supported_formats}`\n")
-            self.supported_formats = SUPPORTED_FORMATS
+            self.supported_formats = DEFAULT_SUPPORTED_FORMATS
 
     def collect_input_files(self,
                            input_paths: Union[List[str], List[Path]],
