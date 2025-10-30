@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import re
 import requests
 from tqdm import tqdm
+import sys
 
 # --- LlamaNote Modules ---
 from ...utils.logger import get_logger_conf, ConsoleOutput
@@ -19,7 +20,7 @@ from ...utils.helpers import cleanup_resources
 from ..hyperparameters import HyperparameterConfig
 from ...config.settings import CACHE_DIR, DEFAULT_GPU_LAYERS
 from ...core.types import GenerationResult
-from ...core.errors import ModelLoadError, GenerationError
+from ...core.errors import ModelLoadError, GenerationError, ConfigurationError
 from .base import LLMBackend # Import the abstract base class
 from .mapper import HyperparamMapper # Import the mapper
 

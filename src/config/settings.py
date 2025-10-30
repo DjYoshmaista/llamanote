@@ -172,7 +172,6 @@ KNOWN_CLOUD_PROVIDERS: List[str] = [ # Used by CloudKeyManager
 SUPPORTED_LLM_PROVIDERS: List[str] = ["local_hf", "local_gguf", "openai", "google", "anthropic"] # Currently implemented backends
 SUPPORTED_TTS_PROVIDERS: List[str] = ["local_audio", "openai_audio"] # Currently implemented audio backends
 
-
 # === Logging Configuration ===
 # Keep LOGGING_CONFIG dictionary here for easy access, ensuring LOG_DIR is resolved
 def get_logging_config(log_dir: Path) -> Dict[str, Any]:
@@ -206,6 +205,3 @@ def get_logging_config(log_dir: Path) -> Dict[str, Any]:
         },
         "root": {"level": "INFO", "handlers": ["console"]} # Root only logs INFO+ to console by default
     }
-
-# Note: Actual LOG_DIR path is now determined by ConfigManager, which reads this file.
-# The logger setup in utils/logger.py will use the path provided by ConfigManager.

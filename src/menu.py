@@ -310,7 +310,7 @@ class MenuSystem:
         self.file_manager = BatchFileManager(supported_formats=SUPPORTED_FORMATS)
 
         # Load API keys on startup
-        self_state_cloud_api_keys = self.config_manager.load_cloud_keys()
+        self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
         logger.info(f"Loaded API keys for: {list(self_state_cloud_api_keys.keys())}")
 
         self.main_menu = self._build_main_menu()

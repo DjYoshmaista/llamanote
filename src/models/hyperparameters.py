@@ -440,7 +440,7 @@ class HyperparameterConfig:
     def create_preset(cls, preset_name: str) -> 'HyperparameterConfig':
         """Create a preset configuration from the loaded presets."""
         config_data = get_hyperparameter_preset(preset_name)
-        if config_
+        if config_data:
             return config_data
         logger.warning(f"Preset '{preset_name}' not found. Returning default config.")
         return cls()

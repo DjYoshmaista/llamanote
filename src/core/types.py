@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
+from ..config.settings import DEFAULT_PIPELINE_STAGES
 
 # Attempt import for type hint, but make it optional
 try:

@@ -29,45 +29,15 @@ except ImportError as e:
     TORCH_AVAILABLE = False
     torch = None
 
+# local module imports
+from ..config.settings import get_logging_config
+
 # Global flag to track if logging has been configured
 _logging_configured = False
 DEFAULT_LOG_DIR = "../../logs"
 
 SAVE_ERROR_CONTEXT = True
 
-# === Logging Configuration ===
-# Keep LOGGING_CONFIG dictionary here for easy access, ensuring LOG_DIR is resolved
-def get_logging_config(log_dir: Path) -> Dict[str, Any]:
-    """Generates the logging configuration dictionary."""
-    log_dir.mkdir(parents=True, exist_ok=True) # Ensure log dir exists
-    return {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "detailed": {"format": "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s", "datefmt": "%Y-%m-%d %H:%M:%S"},
-            "simple": {"format": "%(asctime)s - %(levelname)s - %(message)s", "datefmt": "%H:%M:%S"}
-        },
-        "handlers": {
-            "console": {"class": "logging.StreamHandler", "level": "INFO", "formatter": "simple", "stream": "ext://sys.stdout"},
-            "file": {"class": "logging.handlers.RotatingFileHandler", "level": "DEBUG", "formatter": "detailed", "filename": str(log_dir / "llamanote.log"), "maxBytes": 10485760, "backupCount": 5},
-            "error_file": {"class": "logging.handlers.RotatingFileHandler", "level": "ERROR", "formatter": "detailed", "filename": str(log_dir / "errors.log"), "maxBytes": 10485760, "backupCount": 5}
-        },
-        "loggers": {
-            # Configure specific loggers if needed, e.g., 'llamanote' base logger
-             "llamanote": {"level": "DEBUG", "handlers": ["console", "file", "error_file"], "propagate": False},
-             # Reduce noise from libraries
-             "httpx": {"level": "WARNING", "handlers": ["console", "file"]},
-             "httpcore": {"level": "WARNING", "handlers": ["console", "file"]},
-             "openai": {"level": "WARNING", "handlers": ["console", "file"]},
-             "anthropic": {"level": "WARNING", "handlers": ["console", "file"]},
-             "google": {"level": "WARNING", "handlers": ["console", "file"]},
-             "huggingface_hub": {"level": "WARNING", "handlers": ["console", "file"]},
-             "transformers": {"level": "WARNING", "handlers": ["console", "file"]},
-             "torch": {"level": "WARNING", "handlers": ["console", "file"]},
-             "accelerate": {"level": "WARNING", "handlers": ["console", "file"]},
-        },
-        "root": {"level": "INFO", "handlers": ["console"]} # Root only logs INFO+ to console by default
-    }
 
 def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None):
     """Configures logging for the application."""
@@ -77,11 +47,13 @@ def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None)
         logging.getLogger("llamanote").setLevel(log_level)
         return
 
-    effective_log_dir = Path(log_dir or DEFAULT_LOG_DIR).resolve()
+    # Use DEFAULT_LOG_diR from settings as fallback
+    from ..config.settins import DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
+    effective_log_dir = Path(log_dir or SETTINGS_DEfAULT_LOG_DIR).resolve()
+
     try:
         effective_log_dir.mkdir(parents=True, exist_ok=True)
         logging_config = get_logging_config(effective_log_dir)
-
         # Apply the desired log level to the main 'llamanote' logger handlers
         for handler_name in logging_config.get("loggers", {}).get("llamanote", {}).get("handlers", []):
             if handler_name in logging_config.get("handlers", {}):

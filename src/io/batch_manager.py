@@ -8,10 +8,19 @@ import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
+import os
+import sys
 
 from ..utils.logger import get_logger_conf
 from ..utils.validators import validate_file_path
-from ..config.settings import SUPPORTED_FORMATS
+
+# Load SUPPORTED_FORMATS from environment variable
+DEFAULT_SUPPORTED_FORMATS = ['.pdf', '.txt', '.md']
+SUPPORTED_FORMATS_STR = osgetenv("SUPPORTED_FORMATS", ".pdf,.txt,.md")
+SUPPORTED_FORMATS = [ext.strip() for ext in SUPPORTED_FORMATS_STR.split('.') if ext.strip()]
+if not SUPPORTED_FORMATS:
+    print("Warning: SUPPORTED_FORMATS from .env is empty or invalid. Usin defaults.", file=sys.stderr)
+    SUPPORTED_FORMATS = DEFAULT_SUPPORTED_FORMATS
 
 logger = get_logger_conf(__name__)
 
@@ -24,9 +33,15 @@ class BatchFileManager:
         
         Args:
             supported_formats: List of supported file extensions (e.g., ['.pdf', '.txt'])
+                               If None, uses value loaded from environment/default values
         """
-        self.supported_formats = supported_formats or SUPPORTED_FORMATS
+        # Use provided formats, otherwise use the lobally loaded ones
+        self.supported_formats = supported_formats if supported_formats is not None
         self.logger = get_logger_conf(f"{__name__}.BatchManager")
+        # Ensure self.supported_formats is always a list
+        if not isinstance(self.supported_formats, list):
+            self.logger.warning(f"Invalid supported_formats provided:\n`{self.supported_formats}`\n")
+            self.supported_formats = SUPPORTED_FORMATS
 
     def collect_input_files(self,
                            input_paths: Union[List[str], List[Path]],
@@ -41,8 +56,13 @@ class BatchFileManager:
         Returns:
             A list of unique, valid file Paths.
         """
-        resolved_paths = [Path(os.path.expanduser(p)).resolve() for p in input_paths]
-        
+        reslved_paths = []
+        for p in input_paths:
+            try:
+                resolved_paths.append(Path(os.path.expanduser(p)).resolve())
+            except Exception as e:
+                self.logger.warning(f"Could not resolve path '{p}': {e}.  Skipping.")
+
         files_to_process = []
         seen_paths = set()
 
@@ -51,6 +71,7 @@ class BatchFileManager:
                 continue
                 
             if path.is_file():
+                # Use self.supported_formats
                 is_valid, msg = validate_file_path(
                     path,
                     check_existence=True,
@@ -105,17 +126,22 @@ class BatchFileManager:
             manifest_data = {
                 "created_at": datetime.now().isoformat(),
                 "file_count": len(files),
-                "files": [
-                    {
-                        "path": str(f.resolve()),
-                        "name": f.name,
-                        "size_bytes": f.stat().st_size,
-                        "modified_time": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
-                    }
-                    for f in files if f.exists()
-                ]
+                "files": []
             }
-            
+            for f in files:
+                try:
+                    if f.exists() and f.is_file():
+                        manifest_data["files"].append({
+                            "path": str(f.resolve()),
+                            "name": f.name,
+                            "size_bytes": f.stat().st_size,
+                            "modified_time": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                        })
+                    else:
+                        self.logger.warning(f"File not found or not a file, skipping from manifest: {f}")
+                except OSError as stat_err:
+                    self.logger.warning(f"Could not stat file '{f}'. skipping from manifest: {stat_err}")
+
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             with open(manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(manifest_data, f, indent=2)
@@ -144,22 +170,35 @@ class BatchFileManager:
         try:
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest_data = json.load(f)
-                
-            files = [Path(f["path"]) for f in manifest_data.get("files", [])]
-            # Optional: Add check for file existence
+
+            if "files" not in manifest_data or not isinstance(manifest_data["files"], list):
+                raise KeyError("Manifest format is incorrect (missing 'files' list).")
+
+            files: List[Path] = []
+            for file_entry in manifest_data.get("files", []):
+                if isinstance(file_entry, dict) and "path" in file_entry:
+                    try:
+                        files.append(Path(file_entry["path"]))
+                    except Exception as path_err:
+                        self.logger.warning(f"Invalid path in manifest entry, skipping: {file_entry.get('path')}: ({path_err}).")
+                else:
+                    self.logger.warning(f"Skipping invalid entry in manifest: {file_entry}")
+
+            # Optional check for file existence
             existing_files = [f for f in files if f.exists()]
             if len(existing_files) != len(files):
-                 self.logger.warning(f"Loaded {len(existing_files)} files from manifest. {len(files) - len(existing_files)} files were missing.")
+                missing_count = len(files) - len(existing_files)
+                self.logger.warning(f"Loaded {len(existing_files)} files from manifest. {missing_count} files not found.")
             else:
-                 self.logger.info(f"Loaded {len(existing_files)} files from manifest.")
+                self.logger.info(f"Loaded {len(existing_files)} files from manifest.")
             return existing_files
-            
+
         except json.JSONDecodeError as e:
-             self.logger.error(f"Failed to parse manifest file (invalid JSON): {manifest_path} - {e}")
-             return []
-        except KeyError:
-             self.logger.error(f"Failed to load manifest: File format is incorrect (missing 'files' key).")
-             return []
+            self.logger.error(f"Failed to parse manifest file (invalid JSON): {manifest_path} - {e}")
+            return []
+        except KeyError as e:
+            self.logger.error(f"Failed to load manifest: {e}")
+            return []
         except Exception as e:
             self.logger.error(f"Failed to load manifest {manifest_path}: {e}", exc_info=True)
             return []

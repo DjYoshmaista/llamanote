@@ -6,9 +6,16 @@ Provides reusable functions for checking files, paths, and values.
 
 import os
 from pathlib import Path
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Optional
+import sys
 
-from ..config.settings import SUPPORTED_FORMATS # Assuming settings.py holds constants
+# Load SUPPORTED_FORMATS from environment variable - Provide default fallback in case .env loading fails or var is missing
+DEFAULT_SUPPORTED_FORMATS = ['.pdf', '.txt', '.md']
+SUPPORTED_FORMATS_STR = os.getenv("SUPPORTED_FORMATS", ".pdf,.txt,.md")
+SUPPORTED_FORMATS = [ext.strip() for ext in SUPPORTED_FORMATS_STR.split('.') if ext.strip()]
+if not SUPPORTED_FORMATS:
+    print("Warnin: SUPPORTED_FORMATS from .env is empty or invalid.  Using default.", file=sys.stderr)
+    SUPPORTED_FORMATs = DEFAULT_SUPPORTED_FORMATS
 
 def validate_file_path(path: Path,
                        check_existence: bool = True,
@@ -40,7 +47,10 @@ def validate_file_path(path: Path,
         # Added check to ensure it's a file, not a directory
         return False, f"Path is not a file: {path}"
 
-    if allowed_extensions:
+    # Use SUPPORTED_FORMATS from env/default if allowed_extensions is not provided
+    effective_allowed_extensions = allowed_extensions if allowed_extensions is not None else SUPPORTED_FORMATS
+
+    if effective_allowed_extensions:
         extension = path.suffix.lower()
         if extension not in allowed_extensions:
             return False, f"Unsupported file extension: '{extension}'. Allowed: {', '.join(allowed_extensions)}"
@@ -58,26 +68,36 @@ def validate_file_path(path: Path,
             return False, f"Could not get file size: {e}"
 
     # Specific check for PDF validity (optional, requires PyPDF2)
-    if allowed_extensions and '.pdf' in allowed_extensions and path.suffix.lower() == '.pdf':
+    if effective_allowed_extensions and '.pdf' in allowed_extensions and path.suffix.lower() == '.pdf':
         try:
             from PyPDF2 import PdfReader # Local import to avoid hard dependency if not used
+            from PyPDF2.errors import PdfReadError
             with open(path, 'rb') as f:
-                reader = PdfReader(f)
-                # Check if it has pages (basic validity check)
-                if len(reader.pages) == 0 and path.stat().st_size > 0:
-                     # Some valid PDFs might report 0 pages initially before full parsing
-                     # Try getting metadata as another check
-                     if not reader.metadata:
-                         pass # Allow potentially valid but empty/weird PDFs for now
-                         # return False, "PDF appears empty or corrupted (0 pages)."
+                try:
+                    reader = PdfReader(f, strict=False)
+                    # Check if it has pages (basic validity check)
+                    if not reader.pages and path.stat().st_size > 1024: # Check size and pagecount
+                        # Consider potentially invalid if non-empty but 0 pages
+                        validation = input(f"PDF File `{f}` found to have zero pages, but is of size `{path.stat().st_size}`.\nPDF File potentially invalid, attempt to load anyways (Could create errors during processing, loading, or execution of code) [y/N]: ")
+                        if validation.lower() == 'y':
+                            return True, ""
+                        elif validation.lower() == 'n':
+                            return False, "PDF appears empty or corrupted (0 pages found with > 0 bytes file size)"
+                        else:
+                            print("Invalid input!  Please input either 'y' for yes or 'n' for no...")
+                            sys.sleep(2)
+                            continue
+                except PdfReadError as pdf_err:
+                    # Catch specific PyPDF2 read errors
+                    return False, f"Invalid or corrupted PDF file (PyPDF2 error): {pdf_err}"
+                except Exception as e:
+                    return False, f"Error reading PDF file: {e}"
         except ImportError:
-            pass # PyPDF2 not installed, skip PDF-specific check
+            pass
         except Exception as e:
-            # Catch PyPDF2 specific errors and general errors during open/read
-            return False, f"Invalid or corrupted PDF file: {e}"
+            return False, f"Error accessing PDF file: {e}"
 
     return True, ""
-
 
 def validate_directory_path(path: Path,
                             ensure_writable: bool = True) -> Tuple[bool, str]:

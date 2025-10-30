@@ -13,6 +13,7 @@ from typing import List, Any, Optional, Union
 from datetime import datetime
 
 from .logger import get_logger_conf
+from ..models.registry import ModelEntry
 
 # Attempt optional imports
 try:
