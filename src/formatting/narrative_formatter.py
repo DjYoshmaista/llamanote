@@ -19,7 +19,7 @@ class NarrativeFormatter(BaseFormatter):
     """
     
     def __init__(self):
-        super().__init__(style="narrative")
+        super().__init__(style_name="narrative")
         # Regex to identify lines that are likely dialogue
         # Matches lines starting with a quote or a hyphen/em-dash (common in fiction)
         self.dialogue_pattern = re.compile(r'^\s*["“\'—–-](.*?)["”\']?\s*$', re.MULTILINE)

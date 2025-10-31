@@ -153,7 +153,7 @@ class MemoryMonitor:
             delta_start_mb = (current_ram - (self.start_ram_bytes or current_ram)) / (1024 * 1024)
             delta_last_mb = (current_ram - (self.last_ram_bytes or current_ram)) / (1024 * 1024)
             log_messages.append(
-                    f"  RAM: {ram_mb:.1f} MB (ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb:*.1f} MB)"
+                    f"  RAM: {ram_mb:.1f} MB (ΔStart: {delta_start_mb:+.1f} MB, ΔLast: {delta_last_mb:+.1f} MB)"
                     )
             if abs(current_ram - (self.last_ram_bytes or current_ram)) > self.threshold_bytes:
                 log_worthy = True
@@ -171,7 +171,7 @@ class MemoryMonitor:
             peak_gpu_mb = (torch.cuda.max_memory_allocated() / (1024 * 1024)) if self.gpu_available else 0
 
             log_messages.append(
-                    f"  GPU: {gpu_mb:.1f} MB (Peak: {peak_gpu_mb:.1f} MB, ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb} MB)"
+                    f"  GPU: {gpu_mb:.1f} MB (Peak: {peak_gpu_mb:.1f} MB, ΔStart: {delta_start_mb:+.1f} MB, ΔLast: {delta_last_mb:+.1f} MB)"
                 )
             if abs(current_gpu - (self.last_gpu_bytes or current_gpu)) > self.threshold_bytes:
                 log_worthy = True

@@ -6,8 +6,9 @@ Implements the LLMBackend interface for running models locally using 'transforme
 
 import gc
 from pathlib import Path
-from typing import Optional, Dict, Any
-from ..utils.helpers import DynamicTokenLimitCalculator
+from typing import Optional, Dict, Any, Tuple
+from ...utils.helpers import DynamicTokenLimitCalculator
+import time
 
 # Third-party imports
 try:
@@ -59,7 +60,8 @@ from ...models.hyperparameters import HyperparameterConfig
 from ...models.registry import ModelEntry
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.helpers import cleanup_resources, get_device_manager
-from ...config.settings import DEFAULT_DEFAULT_CACHE_DIR, OFFLOAD_DIR
+from ...utils.decorators import log_execution_time, log_resource_usage
+from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_OFFLOAD_DIR
 
 logger = get_logger_conf(__name__)
 
@@ -95,7 +97,7 @@ class LocalModelLoader:
             self.load_config["device_map"] = "auto"
             self.load_config["max_memory"] = self.split_config.get_max_memory_dict()
             self.load_config["low_cpu_mem_usage"] = True
-            offload_dir = self.split_config.offload_folder or OFFLOAD_DIR
+            offload_dir = self.split_config.offload_folder or DEFAULT_OFFLOAD_DIR
             if self.split_config.offload_state_dict or offload_dir:
                  self.load_config["offload_folder"] = str(offload_dir)
                  self.load_config["offload_state_dict"] = self.split_config.offload_state_dict
@@ -210,6 +212,7 @@ class LocalHFBackend(LLMBackend):
             raise ImportError("LocalHFBackend requires 'torch' and 'transformers'.")
 
         super().__init__("local_hf", model_id, hyperparams)
+        self.model_id = model_id  # Store for compatibility with helper classes
         self.model_entry = model_entry
         self.quant_config = quant_config
         self.split_config = split_config
@@ -219,9 +222,10 @@ class LocalHFBackend(LLMBackend):
         # These helpers depend on the model_entry
         self.response_filter = ResponseFilter(self.model_entry)
         self.token_calculator = DynamicTokenLimitCalculator(
-            model_max_context=self.model_entry.max_context
+            model_config=self.model_entry
         )
-        self.device = get_device_manager().get_device()
+        self.device_manager = get_device_manager()
+        self.device = self.device_manager.get_device()
         self.logger.info(f"Initialized LocalHFBackend for {self.model_id}")
 
     @log_execution_time(logger_name=__name__)

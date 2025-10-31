@@ -13,12 +13,13 @@ from ..utils.logger import get_logger_conf, LoggingProgress, MemoryMonitor, Cons
 from ..utils.decorators import log_execution_time
 from ..config.settings import (
     DEFAULT_PIPELINE_STAGES, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT,
-    INCLUDE_METADATA, TIMESTAMP_OUTPUTS
+    INCLUDE_METADATA, TIMESTAMP_OUTPUTS, DEFAULT_OUTPUT_DIR,
+    MAX_CHARS_PER_FILE, MAX_PDF_SIZE_MB
 )
 from ..config.manager import ConfigManager # For loading defaults if needed
 from .types import (
     ProcessingMode, PipelineConfig, PipelineResult, AudioConfig,
-    ExtractionResult, ChunkingResult, FilterResult
+    ExtractionResult, ChunkingResult, FilterResult, PDFMetadata
 )
 from ..processing.pdf_extractor import PDFProcessor
 from ..processing.text_preprocessor import TextPreprocessor
@@ -29,7 +30,7 @@ from ..io.file_handler import FileHandler
 from ..io.checkpoints import CheckpointManager
 from ..models.backends.base import LLMBackend, AudioBackend
 from ..models.registry import get_model_entry, ModelEntry
-from .errors import PipelineError, MissingDataError
+from .errors import PipelineError, MissingDataError, ModelLoadError, FileProcessingError, GenerationError
 
 logger = get_logger_conf(__name__)
 
@@ -425,7 +426,27 @@ class ProcessingPipeline:
         )
         self.file_handler.record_processed_file(result)
         return result
-        
+
+    def _gather_statistics(self, data_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Gather all statistics from data_payload into a single dictionary.
+
+        Args:
+            data_payload: The data payload dictionary containing stats_* keys
+
+        Returns:
+            A dictionary containing all collected statistics
+        """
+        statistics = {}
+
+        # Collect all stats_* keys from data_payload
+        for key, value in data_payload.items():
+            if key.startswith('stats_'):
+                # Remove 'stats_' prefix and add to statistics
+                stat_name = key.replace('stats_', '')
+                statistics[stat_name] = value
+
+        return statistics
 
     def process_batch(self,
                      input_files: List[Path],

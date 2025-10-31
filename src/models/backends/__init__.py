@@ -58,9 +58,12 @@ except ImportError:
 try:
     from .local_audio import LocalAudioBackend
     TTS_TRANSFORMERS_AVAILABLE = True # Assumes transformers is needed
-except ImportError:
+except ImportError as e:
     LocalAudioBackend = None
     TTS_TRANSFORMERS_AVAILABLE = False
+    # Log the actual import error for debugging
+    import logging
+    logging.getLogger(__name__).warning(f"LocalAudioBackend not available: {e}")
     
 try:
     from .openai_audio import OpenAITTSBackend
@@ -115,8 +118,8 @@ def get_llm_backend(
                 model_id=model_specifier,
                 model_entry=model_entry,
                 quant_config=quantization_config or QuantizationConfig(),
-                layer_split_config=layer_split_config or LayerSplitConfig(),
-                hyperparameters=hyperparameters
+                split_config=layer_split_config or LayerSplitConfig(),
+                hyperparams=hyperparameters
             )
 
         elif provider_lower == "local_gguf":
@@ -206,7 +209,7 @@ def get_audio_backend(
     try:
         if provider_lower == "local_audio":
             if not TTS_TRANSFORMERS_AVAILABLE:
-                raise ImportError("Required libraries for local TTS (transformers, datasets) not installed.")
+                raise ImportError("LocalAudioBackend not available. Check that transformers, datasets, torch, and numpy are installed.")
             return LocalAudioBackend(config=config, model_specifier=model_specifier)
         
         elif provider_lower == "openai_audio":

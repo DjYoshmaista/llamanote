@@ -55,7 +55,7 @@ class PodcastFormatter(BaseFormatter):
     """
     
     def __init__(self):
-        super().__init__(style="podcast")
+        super().__init__(style_name="podcast")
         self.speaker_counter = 0
         self.current_speaker = "Host" # Default start
         self.speaker_pattern = re.compile(r"^\s*\[?\s*(SPEAKER \w+|HOST|GUEST)\s*\]?:\s*", re.IGNORECASE)
@@ -158,11 +158,13 @@ class PodcastFormatter(BaseFormatter):
 
         if add_emotions:
             # Detect primary emotion for the line
-            emotion = self.emotion_detector.detect_from_patterns(line, PodcastEmotionPatterns)
+            # Convert Enum to dictionary for pattern matching
+            emotion_patterns = {member: member.value for member in PodcastEmotionPatterns}
+            emotion = self.emotion_detector.detect_from_patterns(line, emotion_patterns)
             
             # Apply emotion marker from style config
-            if emotion and emotion.value in self.style_config.emotion_markers:
-                marker_template = self.style_config.emotion_markers[emotion.value]
+            if emotion and emotion.name.lower() in self.style_config.emotion_markers:
+                marker_template = self.style_config.emotion_markers[emotion.name.lower()]
                 line = marker_template.format(line)
 
             # Apply emphasis (this is a simple example)

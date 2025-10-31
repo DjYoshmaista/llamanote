@@ -19,6 +19,20 @@ logger = get_logger_conf(__name__)
 # Location of the presets file (relative to this file)
 PRESETS_FILE = Path(__file__).parent / "hyperparameter_presets.json"
 
+# Original preprocessing prompt (kept as is)
+PREPROCESS_PROMPT = """
+You are a world class text pre-processor, here is the raw data from a PDF. Please parse and return it in a way that is crispy and usable to send to a podcast writer.
+The raw data is riddled with new line breaks, LaTeX math, and you will see fluff that you should remove completely. Remove, or alternatively translate, any details or data that would be lost, useless, misunderstood, or simply lost in translation from a pure text and raw data format to the audio podcast format.
+Remember, the podcast could be on any one topic, or even on a myriad of topics, so the issues listed above are not necessarily exhaustive in scope.
+Take care with what you remove, and do so intelligently, yet creatively please.
+DO NOT START SUMMARIZING THIS. This should be a rule which is constantly and consistently at the forefront of your logic and processing as you preprocess the data into usable text. YOU ARE ONLY CLEANING UP THE TEXT AND RE-WRITING WHEN NEEDED.
+Be very smart, yet aggressive, with removing details. You will get a running portion of the text and keep returning the processed text.
+PLEASE DO NOT ADD MARKDOWN FORMATTING, STOP ADDING SPECIAL CHARACTERS THAT MARKDOWN CAPITALIZATION LENDS ITSELF TO
+ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS about my questions, period, end of discussion. Okay?
+
+Here's the text:
+"""
+
 # --- Default Presets (Hardcoded fallback if file is missing/invalid) ---
 DEFAULT_PRESETS = {
     "creative": {

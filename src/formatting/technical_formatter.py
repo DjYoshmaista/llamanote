@@ -19,7 +19,7 @@ class TechnicalFormatter(BaseFormatter):
     """
     
     def __init__(self):
-        super().__init__(style="technical")
+        super().__init__(style_name="technical")
         
         # Patterns for identifying inline code
         self.inline_code_patterns = [

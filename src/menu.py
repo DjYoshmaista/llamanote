@@ -26,7 +26,7 @@ from .config.settings import (
     MAX_RETRIES, FALLBACK_ON_ERROR
 )
 from .config.profiles import list_memory_profiles, create_configs_from_memory_profile, get_memory_profile
-from .config.presets import list_hyperparameter_presets, get_hyperparameter_preset
+from .config.presets import list_hyperparameter_presets, get_hyperparameter_preset, PREPROCESS_PROMPT 
 
 from .core.types import (
     ProcessingMode, PipelineConfig, PipelineResult,
@@ -153,14 +153,15 @@ class AppState:
     stages_to_run: List[str] = field(default_factory=lambda: list(DEFAULT_PIPELINE_STAGES))
     run_audio_generation: bool = False
     cloud_api_keys: Dict[str, str] = field(default_factory=dict) # Loaded at runtime
+    system_prompt: Optional[str] = PREPROCESS_PROMPT # Custom system prompt (if None, use defaults)
 
     # --- Local model compute settings ---
     memory_profile: str = "medium_vram"
     # These are now *derived* from the profile but can be overridden
     quantization: str = "4bit"
     gpu_layers: int = DEFAULT_GPU_LAYERS
-    max_gpu_memory: str = "10GB"
-    max_cpu_memory: str = "30GB"
+    max_gpu_memory: str = "4GiB"
+    max_cpu_memory: str = "24GiB"
 
     def __post_init__(self):
         """Update compute settings from default profile."""
@@ -224,7 +225,8 @@ class AppState:
             
             self.stages_to_run = data.get("stages_to_run", list(DEFAULT_PIPELINE_STAGES))
             self.run_audio_generation = data.get("run_audio_generation", False)
-            
+            self.system_prompt = data.get("system_prompt", PREPROCESS_PROMPT)
+
             # Load compute settings
             self.memory_profile = data.get("memory_profile", "medium_vram")
             self.quantization = data.get("quantization", DEFAULT_QUANTIZATION)
@@ -267,7 +269,7 @@ class AppState:
             layer_split_config.max_gpu_memory = {i: self.max_gpu_memory for i in layer_split_config.max_gpu_memory.keys()}
         
         # 3. Determine System Prompt
-        system_prompt_str = self.hyperparameters.system_prompt # Check if user set one
+        system_prompt_str = self.system_prompt # Check if user set one
         if not system_prompt_str:
             system_prompt_str = PREPROCESS_PROMPT_PODCAST if self.processing_mode == ProcessingMode.PODCAST else DEFAULT_SYSTEM_PROMPT
 
@@ -1503,9 +1505,10 @@ class MenuSystem:
          overall_success = True
 
          try:
-             # 2. Initialize Text Backend (if text stages are selected)
-             text_stages_selected = any(s in pipeline_config.stages for s in DEFAULT_PIPELINE_STAGES if s != 'save')
-             if text_stages_selected:
+             # 2. Initialize Text Backend (only if 'process' stage is selected)
+             # Only the 'process' stage actually needs the LLM backend
+             needs_llm = 'process' in pipeline_config.stages
+             if needs_llm:
                  ConsoleOutput.info(f"Initializing Text Backend ({pipeline_config.model_provider})...")
                  start_init = time.time()
                  
@@ -1567,11 +1570,9 @@ class MenuSystem:
                  ConsoleOutput.success(f"Audio backend initialized in {init_time_audio:.2f}s.")
 
              # 4. Initialize Pipeline object and inject dependencies
-             pipeline = ProcessingPipeline(
-                 config=pipeline_config,
-                 llm_backend=text_backend, # Inject (can be None)
-                 audio_backend=audio_backend # Inject (can be None)
-             )
+             pipeline = ProcessingPipeline(config=pipeline_config)
+             pipeline.llm_backend = text_backend  # Inject (can be None)
+             pipeline.audio_backend = audio_backend  # Inject (can be None)
 
              # 5. Run Processing
              if len(self.state.input_files) == 1:

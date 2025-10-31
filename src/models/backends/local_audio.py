@@ -14,12 +14,12 @@ from typing import Optional, List, Dict, Any
 from .base import AudioBackend
 from ...core.types import AudioConfig, AudioResult
 from ...core.errors import ModelLoadError, GenerationError
-from ...utils.logger import get_logger_conf, LoggingProgress
+from ...utils.logger import get_logger_conf, ConsoleOutput, LoggingProgress
 from ...utils.decorators import log_execution_time
 from ...utils.helpers import get_device_manager, cleanup_resources
 from ...models.hub import ModelHub
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
-from ...config.settings import DEFAULT_DEFAULT_CACHE_DIR
+from ...config.settings import DEFAULT_CACHE_DIR
 
 # --- Lazy Imports for transformers components ---
 _AutoProcessor = None
@@ -75,11 +75,11 @@ class LocalAudioBackend(AudioBackend):
         "bark": ["suno/bark", "suno/bark-small"],
         "mms": ["facebook/mms-tts-eng"],
         "vits": ["facebook/mms-tts-eng"], # MMS uses VITS
-        "vibevoice": ["vibevoice/vibevoice"],
+        "vibevoice": ["vibevoice/vibevoice", "microsoft/vibevoice-1.5b"],
     }
 
     def __init__(self, config: AudioConfig, model_specifier: str):
-        super().__init__(config, model_specifier)
+        super().__init__("local_audio", model_specifier, config)
         _import_transformers() # Ensure transformers is available
         
         self.model = None
@@ -113,8 +113,7 @@ class LocalAudioBackend(AudioBackend):
             if not self.model_hub.is_model_cached(model_id): # This checks registry, might need to check hub cache path
                 self.logger.info(f"Model not cached, downloading: {model_id}")
                 # Note: model_hub.download_model uses snapshot_download
-                model_path = self.model_hub.download_model(model_id, 
-                                                            cache_dir=self.model_hub.model_cache_dir)
+                model_path = self.model_hub.download_model(model_id)
                 if not model_path:
                     raise ModelLoadError(f"Failed to download model: {model_id}")
                 self.logger.info(f"Model downloaded to: {model_path}")
@@ -136,7 +135,7 @@ class LocalAudioBackend(AudioBackend):
                 self._load_vits_model(model_id)
                 loaded = True
             elif any(term.lower() in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
-                self._load_generic_pipeline(model_id)
+                self._load_vibevoice_model(model_id)
                 loaded = True
 
             if not loaded:
@@ -184,10 +183,10 @@ class LocalAudioBackend(AudioBackend):
 
     def _load_speecht5_model(self, model_id: str):
         load_dataset = _import_datasets() # Ensure datasets is available
-        
+
         self.processor = _SpeechT5Processor.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
         self.model = _SpeechT5ForTextToSpeech.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
-        
+
         # Vocoder is essential for SpeechT5
         try:
             vocoder_id = "microsoft/speecht5_hifigan"
@@ -200,11 +199,16 @@ class LocalAudioBackend(AudioBackend):
         if self.config.speaker_embedding:
             self.logger.warning("Custom speaker embeddings not yet supported, using default.")
             # TODO: Add logic to load custom embedding path/ID
-            
+
         if self.speaker_embeddings is None:
+             self.logger.info("Loading default speaker embeddings (cmu-arctic-xvectors)...")
              try:
-                 self.logger.info("Loading default speaker embeddings (cmu-arctic-xvectors)...")
-                 self.embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", cache_dir=DEFAULT_CACHE_DIR / "datasets")
+                 # Try loading without trust_remote_code first (for converted datasets)
+                 self.embeddings_dataset = load_dataset(
+                     "Matthijs/cmu-arctic-xvectors",
+                     split="validation",
+                     cache_dir=DEFAULT_CACHE_DIR / "datasets"
+                 )
                  # Use a common, generic-sounding speaker
                  default_speaker_idx = 7306 # Example index
                  self.speaker_embeddings = torch.tensor(
@@ -212,10 +216,58 @@ class LocalAudioBackend(AudioBackend):
                  ).unsqueeze(0).to(self.device)
                  self.logger.info(f"Using default speaker embedding index: {default_speaker_idx}")
              except Exception as e:
-                 self.logger.error(f"Failed to load speaker embeddings: {e}. SpeechT5 may not work.", exc_info=True)
-                 raise ModelLoadError("Failed to load SpeechT5 speaker embeddings", model_id) from e
+                 self.logger.warning(f"Could not load embeddings dataset: {e}. Trying alternative method...")
+                 # Fallback: Use a bundled default embedding
+                 try:
+                     self._load_default_speaker_embedding()
+                 except Exception as e2:
+                     self.logger.error(f"Failed to load speaker embeddings: {e2}. SpeechT5 may not work.", exc_info=True)
+                     raise ModelLoadError("Failed to load SpeechT5 speaker embeddings", model_id) from e2
 
         self.config.sample_rate = 16000 # SpeechT5 standard
+
+    def _load_default_speaker_embedding(self):
+        """Load a default speaker embedding as fallback when dataset loading fails."""
+        from huggingface_hub import hf_hub_download
+        import json
+
+        self.logger.info("Loading default speaker embedding from HuggingFace Hub...")
+
+        try:
+            # Try to download parquet file from the auto-converted dataset
+            parquet_file = hf_hub_download(
+                repo_id="Matthijs/cmu-arctic-xvectors",
+                filename="data/validation-00000-of-00001.parquet",
+                repo_type="dataset",
+                cache_dir=DEFAULT_CACHE_DIR / "datasets"
+            )
+
+            # Load parquet using pandas
+            import pandas as pd
+            df = pd.read_parquet(parquet_file)
+
+            # Get a speaker embedding (use index 7306 like before, or first if not available)
+            if len(df) > 7306:
+                embedding_data = df.iloc[7306]['xvector']
+            else:
+                embedding_data = df.iloc[0]['xvector']
+
+            # Convert to numpy array if needed
+            if isinstance(embedding_data, list):
+                embedding_array = np.array(embedding_data, dtype=np.float32)
+            else:
+                embedding_array = np.array(embedding_data, dtype=np.float32)
+
+            self.speaker_embeddings = torch.tensor(embedding_array).unsqueeze(0).to(self.device)
+            self.logger.info("Loaded default speaker embedding from parquet file.")
+
+        except Exception as e:
+            self.logger.warning(f"Could not load from parquet file: {e}. Using hardcoded embedding.")
+            # Fallback: Use a zero/random embedding (this may produce poor quality audio)
+            # A proper embedding should be 512-dimensional for SpeechT5
+            default_embedding = np.random.randn(512).astype(np.float32) * 0.1
+            self.speaker_embeddings = torch.tensor(default_embedding).unsqueeze(0).to(self.device)
+            self.logger.warning("Using random speaker embedding. Audio quality may be degraded.")
 
     def _load_vits_model(self, model_id: str):
         # Covers MMS and potentially other VITS models
@@ -227,6 +279,40 @@ class LocalAudioBackend(AudioBackend):
              self.config.sample_rate = 22050 # Common VITS default
         self.logger.info(f"VITS/MMS model loaded. Sample Rate: {self.config.sample_rate}Hz")
 
+
+    def _load_vibevoice_model(self, model_id: str):
+        """Load VibeVoice model with trust_remote_code support."""
+        self.logger.info(f"Loading VibeVoice model: {model_id}")
+
+        try:
+            # VibeVoice requires trust_remote_code for custom architecture
+            # Load processor/tokenizer
+            self.processor = _AutoProcessor.from_pretrained(
+                model_id,
+                cache_dir=DEFAULT_CACHE_DIR,
+                trust_remote_code=True
+            )
+
+            # Load model with custom architecture support
+            dtype = torch.float16 if self.config.use_half_precision and self.device == "cuda" else torch.float32
+            self.model = _AutoModel.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                cache_dir=DEFAULT_CACHE_DIR,
+                trust_remote_code=True
+            ).to(self.device)
+
+            # Get sample rate from config if available
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'sampling_rate'):
+                self.config.sample_rate = self.model.config.sampling_rate
+            else:
+                self.config.sample_rate = 22050  # Default fallback
+
+            self.logger.info(f"VibeVoice model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load VibeVoice model: {e}", exc_info=True)
+            raise ModelLoadError(f"Failed to load VibeVoice: {e}", model_id) from e
 
     def _load_generic_pipeline(self, model_id: str):
         """Load generic TTS model using pipeline with enhanced diagnostics."""
@@ -364,7 +450,37 @@ class LocalAudioBackend(AudioBackend):
         if not self.model or not self.processor or self.speaker_embeddings is None:
             self.logger.error("SpeechT5 components not fully loaded.")
             return None
-        inputs = self.processor(text=text, return_tensors="pt").to(self.device)
+
+        # SpeechT5 has a max sequence length of 600 tokens
+        # Check if text is too long and split if necessary
+        MAX_TOKENS = 590  # Use slightly less than 600 for safety
+        inputs = self.processor(text=text, return_tensors="pt")
+
+        if inputs["input_ids"].shape[1] > MAX_TOKENS:
+            self.logger.warning(f"Text chunk has {inputs['input_ids'].shape[1]} tokens, exceeding SpeechT5 limit of {MAX_TOKENS}. Splitting further...")
+
+            # Split the text into smaller pieces
+            words = text.split()
+            mid = len(words) // 2
+            first_half = ' '.join(words[:mid])
+            second_half = ' '.join(words[mid:])
+
+            # Recursively generate for each half
+            audio1 = self._generate_speecht5(first_half)
+            audio2 = self._generate_speecht5(second_half)
+
+            if audio1 is not None and audio2 is not None:
+                # Combine the two halves
+                return np.concatenate([audio1, audio2])
+            elif audio1 is not None:
+                return audio1
+            elif audio2 is not None:
+                return audio2
+            else:
+                return None
+
+        # Text is within limits, generate normally
+        inputs = inputs.to(self.device)
         with torch.no_grad():
             if self.vocoder:
                 speech = self.model.generate_speech(
@@ -375,7 +491,7 @@ class LocalAudioBackend(AudioBackend):
                  self.logger.warning("No vocoder for SpeechT5. Output may be low quality or unusable.")
                  # This path likely fails if a vocoder is required to get waveform
                  speech = spectrogram # This is likely wrong
-        
+
         self.config.sample_rate = 16000 # SpeechT5 fixed SR
         return speech.cpu().numpy().squeeze()
 

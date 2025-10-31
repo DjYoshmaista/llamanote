@@ -210,18 +210,113 @@ class AudioBackend(abc.ABC):
                       **kwargs) -> Optional[AudioResult]:
         """
         Generate audio from text and save to output_path.
-        
+
         Args:
             text: The text to synthesize.
             output_path: The *base* path (without extension) to save the audio.
                          The final extension will be determined by config.
             chunk_text: Whether to split long text into chunks.
-            
+
         Returns:
             An AudioResult object or None on failure.
         """
         pass
-        
+
+    def _resolve_output_path(self, output_path: Optional[Path]) -> Path:
+        """
+        Resolve the output path with the correct extension based on config.
+
+        Args:
+            output_path: Optional path (with or without extension)
+
+        Returns:
+            Path with the correct extension from config.output_format
+        """
+        if output_path is None:
+            raise ValueError("output_path cannot be None")
+
+        # Ensure proper extension
+        target_ext = f".{self.config.output_format.lower()}"
+        if output_path.suffix.lower() != target_ext:
+            output_path = output_path.with_suffix(target_ext)
+
+        return output_path
+
+    def _split_text(self, text: str) -> List[str]:
+        """
+        Split text into chunks based on config.chunk_size.
+
+        Args:
+            text: The text to split
+
+        Returns:
+            List of text chunks
+        """
+        chunk_size = self.config.chunk_size
+        if len(text) <= chunk_size:
+            return [text]
+
+        chunks = []
+        # Split by sentences or paragraphs when possible
+        # For now, simple chunking with word boundary awareness
+        words = text.split()
+        current_chunk = []
+        current_length = 0
+
+        for word in words:
+            word_length = len(word) + 1  # +1 for space
+            if current_length + word_length > chunk_size and current_chunk:
+                # Save current chunk
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_length = word_length
+            else:
+                current_chunk.append(word)
+                current_length += word_length
+
+        # Add remaining words
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        return chunks
+
+    def _combine_audio(self, audio_arrays: List, sample_rate: int):
+        """
+        Combine multiple audio arrays into a single array.
+
+        Args:
+            audio_arrays: List of numpy arrays containing audio data
+            sample_rate: Sample rate of the audio
+
+        Returns:
+            Combined numpy array or None on failure
+        """
+        try:
+            import numpy as np
+
+            if not audio_arrays:
+                return None
+
+            if len(audio_arrays) == 1:
+                return audio_arrays[0]
+
+            # Add small silence between chunks (100ms)
+            silence_samples = int(sample_rate * 0.1)
+            silence = np.zeros(silence_samples, dtype=np.float32)
+
+            # Combine with silence between
+            combined = []
+            for i, audio in enumerate(audio_arrays):
+                combined.append(audio)
+                if i < len(audio_arrays) - 1:  # Don't add silence after last chunk
+                    combined.append(silence)
+
+            return np.concatenate(combined)
+
+        except Exception as e:
+            self.logger.error(f"Failed to combine audio arrays: {e}")
+            return None
+
     @property
     def provider_identifier(self) -> str:
         """Returns the provider name (e.g., 'local_audio', 'openai_audio')."""

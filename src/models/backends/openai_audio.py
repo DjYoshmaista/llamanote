@@ -11,9 +11,10 @@ from typing import Optional, Dict
 from .base import AudioBackend
 from ...core.types import AudioConfig, AudioResult
 from ...core.errors import ModelLoadError, GenerationError
-from ...utils.logger import get_logger_conf, ConsoleOutput
+from ...utils.logger import get_logger_conf, ConsoleOutput, LoggingProgress
 from ...utils.decorators import log_execution_time
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
+from ...config.settings import DEFAULT_CACHE_DIR
 
 # Try importing OpenAI library
 try:
@@ -35,7 +36,7 @@ class OpenAIAudioBackend(AudioBackend):
                  config: AudioConfig,
                  model_specifier: str, # e.g., "tts-1", "tts-1-hd"
                  api_key: str):
-        super().__init__(config, model_specifier)
+        super().__init__("openai_audio", model_specifier, config)
         
         if not OPENAI_AVAILABLE:
             raise ImportError("OpenAI library not installed. Run 'pip install openai'")
@@ -129,7 +130,8 @@ class OpenAIAudioBackend(AudioBackend):
              with LoggingProgress(logger, f"OpenAI TTS generation", len(text_chunks)) as progress:
                  for i, chunk in enumerate(text_chunks):
                       # Create a unique temp path for this chunk
-                      chunk_temp_path = self.cache_dir / f"openai_chunk_{int(time.time()*1000)}_{i}.{api_format}"
+                      chunk_temp_path = DEFAULT_CACHE_DIR / "audio_temp" / f"openai_chunk_{int(time.time()*1000)}_{i}.{api_format}"
+                      chunk_temp_path.parent.mkdir(parents=True, exist_ok=True)
                       
                       response = self.model_handle.audio.speech.create(
                           model=self.model_specifier,

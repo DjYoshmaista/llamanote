@@ -22,6 +22,7 @@ from tqdm import tqdm # Assuming tqdm is a dependency
 from ..utils.logger import get_logger_conf, ConsoleOutput # Use new logger
 from ..utils.decorators import log_execution_time
 from ..config.settings import DEFAULT_CACHE_DIR # Use central settings
+from .registry import get_registry
 
 logger = get_logger_conf(__name__)
 

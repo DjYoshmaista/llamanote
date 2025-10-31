@@ -18,7 +18,7 @@ from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.decorators import log_execution_time
 from ...utils.helpers import cleanup_resources
 from ..hyperparameters import HyperparameterConfig
-from ...config.settings import DEFAULT_DEFAULT_CACHE_DIR, DEFAULT_GPU_LAYERS
+from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_GPU_LAYERS
 from ...core.types import GenerationResult
 from ...core.errors import ModelLoadError, GenerationError, ConfigurationError
 from .base import LLMBackend # Import the abstract base class
@@ -233,15 +233,15 @@ class LlamaCppBackend(LLMBackend):
 
     def _generate_request(self,
                           prompt: str,
-                          hp_override: HyperparameterConfig,
+                          hyperparams: HyperparameterConfig,
                           **kwargs) -> GenerationResult:
         """Internal generation logic for llama.cpp"""
-        
+
         # Get stop tokens from kwargs if provided (e.g., by chat template)
         stop = kwargs.get("stop", [])
-        
+
         # Map generic hypers to llama-cpp specific ones
-        gen_kwargs = HyperparamMapper.get_llama_cpp_config(hp_override, self.config.n_ctx)
+        gen_kwargs = HyperparamMapper.get_llama_cpp_config(hyperparams, self.config.n_ctx)
         
         # Add/override stop tokens
         if stop:
@@ -282,7 +282,7 @@ class LlamaCppBackend(LLMBackend):
     def _chat_request(self,
                       system_prompt: str,
                       user_message: str,
-                      hp_override: HyperparameterConfig,
+                      hyperparams: HyperparameterConfig,
                       **kwargs) -> GenerationResult:
         """
         Process text using llama_cpp's chat handler.
@@ -290,14 +290,14 @@ class LlamaCppBackend(LLMBackend):
         """
         if self.model_handle is None:
             raise RuntimeError("GGUF model not loaded. Call load_model() first.")
-            
+
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_message})
 
         # Map generic hypers to llama-cpp specific ones
-        gen_kwargs = HyperparamMapper.get_llama_cpp_config(hp_override, self.config.n_ctx)
+        gen_kwargs = HyperparamMapper.get_llama_cpp_config(hyperparams, self.config.n_ctx)
         
         self.logger.debug(f"Generating chat with llama.cpp params: {gen_kwargs}")
 

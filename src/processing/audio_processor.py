@@ -51,6 +51,14 @@ def get_librosa():
 class AudioPostProcessor:
     """A class for applying post-processing effects to audio files."""
 
+    def get_sf(self):
+        """Instance method to access soundfile."""
+        return get_sf()
+
+    def get_librosa(self):
+        """Instance method to access librosa."""
+        return get_librosa()
+
     @staticmethod
     def _load_audio(path: Path, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
         """Loads an audio file using librosa, handling potential errors."""
@@ -63,16 +71,17 @@ class AudioPostProcessor:
             raise FileProcessingError(f"Failed to load audio: {e}", str(path))
 
     @staticmethod
-    def _save_audio(path: Path, audio: np.ndarray, sr: int, format: str = "wav", subtype: str = 'PCM_16'):
+    def _save_audio(path: Path, audio: np.ndarray, sr: int, format: str = "wav", subtype: str = 'PCM_16') -> Optional[Path]:
         """Saves an audio array to a file using soundfile."""
         sf = get_sf()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             sf.write(path, audio, sr, subtype=subtype, format=format.upper())
             logger.info(f"Saved post-processed audio to {path}")
+            return path
         except Exception as e:
             logger.error(f"Failed to save audio file {path}: {e}", exc_info=True)
-            raise FileProcessingError(f"Failed to save audio: {e}", str(path))
+            return None
 
     @staticmethod
     def _normalize(audio: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
@@ -83,6 +92,55 @@ class AudioPostProcessor:
         if max_val > 1e-6: # Avoid division by zero
             return (audio / max_val) * target_peak
         return audio # Return silent audio as-is
+
+    @staticmethod
+    def _post_process_audio(audio: np.ndarray,
+                           sample_rate: int,
+                           speed: float = 1.0,
+                           pitch_shift: float = 0.0,
+                           volume_normalize: bool = True) -> np.ndarray:
+        """
+        Apply post-processing effects to audio.
+
+        Args:
+            audio: Input audio array
+            sample_rate: Sample rate of the audio
+            speed: Speed multiplier (>1.0 = faster, <1.0 = slower)
+            pitch_shift: Pitch shift in semitones (positive = higher, negative = lower)
+            volume_normalize: Whether to normalize volume
+
+        Returns:
+            Processed audio array
+        """
+        librosa = get_librosa()
+        processed = audio.copy()
+
+        # Apply speed adjustment
+        if speed != 1.0 and speed > 0:
+            try:
+                processed = librosa.effects.time_stretch(processed, rate=speed)
+                logger.debug(f"Applied speed adjustment: {speed}x")
+            except Exception as e:
+                logger.warning(f"Failed to apply speed adjustment: {e}")
+
+        # Apply pitch shift
+        if pitch_shift != 0.0:
+            try:
+                processed = librosa.effects.pitch_shift(
+                    processed,
+                    sr=sample_rate,
+                    n_steps=pitch_shift
+                )
+                logger.debug(f"Applied pitch shift: {pitch_shift} semitones")
+            except Exception as e:
+                logger.warning(f"Failed to apply pitch shift: {e}")
+
+        # Normalize volume
+        if volume_normalize:
+            processed = AudioPostProcessor._normalize(processed, target_peak=0.95)
+            logger.debug("Applied volume normalization")
+
+        return processed
 
     @staticmethod
     @log_execution_time(logger_name=__name__)
