@@ -61,6 +61,7 @@ from ...models.registry import ModelEntry
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.helpers import cleanup_resources, get_device_manager
 from ...utils.decorators import log_execution_time, log_resource_usage
+from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_OFFLOAD_DIR
 
 logger = get_logger_conf(__name__)
@@ -71,18 +72,20 @@ class LocalModelLoader:
     """Helper class to consolidate the logic for loading HF Transformers models."""
     
     def __init__(self, model_id: str, quant_config: QuantizationConfig, 
-                 split_config: LayerSplitConfig, trust_remote_code: bool):
+                 split_config: LayerSplitConfig, trust_remote_code: bool, config_manager: ConfigManager):
         self.model_id = model_id
         self.quant_config = quant_config
         self.split_config = split_config
         self.trust_remote_code = trust_remote_code
+        self.config_manager = config_manager
+        self.model_cache_dir = self.config_manager.get_dir("model_cache")
         self.device_manager = get_device_manager()
         self.load_config = {}
 
     def build_load_config(self) -> Dict[str, Any]:
         """Builds the kwargs dictionary for AutoModelForCausalLM.from_pretrained."""
         self.load_config = {
-            "cache_dir": str(DEFAULT_CACHE_DIR),
+            "cache_dir": str(self.model_cache_dir),
             "trust_remote_code": self.trust_remote_code
         }
         
@@ -138,7 +141,7 @@ class LocalModelLoader:
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
-                cache_dir=str(DEFAULT_CACHE_DIR),
+                cache_dir=str(self.model_cache_dir),
                 use_fast=True,
                 trust_remote_code=self.trust_remote_code
             )
@@ -164,7 +167,7 @@ class LocalModelLoader:
             if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
                 logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
                 fallback_config = {
-                    "cache_dir": str(DEFAULT_CACHE_DIR),
+                    "cache_dir": str(self.model_cache_dir),
                     "trust_remote_code": self.trust_remote_code,
                     "torch_dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
                     "device_map": "auto",
@@ -181,7 +184,7 @@ class LocalModelLoader:
             if load_config.get("device_map") != {"": "cpu"}:
                  logger.warning("Falling back to CPU-only load.")
                  cpu_config = {
-                    "cache_dir": str(DEFAULT_CACHE_DIR),
+                    "cache_dir": str(self.model_cache_dir),
                     "trust_remote_code": self.trust_remote_code,
                     "torch_dtype": torch.float32,
                     "device_map": {"": "cpu"},
@@ -228,21 +231,22 @@ class LocalHFBackend(LLMBackend):
         self.device = self.device_manager.get_device()
         self.logger.info(f"Initialized LocalHFBackend for {self.model_id}")
 
-    @log_execution_time(logger_name=__name__)
-    @log_resource_usage(logger_name=__name__)
-    def load(self, trust_remote_code: bool = True, **kwargs) -> bool:
-        """Loads the model and tokenizer using the ModelLoader helper."""
-        if self.is_loaded and self.model_handle is not None:
-            self.logger.info("Model is already loaded.")
-            return True
+        @log_execution_time(logger_name=__name__)
+        @log_resource_usage(logger_name=__name__)
+        def load(self, trust_remote_code: bool = True, **kwargs) -> bool:
+            """Loads the model and tokenizer using the ModelLoader helper."""
+            if self.is_loaded and self.model_handle is not None:
+                self.logger.info("Model is already loaded.")
+                return True
             
-        loader = LocalModelLoader(
-            self.model_specifier,
-            self.quant_config,
-            self.split_config,
-            trust_remote_code
-        )
-        
+            config_manager = ConfigManager()
+            loader = LocalModelLoader(
+                self.model_specifier,
+                self.quant_config,
+                self.split_config,
+                trust_remote_code,
+                config_manager
+            )        
         try:
             model, tokenizer = loader.load()
             self.model_handle = model

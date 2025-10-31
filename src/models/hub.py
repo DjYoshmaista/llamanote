@@ -256,8 +256,9 @@ class ModelHub:
     
     def __init__(self, cache_dir: Optional[Path] = None):
         self.base_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
-        self.model_cache_dir = self.base_cache_dir / "models"
+        self.model_cache_dir = self.base_cache_dir # Use the base cache dir directly
         self.info_cache_dir = self.base_cache_dir / "info"
+        self.logger = get_logger_conf(__name__)
         
         self.api = HfApi()
         self.cache_manager = CacheManager(self.info_cache_dir / "hub_info_cache.json")
@@ -380,7 +381,7 @@ class ModelHub:
             Path to downloaded model directory or None if failed
         """
         # Use a specific subdirectory within the main cache for HF models
-        model_cache_path = DEFAULT_CACHE_DIR / "hf_models"
+        model_cache_path = self.model_cache_dir
         model_cache_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Downloading model: {model_id} (revision: {revision})")
@@ -406,20 +407,32 @@ class ModelHub:
         return Path(model_path)
     
     def is_model_cached(self, model_id: str) -> bool:
-        """Check if model exists in the registry and is marked as cached."""
-        entry = get_registry().get_model(model_id)
-        if entry and entry.is_cached:
-             # Optional: Check if path actually still exists
-             if entry.cache_path and Path(entry.cache_path).exists():
-                 return True
-             else:
-                 # Cache path missing, update registry
-                 logger.warning(f"Registry shows model {model_id} cached, but path not found. Updating status.")
-                 entry.is_cached = False
-                 entry.cache_path = None
-                 get_registry().add_model(entry, save=True) # Save the update
-                 return False
-        return False
+        """Check if a model snapshot exists in the cache."""
+        # Use snapshot_download with local_files_only=True to check the cache
+        # This is the most reliable way to see if a complete snapshot is present.
+        try:
+            model_path_str = snapshot_download(
+                repo_id=model_id,
+                cache_dir=str(self.model_cache_dir),
+                local_files_only=True,
+                # No need for allow/ignore patterns, just checking for existence
+            )
+            model_path = Path(model_path_str)
+            
+            if model_path.exists():
+                self.logger.debug(f"Found cached model {model_id} at {model_path}")
+                # Ensure registry is up-to-date
+                get_registry().mark_cached(model_id, model_path)
+                return True
+            return False
+            
+        except HfHubHTTPError as e:
+            # This specific error is raised by snapshot_download if not found in cache with local_files_only=True
+            self.logger.debug(f"Model {model_id} not found in cache: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error checking cache for {model_id}: {e}", exc_info=True)
+            return False
 
 
 # --- Interactive Model Browser (Placeholder) ---

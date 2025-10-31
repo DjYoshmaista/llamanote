@@ -141,6 +141,7 @@ class ConfigManager:
             "pipeline": self.base_dir / "pipelines",    # Saved pipeline configurations
             "audio": self.base_dir / "audio_configs",   # Saved audio configurations
             "model": self.base_dir / "model_prefs",     # Model preferences (future use)
+            "model_cache": Path.home() / ".cache" / "huggingface" / "hub", # Default to standard HF cache
             "cloud": self.base_dir / "cloud",          # Cloud API keys storage
             "backup": self.base_dir / "backups",       # Backup location
             # Custom paths config lives within 'config' directory

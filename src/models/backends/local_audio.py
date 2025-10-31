@@ -5,6 +5,7 @@ Generates audio using local Hugging Face Transformers models.
 """
 
 import gc
+import sys
 import time
 import numpy as np
 import torch
@@ -19,7 +20,13 @@ from ...utils.decorators import log_execution_time
 from ...utils.helpers import get_device_manager, cleanup_resources
 from ...models.hub import ModelHub
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
+from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR
+
+# Add vibevoice module to path
+_VIBEVOICE_PATH = Path(__file__).parent.parent / "vibevoice"
+if str(_VIBEVOICE_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(_VIBEVOICE_PATH.parent))
 
 # --- Lazy Imports for transformers components ---
 _AutoProcessor = None
@@ -31,6 +38,11 @@ _SpeechT5HifiGan = None
 _BarkModel = None
 _VitsModel = None
 _AutoTokenizer = None
+
+# --- VibeVoice components ---
+_VibeVoiceForConditionalGenerationInference = None
+_VibeVoiceProcessor = None
+_VibeVoiceConfig = None
 
 def _import_transformers():
     global _AutoProcessor, _AutoModel, _pipeline
@@ -64,6 +76,26 @@ def _import_datasets():
         logger.error("Hugging Face 'datasets' library not found. Required for SpeechT5 speaker embeddings.")
         raise ImportError("Hugging Face 'datasets' library not found. Install with: pip install datasets")
 
+def _import_vibevoice():
+    """Import VibeVoice custom components."""
+    global _VibeVoiceForConditionalGenerationInference, _VibeVoiceProcessor, _VibeVoiceConfig
+
+    if _VibeVoiceForConditionalGenerationInference is None:
+        try:
+            from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+            from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+            from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
+
+            _VibeVoiceForConditionalGenerationInference = VibeVoiceForConditionalGenerationInference
+            _VibeVoiceProcessor = VibeVoiceProcessor
+            _VibeVoiceConfig = VibeVoiceConfig
+
+            return True
+        except ImportError as e:
+            logger.error(f"Failed to import VibeVoice components: {e}")
+            return False
+    return True
+
 
 logger = get_logger_conf(__name__)
 
@@ -75,7 +107,7 @@ class LocalAudioBackend(AudioBackend):
         "bark": ["suno/bark", "suno/bark-small"],
         "mms": ["facebook/mms-tts-eng"],
         "vits": ["facebook/mms-tts-eng"], # MMS uses VITS
-        "vibevoice": ["vibevoice/vibevoice", "microsoft/vibevoice-1.5b"],
+        "vibevoice": ["microsoft/vibevoice-1.5b", "vibevoice/vibevoice"],
     }
 
     def __init__(self, config: AudioConfig, model_specifier: str):
@@ -87,8 +119,11 @@ class LocalAudioBackend(AudioBackend):
         self.vocoder = None # Specific to SpeechT5
         self.pipeline = None # For pipeline-based models
         self.device = get_device_manager().get_device()
+
+        self.config_manager = ConfigManager()
+        self.model_cache_dir = self.config_manager.get_dir("model_cache")
         
-        self.model_hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "audio_models")
+        self.model_hub = ModelHub(cache_dir=self.model_cache_dir)
         self.speaker_embeddings = None
         self.embeddings_dataset = None
         self.post_processor = AudioPostProcessor() # Use the separated class
@@ -134,7 +169,7 @@ class LocalAudioBackend(AudioBackend):
             elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["mms"]):
                 self._load_vits_model(model_id)
                 loaded = True
-            elif any(term.lower() in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
+            elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
                 self._load_vibevoice_model(model_id)
                 loaded = True
 
@@ -175,22 +210,22 @@ class LocalAudioBackend(AudioBackend):
         self.logger.info("Local audio model unloaded.")
 
     def _load_bark_model(self, model_id: str):
-        self.processor = _AutoProcessor.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
+        self.processor = _AutoProcessor.from_pretrained(model_id, cache_dir=self.model_cache_dir)
         dtype = torch.float16 if self.config.use_half_precision and self.device == "cuda" else torch.float32
-        self.model = _BarkModel.from_pretrained(model_id, torch_dtype=dtype, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
+        self.model = _BarkModel.from_pretrained(model_id, torch_dtype=dtype, cache_dir=self.model_cache_dir).to(self.device)
         self.config.sample_rate = self.model.generation_config.sample_rate # Get SR from model
         self.logger.info(f"Bark model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
 
     def _load_speecht5_model(self, model_id: str):
         load_dataset = _import_datasets() # Ensure datasets is available
 
-        self.processor = _SpeechT5Processor.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
-        self.model = _SpeechT5ForTextToSpeech.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
+        self.processor = _SpeechT5Processor.from_pretrained(model_id, cache_dir=self.model_cache_dir)
+        self.model = _SpeechT5ForTextToSpeech.from_pretrained(model_id, cache_dir=self.model_cache_dir).to(self.device)
 
         # Vocoder is essential for SpeechT5
         try:
             vocoder_id = "microsoft/speecht5_hifigan"
-            self.vocoder = _SpeechT5HifiGan.from_pretrained(vocoder_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
+            self.vocoder = _SpeechT5HifiGan.from_pretrained(vocoder_id, cache_dir=self.model_cache_dir).to(self.device)
         except Exception as e:
             self.logger.warning(f"Could not load SpeechT5 HiFiGan vocoder: {e}. Audio quality may be low.")
             self.vocoder = None
@@ -207,7 +242,7 @@ class LocalAudioBackend(AudioBackend):
                  self.embeddings_dataset = load_dataset(
                      "Matthijs/cmu-arctic-xvectors",
                      split="validation",
-                     cache_dir=DEFAULT_CACHE_DIR / "datasets"
+                     cache_dir=self.model_cache_dir / "datasets"
                  )
                  # Use a common, generic-sounding speaker
                  default_speaker_idx = 7306 # Example index
@@ -239,7 +274,7 @@ class LocalAudioBackend(AudioBackend):
                 repo_id="Matthijs/cmu-arctic-xvectors",
                 filename="data/validation-00000-of-00001.parquet",
                 repo_type="dataset",
-                cache_dir=DEFAULT_CACHE_DIR / "datasets"
+                cache_dir=self.model_cache_dir / "datasets"
             )
 
             # Load parquet using pandas
@@ -271,48 +306,59 @@ class LocalAudioBackend(AudioBackend):
 
     def _load_vits_model(self, model_id: str):
         # Covers MMS and potentially other VITS models
-        self.processor = _AutoTokenizer.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
-        self.model = _VitsModel.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
+        self.processor = _AutoTokenizer.from_pretrained(model_id, cache_dir=self.model_cache_dir)
+        self.model = _VitsModel.from_pretrained(model_id, cache_dir=self.model_cache_dir).to(self.device)
         if hasattr(self.model, 'config') and hasattr(self.model.config, 'sampling_rate'):
             self.config.sample_rate = self.model.config.sampling_rate
         else:
              self.config.sample_rate = 22050 # Common VITS default
         self.logger.info(f"VITS/MMS model loaded. Sample Rate: {self.config.sample_rate}Hz")
 
-
     def _load_vibevoice_model(self, model_id: str):
-        """Load VibeVoice model with trust_remote_code support."""
+        """Load VibeVoice model using custom implementation."""
         self.logger.info(f"Loading VibeVoice model: {model_id}")
 
+        # Import VibeVoice components
+        if not _import_vibevoice():
+            raise ModelLoadError("Failed to import VibeVoice components", model_id)
+
         try:
-            # VibeVoice requires trust_remote_code for custom architecture
-            # Load processor/tokenizer
-            self.processor = _AutoProcessor.from_pretrained(
+            # Load processor
+            self.processor = _VibeVoiceProcessor.from_pretrained(
                 model_id,
-                cache_dir=DEFAULT_CACHE_DIR,
-                trust_remote_code=True
+                cache_dir=self.model_cache_dir
             )
 
-            # Load model with custom architecture support
-            dtype = torch.float16 if self.config.use_half_precision and self.device == "cuda" else torch.float32
-            self.model = _AutoModel.from_pretrained(
-                model_id,
-                torch_dtype=dtype,
-                cache_dir=DEFAULT_CACHE_DIR,
-                trust_remote_code=True
-            ).to(self.device)
-
-            # Get sample rate from config if available
-            if hasattr(self.model, 'config') and hasattr(self.model.config, 'sampling_rate'):
-                self.config.sample_rate = self.model.config.sampling_rate
+            # Configure dtype based on device and user settings
+            if self.device == "cuda" and self.config.use_half_precision:
+                dtype = torch.bfloat16  # VibeVoice works better with bfloat16
             else:
-                self.config.sample_rate = 22050  # Default fallback
+                dtype = torch.float32
+
+            # Load model
+            self.model = _VibeVoiceForConditionalGenerationInference.from_pretrained(
+                model_id,
+                cache_dir=self.model_cache_dir,
+                torch_dtype=dtype,
+                device_map="auto" if self.device == "cuda" else None,
+                attn_implementation="eager"  # Start with eager attention for compatibility
+            )
+
+            if self.device != "cuda":
+                self.model = self.model.to(self.device)
+
+            # Get sample rate from config
+            if hasattr(self.processor, 'audio_processor') and hasattr(self.processor.audio_processor, 'sampling_rate'):
+                self.config.sample_rate = self.processor.audio_processor.sampling_rate
+            else:
+                self.config.sample_rate = 24000  # VibeVoice default is 24kHz
 
             self.logger.info(f"VibeVoice model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
 
         except Exception as e:
             self.logger.error(f"Failed to load VibeVoice model: {e}", exc_info=True)
             raise ModelLoadError(f"Failed to load VibeVoice: {e}", model_id) from e
+
 
     def _load_generic_pipeline(self, model_id: str):
         """Load generic TTS model using pipeline with enhanced diagnostics."""
@@ -325,7 +371,7 @@ class LocalAudioBackend(AudioBackend):
                 model=model_id,
                 device=pipeline_device_id,
                 trust_remote_code=True, # Required for many TTS models
-                cache_dir=DEFAULT_CACHE_DIR
+                cache_dir=self.model_cache_dir
             )
             
             # Try to get model info
@@ -433,6 +479,8 @@ class LocalAudioBackend(AudioBackend):
                 return self._generate_speecht5(text)
             elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["mms"]):
                 return self._generate_vits(text)
+            elif any(term in model_id_lower for term in self.SUPPORTED_MODELS["vibevoice"]):
+                return self._generate_vibevoice(text)
             else:
                 self.logger.error(f"No specific generation logic found for {self.model_specifier}. Attempting pipeline.")
                 self._load_generic_pipeline(self.model_specifier)
@@ -513,9 +561,70 @@ class LocalAudioBackend(AudioBackend):
         with torch.no_grad():
             output = self.model(**inputs)
             waveform = output.waveform if hasattr(output, 'waveform') else output[0]
-        
+
         # SR should be in config from loading
         return waveform.cpu().numpy().squeeze()
+
+    def _generate_vibevoice(self, text: str) -> Optional[np.ndarray]:
+        """Generate audio using VibeVoice model."""
+        if not self.model or not self.processor:
+            self.logger.error("VibeVoice components not fully loaded.")
+            return None
+
+        try:
+            # Process input text with VibeVoice processor
+            # The processor expects text in dialogue format, e.g., "[1] Hello there"
+            # If text doesn't have speaker tags, add a default one
+            if not text.strip().startswith('['):
+                text = f"[1] {text}"
+
+            inputs = self.processor(
+                text=text,
+                return_tensors="pt",
+                padding=True
+            )
+
+            # Move inputs to device
+            if self.device == "cuda":
+                inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+            # Generate audio with the model
+            with torch.no_grad():
+                # VibeVoice generation with default parameters
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=2048,  # Adjust based on text length
+                    temperature=0.7,
+                    do_sample=True,
+                    cfg_scale=1.3,  # Classifier-free guidance scale
+                    inference_steps=10  # Diffusion steps
+                )
+
+                # Extract audio array from output
+                # VibeVoice returns audio in speech_outputs
+                if hasattr(output, 'speech_outputs') and output.speech_outputs:
+                    # Concatenate all speech outputs if multiple
+                    audio_arrays = []
+                    for speech_output in output.speech_outputs:
+                        if isinstance(speech_output, torch.Tensor):
+                            audio_arrays.append(speech_output.cpu().numpy())
+                        else:
+                            audio_arrays.append(np.array(speech_output))
+
+                    if len(audio_arrays) == 1:
+                        audio_array = audio_arrays[0]
+                    else:
+                        # Concatenate multiple segments
+                        audio_array = np.concatenate(audio_arrays)
+
+                    return audio_array.squeeze()
+                else:
+                    self.logger.error(f"Unexpected VibeVoice output format: {type(output)}")
+                    return None
+
+        except Exception as e:
+            self.logger.error(f"Error during VibeVoice generation: {e}", exc_info=True)
+            return None
 
     def _generate_with_pipeline(self, text: str) -> Optional[np.ndarray]:
         """Generate using the loaded Transformers pipeline."""

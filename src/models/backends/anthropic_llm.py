@@ -48,11 +48,14 @@ class AnthropicBackend(LLMBackend):
         """Initialize the Anthropic client and test the API key."""
         if self.model_handle:
             return True
-            
+
         try:
             self.model_handle = Anthropic(api_key=self.api_key)
-            # Test API key with a simple, cheap call (count tokens)
-            self.model_handle.count_tokens("test connection")
+            # Test API key with a simple, cheap call (count tokens via messages API)
+            test_result = self.model_handle.messages.count_tokens(
+                model=self.model_specifier,
+                messages=[{"role": "user", "content": "test"}]
+            )
             logger.info(f"Anthropic API client initialized for model {self.model_specifier} and key verified.")
             return True
         except AuthenticationError as e:
@@ -96,6 +99,13 @@ class AnthropicBackend(LLMBackend):
             raise ModelLoadError("Anthropic client not initialized. Call load() first.", self.model_specifier)
             
         api_params = HyperparamMapper.get_anthropic_config(hp_override)
+
+        if 'max_tokens' in api_params and api_params['max_tokens'] is not None:
+            try:
+                api_params['max_tokens'] = int(api_params['max_tokens'])
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert max_tokens '{api_params['max_tokens']}' to int. Removing from API params.")
+                del api_params['max_tokens']
 
         messages = [
             {"role": "user", "content": user_message}

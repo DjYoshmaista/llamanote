@@ -18,6 +18,7 @@ from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.decorators import log_execution_time
 from ...utils.helpers import cleanup_resources
 from ..hyperparameters import HyperparameterConfig
+from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_GPU_LAYERS
 from ...core.types import GenerationResult
 from ...core.errors import ModelLoadError, GenerationError, ConfigurationError
@@ -41,8 +42,9 @@ logger = get_logger_conf(__name__)
 class GGUFModelManager:
     """Manager for finding and inspecting GGUF models."""
 
-    def __init__(self, cache_dir: Optional[Path] = None):
-        self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR / "gguf_models")
+    def __init__(self):
+        self.config_manager = ConfigManager()
+        self.cache_dir = self.config_manager.get_dir("model_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger_conf(f"{__name__}.GGUFManager")
 

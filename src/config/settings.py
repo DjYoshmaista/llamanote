@@ -35,7 +35,9 @@ DEFAULT_CONFIG_DIR = Path.home() / ".config" / "llamanote" # User config
 #          print(f"Warning: Could not create default directory {dir_path}")
 #          pass # Avoid crashing on startup
 
-
+# === Model Cache Settings ===
+USER_MODEL_CACHE_DIR = None  # User-defined cache path
+DEFAULT_MODEL_CACHE_DIR = DEFAULT_CACHE_DIR # Default to project's cache/ folder
 # === Core Constants ===
 QUANTIZATION_OPTIONS: List[str] = ["none", "4bit", "8bit", "16bit"] # 16bit often means float16/bfloat16
 DEFAULT_QUANTIZATION: str = "4bit"
@@ -82,7 +84,8 @@ DEFAULT_PIPELINE_STAGES: List[str] = [
     "process",
     "filter",
     "format",
-    "save"
+    "save",
+    "audio"
 ]
 ENABLE_STAGE_CHECKPOINTS: bool = True
 CHECKPOINT_FORMAT: str = "pickle" # Currently only pickle supported

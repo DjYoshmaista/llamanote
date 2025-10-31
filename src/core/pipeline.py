@@ -59,11 +59,13 @@ class ProcessingPipeline:
         self.current_stage: Optional[str] = None
         self.stages_completed: List[str] = []
         self.checkpoint_name: Optional[str] = None
-        self.stages_to_run: List[str] = self.config.stages or list(DEFAULT_PIPELINE_STAGES)
+        self.stages_to_run: List[str] = self.config.stages if self.config.stages is not None else list(DEFAULT_PIPELINE_STAGES)
 
         # Initialize components based on config
         self._initialize_components()
         self.logger.info(f"Initialized pipeline in {self.config.mode.value} mode")
+        self.logger.info(f"Pipeline config stages: {self.config.stages}")
+        self.logger.info(f"Pipeline stages to run: {self.stages_to_run}")
 
     def _initialize_components(self):
         """Initialize all pipeline components based on self.config."""
@@ -115,9 +117,6 @@ class ProcessingPipeline:
     def set_stages_to_run(self, stages: List[str]):
         """Explicitly set which stages to run."""
         self.stages_to_run = [s for s in stages if s in DEFAULT_PIPELINE_STAGES]
-        # Always add 'audio' if config.generate_audio is True, even if not in STAGES list?
-        if self.config.generate_audio and "audio" not in self.stages_to_run:
-             self.stages_to_run.append("audio")
         self.logger.info(f"Pipeline stages set to run: {self.stages_to_run}")
 
     @log_execution_time(logger_name=__name__)
@@ -342,21 +341,29 @@ class ProcessingPipeline:
             if "audio" in self.stages_to_run or self.config.generate_audio: # Check both
                 if self.audio_backend is None:
                      ConsoleOutput.warning("Audio generation requested but no audio backend is set. Skipping.")
-                elif final_output_path is None and "save" not in self.stages_to_run:
-                     ConsoleOutput.warning("Audio generation requires 'save' stage to be run first. Skipping.")
                 else:
                     self.current_stage = "audio"
                     ConsoleOutput.section(f"Stage: Audio Generation")
-                    
-                    # Get text to save (from 'save' stage)
+
+                    # Get text for audio from pipeline stages
                     text_for_audio = data_payload.get('formatted_text', data_payload.get('filtered_text'))
                     if text_for_audio is None: # Fallback (same as save stage)
                          chunks_source = data_payload.get('processed_chunks', data_payload.get('chunks'))
                          if chunks_source: text_for_audio = "\n\n".join(chunks_source)
                          else: text_for_audio = data_payload.get('text')
 
+                    # If no text from pipeline stages, try reading from input file directly
+                    # This allows audio-only processing from existing markdown/text files
                     if text_for_audio is None:
-                         raise MissingDataError("audio", "any text content")
+                         if input_path.suffix.lower() in ['.txt', '.md']:
+                              try:
+                                   self.logger.info(f"No text from pipeline stages, reading directly from input file: {input_path}")
+                                   text_for_audio = input_path.read_text(encoding='utf-8')
+                                   ConsoleOutput.info(f"Read {len(text_for_audio)} characters from {input_path.name}")
+                              except Exception as e:
+                                   raise FileProcessingError(f"Failed to read input file for audio generation: {e}", str(input_path)) from e
+                         else:
+                              raise MissingDataError("audio", "any text content (no pipeline text and input is not .txt/.md)")
                          
                     # Clean text for audio (even if preprocess stage was skipped)
                     if self.config.clean_for_audio:

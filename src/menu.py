@@ -245,6 +245,7 @@ class AppState:
 
     def get_pipeline_config(self) -> PipelineConfig:
         """Creates a PipelineConfig based on current AppState."""
+        logger.info(f"Getting pipeline config. AppState stages_to_run: {self.stages_to_run}")
         
         # 1. Resolve Model Specifier
         # If using a key (like 'qwen3-4b'), resolve it to the full ID
@@ -279,7 +280,6 @@ class AppState:
             model_provider=self.text_model_provider,
             model_specifier=resolved_specifier,
             system_prompt=system_prompt_str,
-            stages=self.stages_to_run,
             
             output_format=self.audio_config.output_format if self.run_audio_generation else "markdown",
             output_dir=self.output_dir,
@@ -531,10 +531,11 @@ class MenuSystem:
                  print(f"  {i+1}. {included} {stage.capitalize()}")
 
             audio_included = "[X]" if self.state.run_audio_generation else "[ ]"
-            audio_dependency_met = 'save' in self.state.stages_to_run
-            dependency_note = "" if audio_dependency_met else " (Requires 'Save' stage)"
+            # Audio can now work without save stage (reads from .txt/.md files directly)
+            has_text_stages = bool(self.state.stages_to_run)
+            audio_note = "" if has_text_stages else " (will read from input file)"
             print(f"\nAudio Generation Stage:")
-            print(f"  A. {audio_included} Generate Audio{dependency_note}")
+            print(f"  A. {audio_included} Generate Audio{audio_note}")
 
             print("\nOptions:")
             print(f"  Enter number (1-{len(all_text_stages)}) or 'A' to toggle a stage.")
@@ -548,11 +549,7 @@ class MenuSystem:
 
             if choice == 'b':
                 # Final check before leaving
-                if self.state.run_audio_generation and not audio_dependency_met:
-                     ConsoleOutput.warning("Audio generation is ON, but 'Save' stage is OFF.")
-                     ConsoleOutput.warning("Audio generation will fail. Please enable 'Save' (7).")
-                     input("Press Enter to continue...")
-                     continue # Stay in this menu
+                # Audio no longer strictly requires save stage - it can read .txt/.md files directly
                 if not self.state.stages_to_run and not self.state.run_audio_generation:
                      ConsoleOutput.warning("No stages are selected. Nothing will be processed.")
                      confirm = input("Are you sure you want to continue? (y/n) [n]: ").strip().lower()
@@ -1447,8 +1444,18 @@ class MenuSystem:
         
         # Audio model checks
         if self.state.run_audio_generation:
-            if not 'save' in self.state.stages_to_run:
-                 errors.append("Audio generation is enabled, but the 'save' stage (which creates the text file) is disabled.")
+            # Check if audio-only mode (no text stages) or normal mode (with text stages)
+            if text_stages_selected:
+                # Normal mode: text stages are running, save stage is required
+                if 'save' not in self.state.stages_to_run:
+                     errors.append("Audio generation with text processing requires the 'save' stage to be enabled.")
+            else:
+                # Audio-only mode: no text stages, input must be .txt or .md
+                if self.state.input_files:
+                    input_file = Path(self.state.input_files[0])
+                    if input_file.suffix.lower() not in ['.txt', '.md']:
+                        errors.append("Audio-only mode (no text stages) requires input file to be .txt or .md format.")
+
             if not self.state.audio_model_specifier:
                 errors.append("No audio model specified.")
             elif self.state.audio_model_provider not in ["local_audio"]:
@@ -1573,6 +1580,12 @@ class MenuSystem:
              pipeline = ProcessingPipeline(config=pipeline_config)
              pipeline.llm_backend = text_backend  # Inject (can be None)
              pipeline.audio_backend = audio_backend  # Inject (can be None)
+
+             # Set stages to run directly from the app state
+             stages_to_run = self.state.stages_to_run.copy()
+             if self.state.run_audio_generation and 'audio' not in stages_to_run:
+                 stages_to_run.append('audio')
+             pipeline.set_stages_to_run(stages_to_run)
 
              # 5. Run Processing
              if len(self.state.input_files) == 1:

@@ -155,7 +155,7 @@ def get_llm_backend(
             return OpenAIBackend(
                 api_key=api_key,
                 model_specifier=model_specifier,
-                hyperparameters=hyperparameters
+                hyperparams=hyperparameters
             )
 
         elif provider_lower == "google":
@@ -167,7 +167,7 @@ def get_llm_backend(
             return GoogleAIBackend(
                 api_key=api_key,
                 model_specifier=model_specifier,
-                hyperparameters=hyperparameters
+                hyperparams=hyperparameters
             )
 
         elif provider_lower == "anthropic":
@@ -179,7 +179,7 @@ def get_llm_backend(
             return AnthropicBackend(
                 api_key=api_key,
                 model_specifier=model_specifier,
-                hyperparameters=hyperparameters
+                hyperparams=hyperparameters
             )
 
         else:
