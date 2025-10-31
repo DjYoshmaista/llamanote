@@ -5,10 +5,10 @@ Specialized formatter for creating podcast scripts from text.
 """
 
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from enum import Enum
 
 from .base_formatter import BaseFormatter, PatternMatcher
-from ..core.types import EmotionType # Assuming EmotionType is in core.types
 from ..utils.logger import get_logger_conf
 
 logger = get_logger_conf(__name__)

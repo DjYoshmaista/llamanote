@@ -9,7 +9,7 @@ post-processing.
 """
 
 from .pdf_extractor import PDFProcessor, MetadataExtractor
-from .text_preprocessor import TextPreprocessor, PDFTextCleaner
+from .text_preprocessor import TextPreprocessor
 from .text_chunker import TextChunker
 from .response_filter import ResponseFilter, ChunkedResponseFilter
 from .audio_processor import AudioPostProcessor
@@ -18,7 +18,6 @@ __all__ = [
     "PDFProcessor",
     "MetadataExtractor",
     "TextPreprocessor",
-    "PDFTextCleaner",
     "TextChunker",
     "ResponseFilter",
     "ChunkedResponseFilter",

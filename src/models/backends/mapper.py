@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional, List, Tuple
 import torch
 
 from ..hyperparameters import HyperparameterConfig
+from ...core.types import AudioConfig
 from ...utils.logger import get_logger_conf
 
 logger = get_logger_conf(__name__)

@@ -18,14 +18,14 @@ from ..utils.logger import get_logger_conf, LoggingProgress, ConsoleOutput
 from ..utils.decorators import retry, log_execution_time
 from ..config.settings import FALLBACK_ON_ERROR, RETRY_DELAY_SECONDS, MAX_RETRIES, INCLUDE_METADATA, DEFAULT_SYSTEM_PROMPT
 from ..core.types import (
-    ProcessingMode, PipelineConfig, ExtractionResult, 
-    ChunkingResult, TextChunk, GenerationResult, FilterResult, PDFMetadata
+    ProcessingMode, PipelineConfig, ExtractionResult,
+    ChunkingResult, TextChunk, GenerationResult, FilterResult, PDFMetadata, AudioResult
 )
 from ..core.errors import PipelineError, MissingDataError, PDFExtractionError, GenerationError
 
 # Import components required by stages
 from ..processing.pdf_extractor import PDFProcessor
-from ..processing.text_preprocessor import TextPreprocessor, PDFTextCleaner
+from ..processing.text_preprocessor import TextPreprocessor
 from ..processing.text_chunker import TextChunker
 from ..processing.response_filter import ChunkedResponseFilter
 from ..formatting.base_formatter import BaseFormatter, get_formatter
@@ -33,6 +33,23 @@ from ..io.file_handler import FileHandler
 from ..models.backends.base import LLMBackend, AudioBackend
 
 logger = get_logger_conf(__name__)
+
+
+# --- Stage Executor Helper Class ---
+
+class PipelineStageExecutor:
+    """Helper class to execute pipeline stages with error handling and logging."""
+
+    def __init__(self, pipeline):
+        """Initialize executor with a reference to the parent pipeline."""
+        self.pipeline = pipeline
+        self.logger = get_logger_conf(f"{__name__}.Executor")
+
+    def execute(self, stage_name: str, stage_func, data_payload: Dict[str, Any], required_keys: List[str]):
+        """Execute a stage function with error handling."""
+        self.logger.info(f"Executing stage: {stage_name}")
+        return stage_func()
+
 
 # --- Stage 1: Extraction ---
 
@@ -93,19 +110,18 @@ def run_extraction_stage(
 
 @log_execution_time(logger_name=__name__)
 def run_preprocess_stage(
-    text: str, 
+    text: str,
     config: PipelineConfig,
-    text_cleaner: PDFTextCleaner,
     text_preprocessor: TextPreprocessor
 ) -> str:
     """Handles text cleaning and normalization."""
     logger.info("Stage 'preprocess': Cleaning extracted text.")
-    
+
     cleaned_text = text
     if config.clean_for_audio and config.mode == ProcessingMode.PODCAST:
-        cleaned_text = text_cleaner.clean_for_audio(cleaned_text)
+        cleaned_text = text_preprocessor.clean_for_audio(cleaned_text)
         logger.debug("Applied audio-specific cleaning.")
-    
+
     preprocessed_text = text_preprocessor.preprocess_for_llm(cleaned_text)
     
     ConsoleOutput.info(f"Preprocessing complete. Text length: {len(preprocessed_text):,} chars")
@@ -166,9 +182,9 @@ def run_processing_stage(
         return llm_backend.process_chat(
             system_prompt=system_prompt,
             user_message=chunk,
-            hyperparams=config.hyperparameters,
+            hyperparams=config.get_hyperparameters(),
             # Pass remove_thinking=False, as we do this in a separate stage
-            remove_thinking=False 
+            remove_thinking=False
         )
 
     with LoggingProgress(logger, f"Processing {len(chunks)} chunks", len(chunks)) as progress:

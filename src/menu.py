@@ -5,26 +5,33 @@ Interactive menu interface for LlamaNote Enhanced
 """
 
 import sys
+import os
 import re
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Union
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 
 # --- LlamaNote Modules ---
 from .utils.logger import ConsoleOutput, get_logger_conf, LoggingProgress
-from .config.manager import ConfigManager
+from .utils.validators import validate_file_path, validate_directory_path
+from .config.manager import ConfigCRUD, ConfigManager
 from .config.settings import (
     DEFAULT_MODEL_KEY, SUPPORTED_FORMATS, DEFAULT_PIPELINE_STAGES,
     TIMESTAMP_OUTPUTS, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT,
-    SUPPORTED_LLM_PROVIDERS, SUPPORTED_TTS_PROVIDERS, CACHE_DIR
+    SUPPORTED_LLM_PROVIDERS, SUPPORTED_TTS_PROVIDERS, DEFAULT_CACHE_DIR, DEFAULT_OUTPUT_DIR,
+    DEFAULT_GPU_LAYERS, DEFAULT_QUANTIZATION, QUANTIZATION_OPTIONS, CHUNK_SIZE_DEFAULT,
+    DEFAULT_CONFIG_DIR, CHUNK_OVERLAP, INCLUDE_METADATA, ENABLE_STAGE_CHECKPOINTS,
+    MAX_RETRIES, FALLBACK_ON_ERROR
 )
-from .config.profiles import list_memory_profiles, create_configs_from_memory_profile
+from .config.profiles import list_memory_profiles, create_configs_from_memory_profile, get_memory_profile
 from .config.presets import list_hyperparameter_presets, get_hyperparameter_preset
 
 from .core.types import (
     ProcessingMode, PipelineConfig, PipelineResult,
-    QuantizationConfig, LayerSplitConfig, AudioConfig, GenerationResult
+    QuantizationConfig, LayerSplitConfig, AudioConfig, GenerationResult,
+    ChunkingStrategy
 )
 from .core.pipeline import ProcessingPipeline
 from .core.errors import ModelLoadError, PipelineError, FileProcessingError
@@ -305,13 +312,13 @@ class MenuSystem:
     def __init__(self):
         self.state = AppState()
         self.config_manager = ConfigManager(base_dir=DEFAULT_CONFIG_DIR)
-        self.model_hub = ModelHub(cache_dir=CACHE_DIR / "model_hub")
+        self.model_hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub")
         self.registry = get_registry() # Get singleton instance
         self.file_manager = BatchFileManager(supported_formats=SUPPORTED_FORMATS)
 
         # Load API keys on startup
         self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
-        logger.info(f"Loaded API keys for: {list(self_state_cloud_api_keys.keys())}")
+        logger.info(f"Loaded API keys for: {list(self.state.cloud_api_keys.keys())}")
 
         self.main_menu = self._build_main_menu()
         logger.info("Initialized MenuSystem")
@@ -739,7 +746,7 @@ class MenuSystem:
             input("Press Enter to continue...")
             return MenuAction.BACK
 
-        manager = GGUFModelManager(cache_dir=CACHE_DIR / "gguf_models")
+        manager = GGUFModelManager(cache_dir=DEFAULT_CACHE_DIR / "gguf_models")
         
         while True:
             ConsoleOutput.subsection("Select Local GGUF Model")
@@ -1521,7 +1528,7 @@ class MenuSystem:
                      provider=pipeline_config.model_provider,
                      model_specifier=pipeline_config.model_specifier,
                      api_keys=self.state.cloud_api_keys,
-                     hyperparameters=pipeline_config.hyperparameters,
+                     hyperparameters=pipeline_config.get_hyperparameters(),
                      model_entry=model_entry_for_backend, # Pass ModelEntry (only used by local_hf)
                      quantization_config=pipeline_config.quantization_config,
                      layer_split_config=pipeline_config.layer_split_config

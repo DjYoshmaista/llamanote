@@ -9,11 +9,14 @@ import threading
 import re
 import os
 from pathlib import Path
-from typing import List, Any, Optional, Union
+from typing import List, Any, Optional, Union, TYPE_CHECKING
 from datetime import datetime
 
 from .logger import get_logger_conf
-from ..models.registry import ModelEntry
+
+# Use TYPE_CHECKING to avoid circular import
+if TYPE_CHECKING:
+    from ..models.registry import ModelEntry
 
 # Attempt optional imports
 try:
@@ -29,7 +32,7 @@ logger = get_logger_conf(__name__)
 class DynamicTokenLimitCalculator:
     """Calculate optimal token limits based on content and model constraints"""
     
-    def __init__(self, model_config: ModelEntry):
+    def __init__(self, model_config: 'ModelEntry'):
         self.model_config = model_config
         self.base_prompt_tokens = 500  # Estimated tokens for system prompt
         

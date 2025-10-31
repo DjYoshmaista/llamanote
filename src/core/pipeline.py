@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from ..utils.logger import get_logger_conf, LoggingProgress, MemoryMonitor, ConsoleOutput
+from ..utils.decorators import log_execution_time
 from ..config.settings import (
     DEFAULT_PIPELINE_STAGES, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT,
     INCLUDE_METADATA, TIMESTAMP_OUTPUTS
@@ -20,7 +21,7 @@ from .types import (
     ExtractionResult, ChunkingResult, FilterResult
 )
 from ..processing.pdf_extractor import PDFProcessor
-from ..processing.text_preprocessor import TextPreprocessor, PDFTextCleaner
+from ..processing.text_preprocessor import TextPreprocessor
 from ..processing.text_chunker import TextChunker
 from ..processing.response_filter import ChunkedResponseFilter
 from ..formatting.base_formatter import get_formatter, BaseFormatter
@@ -74,7 +75,6 @@ class ProcessingPipeline:
             max_chars=MAX_CHARS_PER_FILE,
             max_size_mb=MAX_PDF_SIZE_MB
         )
-        self.text_cleaner = PDFTextCleaner()
         self.text_preprocessor = TextPreprocessor()
         self.text_chunker = TextChunker(
             target_size=self.config.chunk_size,
@@ -186,7 +186,7 @@ class ProcessingPipeline:
                     if text is None: # Need text from extract or checkpoint
                          raise MissingDataError("preprocess", "text")
                     if self.config.clean_for_audio:
-                         text = self.text_cleaner.clean_for_audio(text)
+                         text = self.text_preprocessor.clean_for_audio(text)
                     return self.text_preprocessor.preprocess_for_llm(text)
                 
                 data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
@@ -229,7 +229,7 @@ class ProcessingPipeline:
                      results = batch_processor.process_batch(
                          texts=data_payload['chunks'],
                          system_prompt=system_prompt,
-                         hyperparams=self.config.hyperparameters,
+                         hyperparams=self.config.get_hyperparameters(),
                          # Pass remove_thinking=False so we get raw output for filtering stage
                          remove_thinking=False 
                      )
@@ -359,7 +359,7 @@ class ProcessingPipeline:
                          
                     # Clean text for audio (even if preprocess stage was skipped)
                     if self.config.clean_for_audio:
-                         text_for_audio = self.text_cleaner.clean_for_audio(text_for_audio)
+                         text_for_audio = self.text_preprocessor.clean_for_audio(text_for_audio)
                          
                     # Determine audio output path
                     audio_output_path = self.file_handler.get_output_path(

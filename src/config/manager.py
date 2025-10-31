@@ -145,6 +145,8 @@ class ConfigManager:
             "backup": self.base_dir / "backups",       # Backup location
             # Custom paths config lives within 'config' directory
         }
+        # Initialize custom_paths as empty dict before using get_dir()
+        self.custom_paths = {}
         # Ensure base directories exist
         for dir_type in self.dir_map: _ensure_directory(self.get_dir(dir_type))
 

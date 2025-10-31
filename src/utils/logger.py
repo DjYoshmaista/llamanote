@@ -31,8 +31,7 @@ except ImportError as e:
     TORCH_AVAILABLE = False
     torch = None
 
-# local module imports
-from ..config.settings import get_logging_config
+# Local import of get_logging_config moved to setup_logging() to avoid circular import
 
 # Global flag to track if logging has been configured
 _logging_configured = False
@@ -55,6 +54,8 @@ def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None)
 
     try:
         effective_log_dir.mkdir(parents=True, exist_ok=True)
+        # Local import to avoid circular dependency
+        from ..config.settings import get_logging_config
         logging_config = get_logging_config(effective_log_dir)
         # Apply the desired log level to the main 'llamanote' logger handlers
         for handler_name in logging_config.get("loggers", {}).get("llamanote", {}).get("handlers", []):

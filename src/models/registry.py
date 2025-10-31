@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 # Use config/settings.py for base paths
 from ..config.settings import DEFAULT_CACHE_DIR, DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY
 from ..utils.logger import get_logger_conf
-from ..config.manager import _ensure_directory
+# Local import of _ensure_directory to avoid circular import
 
 logger = get_logger_conf(__name__)
 
@@ -100,9 +100,11 @@ class ModelRegistry:
     """Central registry for all available models."""
     
     def __init__(self, registry_path: Optional[Path] = None):
-        self.registry_path = registry_path or (CACHE_DIR / "model_registry.json")
+        self.registry_path = registry_path or (DEFAULT_CACHE_DIR / "model_registry.json")
+        # Local import to avoid circular dependency
+        from ..config.manager import _ensure_directory
         _ensure_directory(self.registry_path.parent)
-        
+
         self.models: Dict[str, ModelEntry] = {}
         self._load_registry()
         self._ensure_predefined_models()
@@ -306,8 +308,8 @@ class ModelRegistry:
         except AttributeError:
              logger.warning(f"Cannot sort by '{sort_key}', sorting by name instead.")
              results.sort(key=lambda m: m.name.lower())
-             
-        return models
+
+        return results
     
     def update_from_hub_list(self, model_infos: List['ModelHubInfo']) -> int:
         """Updates the registry from a list of ModelInfo objects."""
@@ -434,7 +436,7 @@ def refresh_registry_from_hub(search_terms: List[str] = None, limit: int = 50) -
     """
     from .hub import ModelHub # Local import to avoid circular dependency
     
-    hub = ModelHub(cache_dir=CACHE_DIR / "model_hub") # Use specific cache
+    hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub") # Use specific cache
     registry = get_registry()
     
     if search_terms is None:

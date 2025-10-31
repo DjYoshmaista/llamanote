@@ -6,6 +6,7 @@ Handles loading, saving, and managing API keys securely.
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Optional, List, Any
 

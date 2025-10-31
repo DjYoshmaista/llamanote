@@ -15,7 +15,7 @@ from src.config.manager import ConfigManager
 from src.config.profiles import list_memory_profiles, create_configs_from_memory_profile
 from src.config.presets import get_hyperparameter_preset, list_hyperparameter_presets
 from src.config.settings import (
-    DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY, QUANTIZATION_OPTIONS,
+    CHUNK_SIZE_DEFAULT, DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY, QUANTIZATION_OPTIONS,
     DEFAULT_QUANTIZATION, DEFAULT_GPU_LAYERS, ENABLE_LAYER_SPLITTING,
     DEFAULT_PIPELINE_STAGES, OUTPUT_FORMAT_OPTIONS, DEFAULT_OUTPUT_FORMAT,
     DEFAULT_OUTPUT_DIR, PREPROCESS_PROMPT_PODCAST, SUPPORTED_LLM_PROVIDERS,
@@ -89,6 +89,8 @@ Examples:
     python -m llamanote --search-models "gemma-2"
 """
     )
+    other_group = parser.add_argument_group('Other Options')
+    utility_group = parser.add_argument_group('Utility Commands (run separately)')
     
     # --- Primary Arguments ---
     parser.add_argument(
@@ -110,7 +112,7 @@ Examples:
     # Import missing items at the top
     from src.config.settings import (
         # ... existing imports ...
-        CACHE_DIR, CHUNK_OVERLAP, MAX_RETRIES, FALLBACK_ON_ERROR, # Add missing
+        DEFAULT_CACHE_DIR, CHUNK_OVERLAP, MAX_RETRIES, FALLBACK_ON_ERROR, # Add missing
         PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT
     )
     from src.models.hyperparameters import get_hyperparameter_help # Add missing import
@@ -121,9 +123,8 @@ Examples:
     # Ensure PipelineResult is imported from types (Fix #4)
     # Inside run_cli_processing, update relevant constants if needed or confirm they come from pipeline_config
     # e.g., CHUNK_OVERLAP, MAX_RETRIES, FALLBACK_ON_ERROR are used to create PipelineConfig, which is good.
-    # CACHE_DIR might be needed for ModelHub instantiation if not handled by registry defaults. Add import if needed.    
+    # DEFAULT_CACHE_DIR might be needed for ModelHub instantiation if not handled by registry defaults. Add import if needed.    
     # --- Utility Actions (run instead of processing) ---
-    utility_group = parser.add_argument_group('Utility Commands (run separately)')
     utility_group.add_argument(
         "--list-models",
         action="store_true",
@@ -256,7 +257,6 @@ Examples:
     hyperparam_group.add_argument("--max-tokens", type=int, help="Override max_new_tokens")
     
     # --- Other Processing Options ---
-    other_group = parser.add_argument_group('Other Options')
     other_group.add_argument(
         "--chunk-size", 
         type=int, 
@@ -341,7 +341,7 @@ def handle_utility_commands(args: argparse.Namespace, parser: argparse.ArgumentP
         return True
 
     if args.search_models:
-        hub = ModelHub(cache_dir=CACHE_DIR / "model_hub")
+        hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub")
         ConsoleOutput.header(f"Searching Hugging Face Hub for: '{args.search_models}'")
         results = hub.search_models(search_term=args.search_models, limit=20)
         if not results:
@@ -361,7 +361,7 @@ def handle_utility_commands(args: argparse.Namespace, parser: argparse.ArgumentP
             ConsoleOutput.error("llama-cpp-python is not installed. Cannot list GGUF models.")
             print("Install with: pip install llama-cpp-python")
             return True
-        manager = GGUFModelManager(cache_dir=CACHE_DIR / "gguf_models")
+        manager = GGUFModelManager(cache_dir=DEFAULT_CACHE_DIR / "gguf_models")
         models = manager.list_available_models()
         ConsoleOutput.header("Available GGUF Models (in cache)")
         if not models:
@@ -455,7 +455,7 @@ def run_cli_processing(args: argparse.Namespace, parser: argparse.ArgumentParser
               ConsoleOutput.warning("--browse-models is only for local HuggingFace models. Ignoring.")
          else:
               ConsoleOutput.info("Opening interactive model browser...")
-              hub = ModelHub(cache_dir=CACHE_DIR / "model_hub")
+              hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub")
               browser = InteractiveModelBrowser(hub) # Assumes InteractiveModelBrowser is in model_hub
               hf_model_info: Optional[ModelHubInfo] = browser.browse(task="text-generation", library="transformers")
               if hf_model_info:
@@ -477,7 +477,7 @@ def run_cli_processing(args: argparse.Namespace, parser: argparse.ArgumentParser
         model_entry = registry.get_model(model_specifier)
         if not model_entry:
             ConsoleOutput.warning(f"Model ID '{model_specifier}' not in registry. Fetching info...")
-            hub = ModelHub(cache_dir=CACHE_DIR / "model_hub")
+            hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub")
             info = hub.get_model_info(model_specifier)
             if info:
                 registry.add_from_model_info(info, save=True)

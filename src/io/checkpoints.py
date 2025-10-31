@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Any, List
 
 from ..utils.logger import get_logger_conf
-from ..config.settings import CACHE_DIR, CHECKPOINT_FORMAT
+from ..config.settings import DEFAULT_CACHE_DIR, CHECKPOINT_FORMAT
 
 logger = get_logger_conf(__name__)
 

@@ -5,10 +5,12 @@ Defines memory profiles and provides functions to create hardware configurations
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple, TYPE_CHECKING
 
-# Assuming these types are defined in core.types or imported appropriately
-from ..core.types import QuantizationConfig, LayerSplitConfig
+# Use TYPE_CHECKING to avoid circular import at module load time
+if TYPE_CHECKING:
+    from ..core.types import QuantizationConfig, LayerSplitConfig
+
 from .settings import DEFAULT_QUANTIZATION, DEFAULT_GPU_LAYERS, QUANTIZATION_OPTIONS
 
 # Attempt optional import for torch types
@@ -34,8 +36,10 @@ class MemoryProfile:
     max_cpu_memory: str = "30GB" # For Transformers
     enable_splitting: bool = True # General flag
 
-    def get_quantization_config(self) -> QuantizationConfig:
+    def get_quantization_config(self) -> 'QuantizationConfig':
         """Creates a QuantizationConfig based on the profile."""
+        # Local import to avoid circular dependency
+        from ..core.types import QuantizationConfig
         compute_dtype: Optional[TorchDtype] = None
         if torch:
             dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -48,12 +52,13 @@ class MemoryProfile:
             method=method,
             compute_dtype=compute_dtype,
             use_double_quant=(method == "4bit"),
-            quant_type="nf4", # Default quant_type
-            bnb_4bit_use_double_quant=(method == "4bit") # Align with explicit bnb arg
+            quant_type="nf4" # Default quant_type
         )
 
-    def get_layer_split_config(self) -> LayerSplitConfig:
+    def get_layer_split_config(self) -> 'LayerSplitConfig':
         """Creates a LayerSplitConfig based on the profile."""
+        # Local import to avoid circular dependency
+        from ..core.types import LayerSplitConfig
         max_gpu_mem_dict: Dict[int, str] = {}
         cuda_available = False
         num_gpus = 0
@@ -131,7 +136,7 @@ def list_memory_profiles() -> List[Tuple[str, str]]:
     """Returns a list of available memory profile names and descriptions."""
     return [(name, profile.description) for name, profile in _DEFINED_PROFILES.items()]
 
-def create_configs_from_memory_profile(profile_name: str) -> Tuple[Optional[QuantizationConfig], Optional[LayerSplitConfig]]:
+def create_configs_from_memory_profile(profile_name: str) -> Tuple[Optional['QuantizationConfig'], Optional['LayerSplitConfig']]:
     """
     Factory function to create QuantizationConfig and LayerSplitConfig from a profile name.
 
@@ -141,6 +146,9 @@ def create_configs_from_memory_profile(profile_name: str) -> Tuple[Optional[Quan
     Returns:
         A tuple containing (QuantizationConfig, LayerSplitConfig), or (None, None) if profile not found.
     """
+    # Local import to avoid circular dependency
+    from ..core.types import QuantizationConfig, LayerSplitConfig
+
     profile = get_memory_profile(profile_name)
     if profile:
         return profile.get_quantization_config(), profile.get_layer_split_config()

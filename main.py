@@ -22,7 +22,22 @@ except NameError:
 dotenv_path = '.env'
 load_dotenv(dotenv_path=dotenv_path)
 print(f"Attempted to load .env from: '{dotenv_path}")
-LOG_LVL = os.getenv("LOG_LEVEL")
+LOG_LVL = str(os.getenv("LOG_LEVEL")).upper()
+
+def set_log_level(LOG_LVL: str = "WARNING"):
+    if LOG_LVL == "DEBUG":
+        return logging.DEBUG
+    elif LOG_LVL == "INFO":
+        return logging.INFO
+    elif LOG_LVL == "WARNING":
+        return logging.WARNING
+    elif LOG_LVL == "CRITICAL":
+        return logging.CRITICAL
+    elif LOG_LVL == "ERROR":
+        return logging.ERROR
+    else:
+        print(f"Log level set incorrectly in environment variable.  Check `.env` file value for the variable LOG_LEVEL.  Current value: `{LOG_LVL}`\nSetting logging level to default (logging.INFO)")
+        return logging.INFO
 
 # Add src to path
 sys.path.append(str(BASE_DIR))
@@ -42,7 +57,7 @@ def main():
         args = parser.parse_args()
 
         # --- 1. Set Verbosity ---
-        log_level = logging.DEBUG if args.verbose else logging.LOG_LVL
+        log_level = logging.DEBUG if args.verbose else set_log_level(LOG_LVL)
         logging.getLogger("llamanote").setLevel(log_level)
         for handler in logging.getLogger("llamanote").handlers:
             if isinstance(handler, logging.StreamHandler):

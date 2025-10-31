@@ -6,11 +6,12 @@ silence, and applying effects.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import warnings
 
-from ..utils.logger import get_logger_conf, log_execution_time
+from ..utils.logger import get_logger_conf
+from ..utils.decorators import log_execution_time
 from ..core.errors import FileProcessingError
 
 # Suppress warnings from audio libraries if they get too noisy

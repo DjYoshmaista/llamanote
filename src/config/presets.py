@@ -6,10 +6,12 @@ Loads predefined hyperparameter configurations from a JSON file.
 
 import json
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, TYPE_CHECKING
 
-# Assuming HyperparameterConfig is defined in models.hyperparameters
-from ..models.hyperparameters import HyperparameterConfig
+# Use TYPE_CHECKING to avoid circular import
+if TYPE_CHECKING:
+    from ..models.hyperparameters import HyperparameterConfig
+
 from ..utils.logger import get_logger_conf
 
 logger = get_logger_conf(__name__)
@@ -69,7 +71,7 @@ def _load_presets_from_file() -> Dict[str, Dict]:
 # Load presets when the module is imported
 _PRESETS_DATA = _load_presets_from_file()
 
-def get_hyperparameter_preset(name: str) -> Optional[HyperparameterConfig]:
+def get_hyperparameter_preset(name: str) -> Optional['HyperparameterConfig']:
     """
     Retrieves a HyperparameterConfig instance for a given preset name.
 
@@ -82,6 +84,8 @@ def get_hyperparameter_preset(name: str) -> Optional[HyperparameterConfig]:
     preset_data = _PRESETS_DATA.get(name.lower())
     if preset_data:
         try:
+            # Local import to avoid circular dependency
+            from ..models.hyperparameters import HyperparameterConfig
             # Create config, ignoring extra keys like 'description'
             config_params = {k: v for k, v in preset_data.items() if k != 'description'}
             return HyperparameterConfig(**config_params)
@@ -103,7 +107,7 @@ def list_hyperparameter_presets() -> List[Tuple[str, str]]:
         for name, data in _PRESETS_DATA.items()
     ]
 
-def add_hyperparameter_preset(name: str, config: HyperparameterConfig, description: str = "") -> bool:
+def add_hyperparameter_preset(name: str, config: 'HyperparameterConfig', description: str = "") -> bool:
     """
     Adds or updates a preset in memory and saves to the file. (Use with caution)
 

@@ -16,7 +16,8 @@ from ...core.types import (
 )
 from ..hyperparameters import HyperparameterConfig
 from ...core.errors import ModelLoadError
-from ...utils.logger import get_logger_conf, log_execution_time
+from ...utils.logger import get_logger_conf
+from ...utils.decorators import log_execution_time
 from ...utils.helpers import estimate_tokens
 
 class LLMBackend(abc.ABC):
@@ -195,7 +196,7 @@ class AudioBackend(abc.ABC):
         """Load the model/pipeline or initialize the API client."""
         pass
 
-    @abc.abstractabstractmethod
+    @abc.abstractmethod
     def unload(self):
         """Unload model/pipeline or clean up resources."""
         pass

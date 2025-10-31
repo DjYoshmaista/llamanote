@@ -13,14 +13,15 @@ import time
 from functools import wraps
 from pathlib import Path
 from typing import List, Dict, Callable, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
-from huggingface_hub import HfApi, HfFolder, hf_hub_download, snapshot_download, ModelSearchArguments, ModelFilter
+from dataclasses import dataclass, asdict, field
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.hf_api import HfApi, ModelInfo
 from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError, GatedRepoError
 from tqdm import tqdm # Assuming tqdm is a dependency
 
 from ..utils.logger import get_logger_conf, ConsoleOutput # Use new logger
-from ..config.settings import CACHE_DIR # Use central settings
+from ..utils.decorators import log_execution_time
+from ..config.settings import DEFAULT_CACHE_DIR # Use central settings
 
 logger = get_logger_conf(__name__)
 
@@ -253,7 +254,7 @@ class ModelHub:
     """Interface to HuggingFace Hub using refactored helpers."""
     
     def __init__(self, cache_dir: Optional[Path] = None):
-        self.base_cache_dir = Path(cache_dir or CACHE_DIR)
+        self.base_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
         self.model_cache_dir = self.base_cache_dir / "models"
         self.info_cache_dir = self.base_cache_dir / "info"
         
@@ -295,16 +296,12 @@ class ModelHub:
         """Search models on HuggingFace Hub, applying local filters."""
         logger.info(f"Searching Hub: task={task}, library={library}, term='{search_term}'")
         
-        # Use ModelFilter for server-side filtering
-        model_filter = ModelFilter(
+        # list_models returns an iterator
+        # In newer versions of huggingface_hub, pass parameters directly
+        model_iterator = self.api.list_models(
             task=task,
             library=library,
-            model_name=search_term if search_term else None
-        )
-        
-        # list_models returns an iterator
-        model_iterator = self.api.list_models(
-            filter=model_filter,
+            search=search_term if search_term else None,
             sort=sort,
             direction=-1, # Descending
             fetch_config=False # Fetching config/cardData is slow, do it only if needed
@@ -382,7 +379,7 @@ class ModelHub:
             Path to downloaded model directory or None if failed
         """
         # Use a specific subdirectory within the main cache for HF models
-        model_cache_path = CACHE_DIR / "hf_models"
+        model_cache_path = DEFAULT_CACHE_DIR / "hf_models"
         model_cache_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Downloading model: {model_id} (revision: {revision})")
@@ -422,3 +419,20 @@ class ModelHub:
                  get_registry().add_model(entry, save=True) # Save the update
                  return False
         return False
+
+
+# --- Interactive Model Browser (Placeholder) ---
+
+class InteractiveModelBrowser:
+    """Placeholder for interactive model browsing functionality."""
+
+    def __init__(self, model_hub: ModelHub):
+        """Initialize browser with a ModelHub instance."""
+        self.model_hub = model_hub
+        self.logger = get_logger_conf(f"{__name__}.Browser")
+
+    def browse(self):
+        """Launch interactive model browsing."""
+        self.logger.warning("InteractiveModelBrowser.browse() is not yet implemented.")
+        ConsoleOutput.warning("Interactive model browsing is not yet implemented.")
+        return None

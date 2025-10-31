@@ -14,11 +14,12 @@ from typing import Optional, List, Dict, Any
 from .base import AudioBackend
 from ...core.types import AudioConfig, AudioResult
 from ...core.errors import ModelLoadError, GenerationError
-from ...utils.logger import get_logger_conf, log_execution_time, LoggingProgress
+from ...utils.logger import get_logger_conf, LoggingProgress
+from ...utils.decorators import log_execution_time
 from ...utils.helpers import get_device_manager, cleanup_resources
 from ...models.hub import ModelHub
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
-from ...config.settings import CACHE_DIR
+from ...config.settings import DEFAULT_DEFAULT_CACHE_DIR
 
 # --- Lazy Imports for transformers components ---
 _AutoProcessor = None
@@ -87,7 +88,7 @@ class LocalAudioBackend(AudioBackend):
         self.pipeline = None # For pipeline-based models
         self.device = get_device_manager().get_device()
         
-        self.model_hub = ModelHub(cache_dir=CACHE_DIR / "audio_models")
+        self.model_hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "audio_models")
         self.speaker_embeddings = None
         self.embeddings_dataset = None
         self.post_processor = AudioPostProcessor() # Use the separated class
@@ -175,22 +176,22 @@ class LocalAudioBackend(AudioBackend):
         self.logger.info("Local audio model unloaded.")
 
     def _load_bark_model(self, model_id: str):
-        self.processor = _AutoProcessor.from_pretrained(model_id, cache_dir=CACHE_DIR)
+        self.processor = _AutoProcessor.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
         dtype = torch.float16 if self.config.use_half_precision and self.device == "cuda" else torch.float32
-        self.model = _BarkModel.from_pretrained(model_id, torch_dtype=dtype, cache_dir=CACHE_DIR).to(self.device)
+        self.model = _BarkModel.from_pretrained(model_id, torch_dtype=dtype, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
         self.config.sample_rate = self.model.generation_config.sample_rate # Get SR from model
         self.logger.info(f"Bark model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
 
     def _load_speecht5_model(self, model_id: str):
         load_dataset = _import_datasets() # Ensure datasets is available
         
-        self.processor = _SpeechT5Processor.from_pretrained(model_id, cache_dir=CACHE_DIR)
-        self.model = _SpeechT5ForTextToSpeech.from_pretrained(model_id, cache_dir=CACHE_DIR).to(self.device)
+        self.processor = _SpeechT5Processor.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
+        self.model = _SpeechT5ForTextToSpeech.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
         
         # Vocoder is essential for SpeechT5
         try:
             vocoder_id = "microsoft/speecht5_hifigan"
-            self.vocoder = _SpeechT5HifiGan.from_pretrained(vocoder_id, cache_dir=CACHE_DIR).to(self.device)
+            self.vocoder = _SpeechT5HifiGan.from_pretrained(vocoder_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
         except Exception as e:
             self.logger.warning(f"Could not load SpeechT5 HiFiGan vocoder: {e}. Audio quality may be low.")
             self.vocoder = None
@@ -203,7 +204,7 @@ class LocalAudioBackend(AudioBackend):
         if self.speaker_embeddings is None:
              try:
                  self.logger.info("Loading default speaker embeddings (cmu-arctic-xvectors)...")
-                 self.embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", cache_dir=CACHE_DIR / "datasets")
+                 self.embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", cache_dir=DEFAULT_CACHE_DIR / "datasets")
                  # Use a common, generic-sounding speaker
                  default_speaker_idx = 7306 # Example index
                  self.speaker_embeddings = torch.tensor(
@@ -218,8 +219,8 @@ class LocalAudioBackend(AudioBackend):
 
     def _load_vits_model(self, model_id: str):
         # Covers MMS and potentially other VITS models
-        self.processor = _AutoTokenizer.from_pretrained(model_id, cache_dir=CACHE_DIR)
-        self.model = _VitsModel.from_pretrained(model_id, cache_dir=CACHE_DIR).to(self.device)
+        self.processor = _AutoTokenizer.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR)
+        self.model = _VitsModel.from_pretrained(model_id, cache_dir=DEFAULT_CACHE_DIR).to(self.device)
         if hasattr(self.model, 'config') and hasattr(self.model.config, 'sampling_rate'):
             self.config.sample_rate = self.model.config.sampling_rate
         else:
@@ -238,7 +239,7 @@ class LocalAudioBackend(AudioBackend):
                 model=model_id,
                 device=pipeline_device_id,
                 trust_remote_code=True, # Required for many TTS models
-                cache_dir=CACHE_DIR
+                cache_dir=DEFAULT_CACHE_DIR
             )
             
             # Try to get model info

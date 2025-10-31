@@ -11,7 +11,8 @@ from typing import Optional, Dict
 from .base import AudioBackend
 from ...core.types import AudioConfig, AudioResult
 from ...core.errors import ModelLoadError, GenerationError
-from ...utils.logger import get_logger_conf, log_execution_time, ConsoleOutput
+from ...utils.logger import get_logger_conf, ConsoleOutput
+from ...utils.decorators import log_execution_time
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
 
 # Try importing OpenAI library

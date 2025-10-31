@@ -7,7 +7,7 @@ Defines shared Enums and Dataclasses used across the pipeline and components.
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, TYPE_CHECKING
 from ..config.settings import DEFAULT_PIPELINE_STAGES
 
 # Attempt import for type hint, but make it optional
@@ -17,10 +17,9 @@ try:
 except ImportError:
     TorchDtype = Any # Fallback type if torch is not installed
 
-# Forward declaration for HyperparameterConfig if needed, or import directly
-# from ..models.hyperparameters import HyperparameterConfig
-# For simplicity, assume HyperparameterConfig is defined/imported where needed.
-# If strict type checking requires it here, adjust imports.
+# Use TYPE_CHECKING to avoid circular import
+if TYPE_CHECKING:
+    from ..models.hyperparameters import HyperparameterConfig
 
 # --- Enums ---
 
@@ -277,7 +276,7 @@ class PipelineConfig:
     add_emotions: bool = True # For formatting
 
     # LLM Generation settings
-    hyperparameters: Any = field(default_factory=lambda: {}) # Use Any for now, ideally HyperparameterConfig
+    hyperparameters: Any = field(default=None) # Will be lazily initialized
     # Local Model Hardware settings
     quantization_config: Optional[QuantizationConfig] = None
     layer_split_config: Optional[LayerSplitConfig] = None
@@ -302,15 +301,21 @@ class PipelineConfig:
             specifier_display = Path(self.model_specifier).name
         return f"{self.model_provider}:{specifier_display}"
 
+    def get_hyperparameters(self) -> 'HyperparameterConfig':
+        """Lazily loads and returns HyperparameterConfig only when needed."""
+        if self.hyperparameters is None:
+            # Local import to avoid circular dependency
+            from ..models.hyperparameters import HyperparameterConfig
+            self.hyperparameters = HyperparameterConfig()
+        return self.hyperparameters
+
     def __post_init__(self):
         # Ensure default dataclasses are created if None
         if self.quantization_config is None: self.quantization_config = QuantizationConfig()
         if self.layer_split_config is None: self.layer_split_config = LayerSplitConfig()
         if self.audio_config is None: self.audio_config = AudioConfig()
         if not self.stages: self.stages = list(DEFAULT_PIPELINE_STAGES) # Use constant
-        if not self.hyperparameters: # Check if empty dict/None
-             from ..models.hyperparameters import HyperparameterConfig # Local import
-             self.hyperparameters = HyperparameterConfig()
+        # hyperparameters is now lazily initialized via get_hyperparameters() method
 
 
 @dataclass
@@ -332,3 +337,16 @@ class PipelineResult:
         d["output_file"] = str(self.output_file) if self.output_file else None
         d["audio_file"] = str(self.audio_file) if self.audio_file else None
         return d
+
+
+@dataclass
+class ProcessedFile:
+    """Information about a processed file for tracking and reporting."""
+    input_path: Path
+    output_path: Optional[Path]
+    format: str
+    timestamp: str
+    processing_time: float
+    metadata: Dict[str, Any]
+    success: bool
+    error_message: Optional[str] = None

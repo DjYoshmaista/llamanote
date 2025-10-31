@@ -13,11 +13,12 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 import time
 
-from ..utils.logger import get_logger_conf, log_execution_time
+from ..utils.logger import get_logger_conf
+from ..utils.decorators import log_execution_time
 from ..utils.helpers import PathGenerator # Import refactored helper
 from ..utils.validators import validate_directory_path
 from ..config.settings import (
-    DEFAULT_OUTPUT_DIR, CACHE_DIR, OUTPUT_FORMAT_OPTIONS,
+    DEFAULT_OUTPUT_DIR, DEFAULT_CACHE_DIR, OUTPUT_FORMAT_OPTIONS,
     DEFAULT_OUTPUT_FORMAT, TIMESTAMP_OUTPUTS, INCLUDE_METADATA
 )
 # Import core types
@@ -87,11 +88,11 @@ class FileHandler:
         
         try:
             self.output_dir = Path(output_dir or DEFAULT_OUTPUT_DIR).resolve()
-            self.cache_dir = Path(cache_dir or CACHE_DIR).resolve()
+            self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR).resolve()
         except Exception as e:
              logger.error(f"Invalid path provided to FileHandler: {e}. Using defaults.", exc_info=True)
              self.output_dir = DEFAULT_OUTPUT_DIR.resolve()
-             self.cache_dir = CACHE_DIR.resolve()
+             self.cache_dir = DEFAULT_CACHE_DIR.resolve()
 
         # Ensure directories exist
         try:

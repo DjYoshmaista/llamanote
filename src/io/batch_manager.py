@@ -56,7 +56,7 @@ class BatchFileManager:
         Returns:
             A list of unique, valid file Paths.
         """
-        reslved_paths = []
+        resolved_paths = []
         for p in input_paths:
             try:
                 resolved_paths.append(Path(os.path.expanduser(p)).resolve())

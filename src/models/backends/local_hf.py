@@ -59,7 +59,7 @@ from ...models.hyperparameters import HyperparameterConfig
 from ...models.registry import ModelEntry
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.helpers import cleanup_resources, get_device_manager
-from ...config.settings import CACHE_DIR, OFFLOAD_DIR
+from ...config.settings import DEFAULT_DEFAULT_CACHE_DIR, OFFLOAD_DIR
 
 logger = get_logger_conf(__name__)
 
@@ -80,7 +80,7 @@ class LocalModelLoader:
     def build_load_config(self) -> Dict[str, Any]:
         """Builds the kwargs dictionary for AutoModelForCausalLM.from_pretrained."""
         self.load_config = {
-            "cache_dir": str(CACHE_DIR),
+            "cache_dir": str(DEFAULT_CACHE_DIR),
             "trust_remote_code": self.trust_remote_code
         }
         
@@ -136,7 +136,7 @@ class LocalModelLoader:
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
-                cache_dir=str(CACHE_DIR),
+                cache_dir=str(DEFAULT_CACHE_DIR),
                 use_fast=True,
                 trust_remote_code=self.trust_remote_code
             )
@@ -162,7 +162,7 @@ class LocalModelLoader:
             if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
                 logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
                 fallback_config = {
-                    "cache_dir": str(CACHE_DIR),
+                    "cache_dir": str(DEFAULT_CACHE_DIR),
                     "trust_remote_code": self.trust_remote_code,
                     "torch_dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
                     "device_map": "auto",
@@ -179,7 +179,7 @@ class LocalModelLoader:
             if load_config.get("device_map") != {"": "cpu"}:
                  logger.warning("Falling back to CPU-only load.")
                  cpu_config = {
-                    "cache_dir": str(CACHE_DIR),
+                    "cache_dir": str(DEFAULT_CACHE_DIR),
                     "trust_remote_code": self.trust_remote_code,
                     "torch_dtype": torch.float32,
                     "device_map": {"": "cpu"},

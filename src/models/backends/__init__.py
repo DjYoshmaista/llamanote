@@ -12,11 +12,11 @@ from typing import Dict, Optional, Any
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...core.errors import ConfigurationError, ModelLoadError
 from ...core.types import (
-    HyperparameterConfig, 
     AudioConfig,
     QuantizationConfig,
     LayerSplitConfig
 )
+from ..hyperparameters import HyperparameterConfig
 from .base import LLMBackend, AudioBackend
 
 # --- Conditional Imports for Backends ---
