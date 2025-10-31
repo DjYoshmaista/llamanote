@@ -20,43 +20,6 @@ from ..config.settings import (
 
 logger = get_logger_conf(__name__)
 
-class ChunkingStrategy(Enum):
-    """Different strategies for chunking text"""
-    WORD_BOUNDARY = "word_boundary"
-    SENTENCE_BOUNDARY = "sentence_boundary"
-    PARAGRAPH_BOUNDARY = "paragraph_boundary"
-    SEMANTIC = "semantic"
-    SLIDING_WINDOW = "sliding_window"
-    TOKEN_BASED = "token_based"
-
-
-@dataclass
-class TextChunk:
-    """Represents a text chunk with metadata"""
-    text: str
-    index: int
-    start_pos: int
-    end_pos: int
-    word_count: int
-    char_count: int
-    metadata: Dict[str, Any] = None
-    
-    @property
-    def is_complete_sentence(self) -> bool:
-        """Check if chunk ends with sentence terminator"""
-        return self.text.rstrip().endswith(('.', '!', '?'))
-
-
-@dataclass
-class ChunkingResult:
-    """Result of text chunking operation"""
-    chunks: List[TextChunk]
-    total_chunks: int
-    strategy_used: ChunkingStrategy
-    average_chunk_size: float
-    overlap_used: int
-    metadata: Dict[str, Any] = None
-
 def _apply_overlap_and_create_chunks(self, 
                                      initial_chunks: List[str], 
                                      strategy: ChunkingStrategy) -> List[TextChunk]:

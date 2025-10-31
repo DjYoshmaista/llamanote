@@ -79,15 +79,16 @@ def validate_file_path(path: Path,
                     # Check if it has pages (basic validity check)
                     if not reader.pages and path.stat().st_size > 1024: # Check size and pagecount
                         # Consider potentially invalid if non-empty but 0 pages
-                        validation = input(f"PDF File `{f}` found to have zero pages, but is of size `{path.stat().st_size}`.\nPDF File potentially invalid, attempt to load anyways (Could create errors during processing, loading, or execution of code) [y/N]: ")
-                        if validation.lower() == 'y':
-                            return True, ""
-                        elif validation.lower() == 'n':
-                            return False, "PDF appears empty or corrupted (0 pages found with > 0 bytes file size)"
-                        else:
-                            print("Invalid input!  Please input either 'y' for yes or 'n' for no...")
-                            sys.sleep(2)
-                            continue
+                        while True:
+                            validation = input(f"PDF File `{f}` found to have zero pages, but is of size `{path.stat().st_size}`.\nPDF File potentially invalid, attempt to load anyways (Could create errors during processing, loading, or execution of code) [y/N]: ")
+                            if validation.lower() == 'y':
+                                return True, ""
+                            elif validation.lower() == 'n':
+                                return False, "PDF appears empty or corrupted (0 pages found with > 0 bytes file size)"
+                            else:
+                                print("Invalid input!  Please input either 'y' for yes or 'n' for no...")
+                                sys.sleep(2)
+                                continue
                 except PdfReadError as pdf_err:
                     # Catch specific PyPDF2 read errors
                     return False, f"Invalid or corrupted PDF file (PyPDF2 error): {pdf_err}"

@@ -20,7 +20,7 @@ try:
     PSUTIL_AVAILABLE = True
 except ImportError as e:
     print(f"Error importing psutil: '{e}'")
-    PSUTIL_AVAILBLE = False
+    PSUTIL_AVAILABLE = False  # Corrected variable name from PSUTIL_AVAILBLE
     psutil = None
 
 try:
@@ -32,25 +32,28 @@ except ImportError as e:
     torch = None
 
 # local module imports
-from ..config.settings import get_logging_config
+# from ..config.settings import get_logging_config  <- MOVED TO setup_logging
 
 # Global flag to track if logging has been configured
 _logging_configured = False
-DEFAULT_LOG_DIR = "../../logs"
+DEFAULT_LOG_DIR = "../../logs"  # This will be overridden by settings if possible
 
 SAVE_ERROR_CONTEXT = True
 
 
 def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None):
     """Configures logging for the application."""
+    
+    # Import moved inside function to prevent circular import
+    from ..config.settings import get_logging_config, DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
+
     global _logging_configured
     if _logging_configured:
         # Update level if already configured
         logging.getLogger("llamanote").setLevel(log_level)
         return
 
-    # Use DEFAULT_LOG_diR from settings as fallback
-    from ..config.settings import DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
+    # Use DEFAULT_LOG_DIR from settings as fallback
     effective_log_dir = Path(log_dir or SETTINGS_DEFAULT_LOG_DIR).resolve()
 
     try:
@@ -66,8 +69,10 @@ def setup_logging(log_level: int = logging.INFO, log_dir: Optional[Path] = None)
 
         # Apply config
         logging.config.dictConfig(logging_config)
-        # Ensure the root logger's level doesn't suppress messages lower than INFO for console
-        logging.getLogger().handlers[0].setLevel(logging.getLevelName(log_level)) # Assuming console is root's first handler
+        
+        # Ensure the root logger's console handler level is also set
+        if logging.getLogger().handlers: # Check if root handler exists
+            logging.getLogger().handlers[0].setLevel(logging.getLevelName(log_level)) # Assuming console is root's first handler
 
         _logging_configured = True
         logger = logging.getLogger("llamanote.logger_setup") # Use a specific logger
@@ -120,7 +125,8 @@ class MemoryMonitor:
                 # Use max_memory_allocated for peak since last reset, or memory_allocated for current.  Using current for deltas
                 allocated = torch.cuda.memory_allocated()
                 # Reset peak stats if measuring peak between chunks
-                torch.cuda.reset_peak_memory_state()
+                if hasattr(torch.cuda, 'reset_peak_memory_stats'): # Check if function exists
+                    torch.cuda.reset_peak_memory_stats()
                 return allocated
             except Exception as e:
                 self.logger.warning(f"Failed to get GPU VRAM usage: {e}")
@@ -152,9 +158,9 @@ class MemoryMonitor:
             delta_start_mb = (current_ram - (self.start_ram_bytes or current_ram)) / (1024 * 1024)
             delta_last_mb = (current_ram - (self.last_ram_bytes or current_ram)) / (1024 * 1024)
             log_messages.append(
-                    f"  RAM: {ram_mb:.1f} MB (ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb:*.1f} MB)"
+                    f"  RAM: {ram_mb:.1f} MB (ΔStart: {delta_start_mb:+.1f} MB, ΔLast: {delta_last_mb:+.1f} MB)"
                     )
-            if abs(current_ram - (self.last_ram_bytes or current_ram)) > self.threshold_bytes:
+            if self.last_ram_bytes is not None and abs(current_ram - self.last_ram_bytes) > self.threshold_bytes:
                 log_worthy = True
             self.last_ram_bytes = current_ram
         else:
@@ -167,21 +173,22 @@ class MemoryMonitor:
             delta_last_mb = (current_gpu - (self.last_gpu_bytes or current_gpu)) / (1024 * 1024)
 
             # Optionally get peak memory since last reset
-            peak_gpu_mb = (torch.cuda.max_memory_allocated() / (1024 * 1024)) if self.gpu_available else 0
+            peak_gpu_mb = (torch.cuda.max_memory_allocated() / (1024 * 1024)) if self.gpu_available and hasattr(torch.cuda, 'max_memory_allocated') else 0
 
             log_messages.append(
-                    f"  GPU: {gpu_mb:.1f} MB (Peak: {peak_gpu_mb:.1f} MB, ΔStart: {delta_start_mb:*.1f} MB, ΔLast: {delta_last_mb} MB)"
+                    f"  GPU: {gpu_mb:.1f} MB (Peak: {peak_gpu_mb:.1f} MB, ΔStart: {delta_start_mb:+.1f} MB, ΔLast: {delta_last_mb:+.1f} MB)"
                 )
-            if abs(current_gpu - (self.last_gpu_bytes or current_gpu)) > self.threshold_bytes:
+            if self.last_gpu_bytes is not None and abs(current_gpu - self.last_gpu_bytes) > self.threshold_bytes:
                 log_worthy = True
             self.last_gpu_bytes = current_gpu
             # Reset peak for next check
-            if self.gpu_available:
+            if self.gpu_available and hasattr(torch.cuda, 'reset_peak_memory_stats'):
                 torch.cuda.reset_peak_memory_stats()
-        if self.gpu_available: # Log N/A only if GPU was expected
-            log_messages.append("  GPU: NA")
+        elif self.gpu_available: # Log N/A only if GPU was expected
+            log_messages.append("  GPU: N/A")
+            
         # Log only if memory changed significantly or it's the first check
-        if log_worthy or self.last_ram_bytes == self.start_ram_bytes:
+        if log_worthy or (self.start_ram_bytes is not None and self.last_ram_bytes == self.start_ram_bytes):
             self.logger.info("\n".join(log_messages))
         else:
             self.logger.debug(f"Memory check @ '{description}': No significant change.")
@@ -226,16 +233,17 @@ class ContextLogger:
         formatted_message = self._format_message(message)
         self.logger.critical(formatted_message, exc_info=exc_info, **kwargs)
         if save_context and SAVE_ERROR_CONTEXT:
+            self.logger.error(f"Critical failure: {message}", exc_info=exc_info) # Log with traceback
             self._save_error_context(message, include_traceback=exc_info)
 
     def _save_error_context(self, message: str, include_traceback: bool):
         """Saves current context and optional traceback to a JSON file."""
         try:
-            # Need to get log_dir reliably. Assume it's configured.
-            # This is slightly tricky as the logger doesn't own the log_dir path.
-            # We might need ConfigManager here, or pass log_dir during setup.
-            # For simplicity, let's assume DEFAULT_LOG_DIR is accessible and created.
-            error_log_dir = Path(DEFAULT_LOG_DIR).resolve() # Use default path for error context
+            # Need to get log_dir reliably.
+            # Import here, inside the method, to avoid circular dependencies
+            from ..config.settings import DEFAULT_LOG_DIR as SETTINGS_DEFAULT_LOG_DIR
+            
+            error_log_dir = Path(SETTINGS_DEFAULT_LOG_DIR).resolve() # Use default path for error context
             error_log_dir.mkdir(parents=True, exist_ok=True) # Ensure it exists
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -271,9 +279,15 @@ def get_logger_conf(name: str) -> ContextLogger:
 class ConsoleOutput:
     """Utilities for formatted console output using ANSI codes."""
     # ANSI color codes
-    HEADER = '\033[95m'; OKBLUE = '\033[94m'; OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'; WARNING = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'; UNDERLINE = '\033[4m'
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
     @staticmethod
     def _is_color_supported() -> bool:
@@ -322,7 +336,7 @@ class ConsoleOutput:
     @classmethod
     def success(cls, message: str): print(f"{cls._colorize('✅ ' + message, cls.OKGREEN)}")
     @classmethod
-    def warning(cls, message: str): print(f"{cls._colorize('⚠️  ' + message, cls.WARNING)}")
+    def warning(cls, message: str): print(f"{cls._colorize('⚠️ ' + message, cls.WARNING)}")
     @classmethod
     def error(cls, message: str): print(f"{cls._colorize('❌ ' + message, cls.FAIL)}")
     @classmethod

@@ -10,7 +10,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from PyPDF2 import PdfReader
 from PyPDF2.errors import PdfReadError
 import fitz  # PyMuPDF
-from load_dotenv import load_dotenv
+import os
+from dotenv import load_dotenv
 
 from ..utils.logger import get_logger_conf, LoggingProgress
 from ..utils.decorators import log_execution_time

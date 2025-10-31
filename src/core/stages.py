@@ -25,7 +25,7 @@ from ..core.errors import PipelineError, MissingDataError, PDFExtractionError, G
 
 # Import components required by stages
 from ..processing.pdf_extractor import PDFProcessor
-from ..processing.text_preprocessor import TextPreprocessor, PDFTextCleaner
+from ..processing.text_preprocessor import TextPreprocessor # Removed PDFTextCleaner
 from ..processing.text_chunker import TextChunker
 from ..processing.response_filter import ChunkedResponseFilter
 from ..formatting.base_formatter import BaseFormatter, get_formatter
@@ -35,7 +35,6 @@ from ..models.backends.base import LLMBackend, AudioBackend
 logger = get_logger_conf(__name__)
 
 # --- Stage 1: Extraction ---
-
 @log_execution_time(logger_name=__name__)
 def run_extraction_stage(
     input_path: Path,
@@ -90,37 +89,32 @@ def run_extraction_stage(
 
 
 # --- Stage 2: Preprocessing ---
-
 @log_execution_time(logger_name=__name__)
 def run_preprocess_stage(
     text: str, 
     config: PipelineConfig,
-    text_cleaner: PDFTextCleaner,
     text_preprocessor: TextPreprocessor
 ) -> str:
     """Handles text cleaning and normalization."""
     logger.info("Stage 'preprocess': Cleaning extracted text.")
-    
-    cleaned_text = text
+    cleaned_text = text_preprocessor.preprocess_for_llm(text)
+
     if config.clean_for_audio and config.mode == ProcessingMode.PODCAST:
-        cleaned_text = text_cleaner.clean_for_audio(cleaned_text)
+        # Use the text_preprocessor instance, which has the clean_for_audio method
+        preprocessed_text = text_preprocessor.clean_for_audio(cleaned_text) # <-- CHANGED
         logger.debug("Applied audio-specific cleaning.")
-    
-    preprocessed_text = text_preprocessor.preprocess_for_llm(cleaned_text)
     
     ConsoleOutput.info(f"Preprocessing complete. Text length: {len(preprocessed_text):,} chars")
     return preprocessed_text
 
-
 # --- Stage 3: Chunking ---
-
 @log_execution_time(logger_name=__name__)
 def run_chunking_stage(
     text: str,
     text_chunker: TextChunker
 ) -> ChunkingResult:
     """Handles splitting text into chunks."""
-    logger.info(f"Stage 'chunk': Chunking text using {text_chunker.default_strategy.value} strategy.")
+    logger.info(f"Stage 'chunk': Chunking text using {text_chunker.strategy.value} strategy.") # Fixed: use .strategy, not .default_strategy
     
     result = text_chunker.chunk_text(text) # Uses chunker's configured strategy
     
@@ -133,7 +127,6 @@ def run_chunking_stage(
     return result
 
 # --- Stage 4: Processing (LLM) ---
-
 @log_execution_time(logger_name=__name__)
 def run_processing_stage(
     chunks: List[str],
@@ -163,7 +156,8 @@ def run_processing_stage(
            exceptions_to_catch=(GenerationError, TimeoutError, IOError), # Add specific errors
            logger_name=__name__)
     def _process_chunk_with_retry(chunk: str) -> GenerationResult:
-        return llm_backend.process_chat(
+        # Use process_with_chat_template for consistency
+        return llm_backend.process_with_chat_template(
             system_prompt=system_prompt,
             user_message=chunk,
             hyperparams=config.hyperparameters,
@@ -205,7 +199,6 @@ def run_processing_stage(
     return processed_chunks
 
 # --- Stage 5: Filtering ---
-
 @log_execution_time(logger_name=__name__)
 def run_filtering_stage(
     processed_chunks: List[str],
@@ -235,7 +228,6 @@ def run_filtering_stage(
 
 
 # --- Stage 6: Formatting ---
-
 @log_execution_time(logger_name=__name__)
 def run_formatting_stage(
     filtered_text: str,
@@ -256,7 +248,6 @@ def run_formatting_stage(
 
 
 # --- Stage 7: Saving ---
-
 @log_execution_time(logger_name=__name__)
 def run_save_stage(
     text_to_save: str,
@@ -271,7 +262,7 @@ def run_save_stage(
 
     # Generate the final output path
     # If output_path_base is set (e.g., via -o), use it
-    # Otherwise, generate a name based on the input file
+    # Otherwise, generate a name based on the input_path
     if output_path_base:
         # Check if it was a directory (from -o <dir>) or a specific file (from -o <file>)
         if output_path_base.suffix: # It's a file path
@@ -325,14 +316,13 @@ def run_save_stage(
     ConsoleOutput.success(f"File saved: {saved_path.name}")
     return saved_path
 
-
 # --- Stage 8: Audio Generation (New stage) ---
-
 @log_execution_time(logger_name=__name__)
 def run_audio_stage(
     text_file_path: Path,
     audio_backend: AudioBackend,
-    config: PipelineConfig
+    config: PipelineConfig,
+    text_preprocessor: TextPreprocessor  # Pass in the preprocessor instance
 ) -> Optional[AudioResult]:
     """Handles generating audio from a text file."""
     if not audio_backend:
@@ -361,7 +351,13 @@ def run_audio_stage(
         # Consolidate whitespace
         text_content = re.sub(r'\n{2,}', '\n', text_content).strip()
 
-        if not text_content:
+        # Apply the *full* audio cleaning from the preprocessor
+        if config.clean_for_audio:
+            text_for_audio = text_preprocessor.clean_for_audio(text_content)
+        else:
+            text_for_audio = text_content
+
+        if not text_for_audio.strip():
             logger.warning(f"Skipping audio generation for {text_file_path.name}: No content after cleaning.")
             return None
 
@@ -369,12 +365,12 @@ def run_audio_stage(
         audio_output_path = text_file_path.with_suffix(f".{config.audio_config.output_format}")
         
         # Ensure audio model is loaded (for local models)
-        if not audio_backend.model_handle:
+        if not audio_backend.is_loaded: # Use is_loaded flag
             if not audio_backend.load():
                 raise ModelLoadError(f"Failed to load audio backend {audio_backend.model_identifier}", audio_backend.model_specifier)
         
         audio_result = audio_backend.generate_audio(
-            text=text_content,
+            text=text_for_audio,
             output_path=audio_output_path,
             chunk_text=(audio_backend.provider_identifier == 'local_audio')
         )

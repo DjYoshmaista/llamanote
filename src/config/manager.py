@@ -11,15 +11,17 @@ from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 import shutil
 
-from ..utils.logger import get_logger_conf
+# from ..utils.logger import get_logger_conf  <-- REMOVE THIS LINE
 from .settings import BASE_DIR, DEFAULT_MODEL_KEY # Use central settings
 from .cloud_keys import CloudKeyManager # Import the dedicated key manager
 
-logger = get_logger_conf(__name__)
+# logger = get_logger_conf(__name__) <-- REMOVE THIS LINE
 
 # --- Helper ---
 def _ensure_directory(dir_path: Path):
     """Ensures a directory exists."""
+    from ..utils.logger import get_logger_conf # <-- ADD IMPORT HERE
+    logger = get_logger_conf(__name__) # <-- ADD LOGGER HERE
     try:
         dir_path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -33,6 +35,8 @@ class ConfigCRUD:
         self.dir_path = dir_path
         self.config_type = config_type
         _ensure_directory(self.dir_path)
+        from ..utils.logger import get_logger_conf # <-- ADD IMPORT HERE
+        self.logger = get_logger_conf(f"{__name__}.ConfigCRUD") # <-- INITIALIZE self.logger HERE
 
     def _get_config_path(self, name: str) -> Path:
         # Basic sanitization, replace spaces, remove unsafe chars
@@ -48,13 +52,13 @@ class ConfigCRUD:
             config["_metadata"] = {"saved_name": name, "created": datetime.now().isoformat(), "type": self.config_type}
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, sort_keys=True)
-            logger.info(f"Saved {self.config_type} config: {name} to {config_file.name}")
+            self.logger.info(f"Saved {self.config_type} config: {name} to {config_file.name}") # Uses self.logger
             return True
         except TypeError as e:
-             logger.error(f"Failed to serialize {self.config_type} config '{name}' to JSON: {e}. Check for non-serializable types.")
+             self.logger.error(f"Failed to serialize {self.config_type} config '{name}' to JSON: {e}. Check for non-serializable types.") # Uses self.logger
              return False
         except Exception as e:
-            logger.error(f"Failed to save {self.config_type} config '{name}': {e}", exc_info=True)
+            self.logger.error(f"Failed to save {self.config_type} config '{name}': {e}", exc_info=True) # Uses self.logger
             return False
 
     def load(self, name: str) -> Optional[Dict[str, Any]]:
@@ -66,19 +70,19 @@ class ConfigCRUD:
              if possible_original_file.exists():
                  config_file = possible_original_file
              else:
-                 logger.debug(f"{self.config_type.capitalize()} config '{name}' not found at {config_file}")
+                 self.logger.debug(f"{self.config_type.capitalize()} config '{name}' not found at {config_file}") # Uses self.logger
                  return None
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             config.pop("_metadata", None) # Remove internal metadata
-            logger.info(f"Loaded {self.config_type} config: {name} from {config_file.name}")
+            self.logger.info(f"Loaded {self.config_type} config: {name} from {config_file.name}") # Uses self.logger
             return config
         except json.JSONDecodeError as e:
-             logger.error(f"Failed to parse {self.config_type} config '{name}' ({config_file.name}): {e}")
+             self.logger.error(f"Failed to parse {self.config_type} config '{name}' ({config_file.name}): {e}") # Uses self.logger
              return None
         except Exception as e:
-            logger.error(f"Failed to load {self.config_type} config '{name}' ({config_file.name}): {e}", exc_info=True)
+            self.logger.error(f"Failed to load {self.config_type} config '{name}' ({config_file.name}): {e}", exc_info=True) # Uses self.logger
             return None
 
     def list(self) -> List[str]:
@@ -106,15 +110,15 @@ class ConfigCRUD:
              if file_to_delete.exists():
                  try:
                      file_to_delete.unlink()
-                     logger.info(f"Deleted {self.config_type} config file: {file_to_delete.name} (requested name: {name})")
+                     self.logger.info(f"Deleted {self.config_type} config file: {file_to_delete.name} (requested name: {name})") # Uses self.logger
                      deleted = True
                      # Don't break, might need to delete both if names clash weirdly
                  except Exception as e:
-                     logger.error(f"Failed to delete {self.config_type} config file '{file_to_delete.name}': {e}")
+                     self.logger.error(f"Failed to delete {self.config_type} config file '{file_to_delete.name}': {e}") # Uses self.logger
                      # Continue trying other path if exists
 
         if not deleted:
-             logger.warning(f"{self.config_type.capitalize()} config '{name}' not found for deletion.")
+             self.logger.warning(f"{self.config_type.capitalize()} config '{name}' not found for deletion.") # Uses self.logger
 
         return deleted
 
@@ -130,6 +134,9 @@ class ConfigManager:
             base_dir: Optional path to the root configuration directory.
                       Defaults to ~/.config/llamanote.
         """
+        from ..utils.logger import get_logger_conf # <-- ADD IMPORT HERE
+        self.logger = get_logger_conf(f"{__name__}.ConfigManager") # <-- INITIALIZE self.logger HERE
+
         self.base_dir = Path(base_dir or Path.home() / ".config" / "llamanote").resolve()
         _ensure_directory(self.base_dir)
 
@@ -163,7 +170,7 @@ class ConfigManager:
         # Custom Paths Handling (uses self.configs CRUD handler)
         self.custom_paths = self._load_custom_paths()
 
-        logger.info(f"Initialized ConfigManager. Base directory: {self.base_dir}")
+        self.logger.info(f"Initialized ConfigManager. Base directory: {self.base_dir}") # <-- Use self.logger
 
     # --- Directory Access ---
     def get_dir(self, dir_type: str) -> Path:
@@ -190,7 +197,7 @@ class ConfigManager:
                   if isinstance(k, str) and isinstance(v, str):
                        valid_paths[k] = v # Store as string
                   else:
-                       logger.warning(f"Ignoring invalid entry in paths.json: {k}={v}")
+                       self.logger.warning(f"Ignoring invalid entry in paths.json: {k}={v}") # Uses self.logger
         return valid_paths
 
     def set_custom_path(self, name: str, path: Union[str, Path]):
@@ -200,9 +207,9 @@ class ConfigManager:
              path_str = str(Path(path).resolve()) # Store resolved absolute path string
              self.custom_paths[name] = path_str
              self.configs.save("paths", self.custom_paths)
-             logger.info(f"Set custom path '{name}' to '{path_str}'")
+             self.logger.info(f"Set custom path '{name}' to '{path_str}'") # Uses self.logger
         except Exception as e:
-             logger.error(f"Failed to set custom path '{name}' to '{path}': {e}", exc_info=True)
+             self.logger.error(f"Failed to set custom path '{name}' to '{path}': {e}", exc_info=True) # Uses self.logger
 
 
     # --- Cloud Key Passthrough Methods ---
@@ -237,7 +244,7 @@ class ConfigManager:
         """Gets default config, falling back to hardcoded."""
         loaded = self.configs.load("default")
         if loaded: return loaded
-        logger.warning("Default config file not found/loaded. Using hardcoded defaults.")
+        self.logger.warning("Default config file not found/loaded. Using hardcoded defaults.") # Uses self.logger
         # Minimal hardcoded defaults
         return {"mode": "podcast", "model_provider": "local_hf", "model_specifier": DEFAULT_MODEL_KEY}
 
@@ -254,7 +261,7 @@ class ConfigManager:
             if dir_path.exists() and dir_path.is_dir():
                 operation_fn(dir_path, dir_type) # Pass path and type name
             else:
-                logger.debug(f"Skipping non-existent directory during backup/restore: {dir_path}")
+                self.logger.debug(f"Skipping non-existent directory during backup/restore: {dir_path}") # Uses self.logger
 
     def backup_configs(self, backup_name: Optional[str] = None) -> Optional[Path]:
         """Backs up configuration directories."""
@@ -263,32 +270,32 @@ class ConfigManager:
             backup_name = backup_name or f"backup_{ts}"
             backup_root = self.get_dir("backup") / backup_name # Use get_dir for backup location
             _ensure_directory(backup_root)
-            logger.info(f"Starting backup to {backup_root}...")
+            self.logger.info(f"Starting backup to {backup_root}...") # Uses self.logger
 
             def copy_dir(src_dir, dir_type):
                 dst_dir = backup_root / dir_type
                 shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
-                logger.debug(f"Backed up {dir_type} from {src_dir} to {dst_dir}")
+                self.logger.debug(f"Backed up {dir_type} from {src_dir} to {dst_dir}") # Uses self.logger
 
             self._iterate_backup_dirs(copy_dir)
-            logger.info(f"Configuration backup completed: {backup_root}")
+            self.logger.info(f"Configuration backup completed: {backup_root}") # Uses self.logger
             return backup_root
         except Exception as e:
-            logger.error(f"Failed to create backup '{backup_name}': {e}", exc_info=True)
+            self.logger.error(f"Failed to create backup '{backup_name}': {e}", exc_info=True) # Uses self.logger
             return None
 
     def restore_backup(self, backup_name: str) -> bool:
         """Restores configuration from a backup."""
         backup_root = self.get_dir("backup") / backup_name
         if not backup_root.is_dir():
-            logger.error(f"Backup directory not found: {backup_root}")
+            self.logger.error(f"Backup directory not found: {backup_root}") # Uses self.logger
             return False
         try:
-            logger.warning(f"Starting restore from backup: {backup_name}. This will overwrite current configs.")
+            self.logger.warning(f"Starting restore from backup: {backup_name}. This will overwrite current configs.") # Uses self.logger
             # Simple confirmation - enhance if needed
             confirm = input("Are you sure you want to restore? (yes/no): ").strip().lower()
             if confirm != 'yes':
-                 logger.info("Restore cancelled by user.")
+                 self.logger.info("Restore cancelled by user.") # Uses self.logger
                  return False
 
             def restore_dir(src_dir_in_backup, dir_type):
@@ -298,18 +305,18 @@ class ConfigManager:
                 # Optional: Clear destination dir first? Risky. Overwrite is safer.
                 # if dst_dir.exists(): shutil.rmtree(dst_dir)
                 shutil.copytree(src_dir_for_copy, dst_dir, dirs_exist_ok=True)
-                logger.debug(f"Restored {dir_type} from {src_dir_for_copy} to {dst_dir}")
+                self.logger.debug(f"Restored {dir_type} from {src_dir_for_copy} to {dst_dir}") # Uses self.logger
 
             self._iterate_backup_dirs(restore_dir)
 
             # Reload custom paths after potential restore
             self.custom_paths = self._load_custom_paths()
 
-            logger.info(f"Successfully restored configuration from backup: {backup_name}")
-            logger.warning("Application restart might be needed for all changes to take effect.")
+            self.logger.info(f"Successfully restored configuration from backup: {backup_name}") # Uses self.logger
+            self.logger.warning("Application restart might be needed for all changes to take effect.") # Uses self.logger
             return True
         except Exception as e:
-            logger.error(f"Failed to restore backup '{backup_name}': {e}", exc_info=True)
+            self.logger.error(f"Failed to restore backup '{backup_name}': {e}", exc_info=True) # Uses self.logger
             return False
 
     def list_backups(self) -> List[str]:

@@ -3,14 +3,16 @@
 Response Filter Module
 Filters out thinking tokens and other unwanted patterns from LLM responses.
 """
-
+for __future__ import annotations
 import re
-from typing import List, Tuple, Optional, Dict, Any, Set
+from typing import List, Tuple, Optional, Dict, Any, Set, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from ..utils.logger import get_logger_conf
 from ..core.types import FilterResult
-from ..models.registry import ModelEntry
+
+if TYPE_CHECKING:
+    from ..models.registry import ModelEntry
 
 logger = get_logger_conf(__name__)
 
@@ -42,7 +44,7 @@ class ResponseFilter:
     Filters thinking tokens, acknowledgments, and other patterns from LLM responses.
     """
     
-    def __init__(self, model_config: Optional[ModelEntry] = None):
+    def __init__(self, model_config: Optional['ModelEntry'] = None):
         self.patterns: List[Tuple[re.Pattern, str]] = []
         self.artifact_patterns: List[re.Pattern] = []
         
@@ -150,7 +152,7 @@ class ChunkedResponseFilter:
     Specialized filter for handling chunked responses, focusing on stitching.
     """
     
-    def __init__(self, model_config: Optional[ModelEntry] = None):
+    def __init__(self, model_config: Optional['ModelEntry'] = None):
         self.filter = ResponseFilter(model_config)
         self.continuation_patterns = [
             re.compile(r"^\.\.\.\s*continuing.*(?:\n|$)", re.IGNORECASE),
