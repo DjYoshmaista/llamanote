@@ -163,9 +163,15 @@ class AppState:
     max_gpu_memory: str = "4GiB"
     max_cpu_memory: str = "24GiB"
 
+    # --- Advanced memory optimization settings ---
+    layer_split_config: LayerSplitConfig = field(default_factory=LayerSplitConfig)
+
     def __post_init__(self):
         """Update compute settings from default profile."""
         self.update_compute_settings(self.memory_profile, force=True)
+        # Ensure layer_split_config is initialized with defaults
+        if not hasattr(self, 'layer_split_config') or self.layer_split_config is None:
+            self.layer_split_config = LayerSplitConfig()
 
     def update_compute_settings(self, profile_name: str, force: bool = False):
         """Updates compute settings based on a memory profile name."""
@@ -197,6 +203,7 @@ class AppState:
         # Store nested dataclasses as dicts
         data["hyperparameters"] = self.hyperparameters.to_dict()
         data["audio_config"] = self.audio_config.to_dict()
+        # layer_split_config is already converted by asdict, but ensure it's serialized
         return data
 
     def from_dict(self, data: Dict[str, Any]):
@@ -222,7 +229,7 @@ class AppState:
             
             self.hyperparameters = HyperparameterConfig(**data.get("hyperparameters", {}))
             self.audio_config = AudioConfig(**data.get("audio_config", {}))
-            
+
             self.stages_to_run = data.get("stages_to_run", list(DEFAULT_PIPELINE_STAGES))
             self.run_audio_generation = data.get("run_audio_generation", False)
             self.system_prompt = data.get("system_prompt", PREPROCESS_PROMPT)
@@ -233,6 +240,13 @@ class AppState:
             self.gpu_layers = data.get("gpu_layers", DEFAULT_GPU_LAYERS)
             self.max_gpu_memory = data.get("max_gpu_memory", "10GB")
             self.max_cpu_memory = data.get("max_cpu_memory", "30GB")
+
+            # Load layer_split_config
+            layer_split_data = data.get("layer_split_config", {})
+            if layer_split_data:
+                self.layer_split_config = LayerSplitConfig(**layer_split_data)
+            else:
+                self.layer_split_config = LayerSplitConfig()
 
             # Restore preserved values
             self.input_files = current_inputs
@@ -260,14 +274,20 @@ class AppState:
                 resolved_specifier = self.text_model_specifier
         
         # 2. Build Hardware Configs
-        # Get base configs from profile
-        quant_config, layer_split_config = create_configs_from_memory_profile(self.memory_profile)
-        # Apply overrides
+        # Use the layer_split_config from AppState (which includes advanced memory settings)
+        # Get base configs from profile for quantization
+        quant_config, _ = create_configs_from_memory_profile(self.memory_profile)
+        # Apply quantization override
         quant_config.method = self.quantization
+
+        # Use the state's layer_split_config which has advanced memory optimization settings
+        # but also apply profile-based overrides for backwards compatibility
+        layer_split_config = self.layer_split_config
         layer_split_config.gpu_layers = self.gpu_layers
         layer_split_config.max_cpu_memory = self.max_cpu_memory
         if layer_split_config.max_gpu_memory: # Update all GPUs if dict exists
-            layer_split_config.max_gpu_memory = {i: self.max_gpu_memory for i in layer_split_config.max_gpu_memory.keys()}
+            # Ensure keys are integers, not strings
+            layer_split_config.max_gpu_memory = {int(i): self.max_gpu_memory for i in layer_split_config.max_gpu_memory.keys()}
         
         # 3. Determine System Prompt
         system_prompt_str = self.system_prompt # Check if user set one
@@ -402,18 +422,24 @@ class MenuSystem:
             ),
             MenuItem(
                 "3",
+                "Advanced Memory Optimization",
+                self._memory_optimization_menu,
+                description="Configure CPU/disk offloading, OOM handling, cache management"
+            ),
+            MenuItem(
+                "4",
                 "Set Text Hyperparameters",
                 self._set_text_hyperparameters,
                 description="e.g., Temperature, Top-p, Max Tokens"
             ),
             MenuItem(
-                "4",
+                "5",
                 "Set Audio Model (TTS)",
                 self._set_audio_model_menu,
                 description=lambda: f"Provider: {self.state.audio_model_provider} | Model: {self.state.audio_model_specifier}"
             ),
             MenuItem(
-                "5",
+                "6",
                 "Configure Audio Settings",
                 self._set_audio_config,
                 description="e.g., Voice, Speed, Format"
@@ -745,7 +771,7 @@ class MenuSystem:
             input("Press Enter to continue...")
             return MenuAction.BACK
 
-        manager = GGUFModelManager(cache_dir=DEFAULT_CACHE_DIR / "gguf_models")
+        manager = GGUFModelManager()
         
         while True:
             ConsoleOutput.subsection("Select Local GGUF Model")
@@ -983,6 +1009,109 @@ class MenuSystem:
             except Exception as e:
                  ConsoleOutput.error(f"Error updating setting: {e}")
 
+    def _memory_optimization_menu(self):
+        """Interactive menu for advanced memory optimization settings."""
+        while True:
+            ConsoleOutput.header("Advanced Memory Optimization Settings")
+            print("These settings apply to local models (HF and Audio)\n")
+
+            # Get current settings from state
+            lsc = self.state.layer_split_config
+            ac = self.state.audio_config
+
+            print("Current Settings:")
+            print(f"  CPU Offloading:         {'ENABLED' if lsc.enabled else 'DISABLED'}")
+            print(f"  Auto OOM Handling:      {'ENABLED' if lsc.auto_oom_handling else 'DISABLED'}")
+            print(f"  Max GPU Memory:         {list(lsc.max_gpu_memory.values())[0] if lsc.max_gpu_memory else 'N/A'}")
+            print(f"  Max CPU Memory:         {lsc.max_cpu_memory}")
+            print(f"  Disk Offloading:        {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
+            print(f"  Cache Clearing (Audio): {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
+            print(f"  Low CPU Mem Mode:       {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
+            print("-" * 70)
+
+            print("\nConfiguration Options:")
+            print("  1. Toggle CPU Offloading")
+            print("  2. Toggle Auto OOM Handling (Progressive Layer Offloading)")
+            print("  3. Set Max GPU Memory")
+            print("  4. Set Max CPU Memory")
+            print("  5. Toggle Disk Offloading")
+            print("  6. Toggle Cache Clearing Between Audio Chunks")
+            print("  7. Toggle Low CPU Memory Mode")
+            print("  8. Reset to Recommended Defaults (4GB VRAM + 28GB RAM)")
+            print("\n  b. Back to Model Settings")
+            print("-" * 70)
+
+            choice = input("Select option: ").strip().lower()
+
+            try:
+                if choice == 'b':
+                    return MenuAction.BACK
+
+                elif choice == '1':
+                    lsc.enabled = not lsc.enabled
+                    ConsoleOutput.success(f"CPU Offloading {'ENABLED' if lsc.enabled else 'DISABLED'}")
+
+                elif choice == '2':
+                    lsc.auto_oom_handling = not lsc.auto_oom_handling
+                    ConsoleOutput.success(f"Auto OOM Handling {'ENABLED' if lsc.auto_oom_handling else 'DISABLED'}")
+                    if lsc.auto_oom_handling:
+                        ConsoleOutput.info("The system will automatically reduce GPU memory allocation if CUDA OOM errors occur")
+
+                elif choice == '3':
+                    current_val = list(lsc.max_gpu_memory.values())[0] if lsc.max_gpu_memory else "4GB"
+                    val = input(f"Enter Max GPU Memory (e.g., 4GB, 3.5GB) [current: {current_val}]: ").strip()
+                    if val:
+                        if re.match(r"^\d+(\.\d+)?(GB|GiB|MB|MiB)$", val, re.IGNORECASE):
+                            lsc.max_gpu_memory = {0: val}
+                            ConsoleOutput.success(f"Max GPU Memory set to {val}")
+                        else:
+                            ConsoleOutput.warning("Invalid format. Use numbers followed by GB, GiB, MB, or MiB.")
+
+                elif choice == '4':
+                    val = input(f"Enter Max CPU Memory (e.g., 28GB) [current: {lsc.max_cpu_memory}]: ").strip()
+                    if val:
+                        if re.match(r"^\d+(\.\d+)?(GB|GiB|MB|MiB)$", val, re.IGNORECASE):
+                            lsc.max_cpu_memory = val
+                            ConsoleOutput.success(f"Max CPU Memory set to {val}")
+                        else:
+                            ConsoleOutput.warning("Invalid format. Use numbers followed by GB, GiB, MB, or MiB.")
+
+                elif choice == '5':
+                    ac.enable_disk_offload = not ac.enable_disk_offload
+                    ConsoleOutput.success(f"Disk Offloading {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
+                    if ac.enable_disk_offload:
+                        ConsoleOutput.warning("Disk offloading is SLOW but saves RAM. Only use if necessary.")
+
+                elif choice == '6':
+                    ac.clear_cache_between_chunks = not ac.clear_cache_between_chunks
+                    ConsoleOutput.success(f"Cache Clearing {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
+
+                elif choice == '7':
+                    lsc.low_cpu_mem_usage = not lsc.low_cpu_mem_usage
+                    ConsoleOutput.success(f"Low CPU Memory Mode {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
+
+                elif choice == '8':
+                    # Reset to recommended defaults
+                    lsc.enabled = True
+                    lsc.auto_oom_handling = True
+                    lsc.max_gpu_memory = {0: "4GB"}
+                    lsc.max_cpu_memory = "28GB"
+                    lsc.low_cpu_mem_usage = True
+                    lsc.offload_state_dict = True
+                    ac.enable_disk_offload = False
+                    ac.clear_cache_between_chunks = True
+                    ac.quantization = "4bit"
+                    ac.enable_cpu_offload = True
+                    ConsoleOutput.success("Reset to recommended defaults for 4GB VRAM + 32GB RAM system")
+
+                else:
+                    ConsoleOutput.warning("Invalid selection.")
+
+            except ValueError:
+                ConsoleOutput.warning("Invalid input value.")
+            except Exception as e:
+                ConsoleOutput.error(f"Error updating setting: {e}")
+
     def _set_text_hyperparameters(self):
         """Opens the interactive hyperparameter editor."""
         ConsoleOutput.section(f"Configure Text Hyperparameters for {self.state.text_model_provider}: {self.state.text_model_specifier}")
@@ -1144,6 +1273,9 @@ class MenuSystem:
                  print(f"  {option_num}. Text Chunk Size:{cfg.chunk_size} chars (Local processing)")
                  provider_options_map[str(option_num)] = 'chunk_size'
                  option_num += 1
+                 print(f"  {option_num}. Quantization   : {cfg.quantization} (none, 4bit, 8bit)")
+                 provider_options_map[str(option_num)] = 'quantization'
+                 option_num += 1
             else: # Cloud
                  print(f"  {option_num}. Cloud Voice   : {cfg.cloud_voice} (Provider-specific, e.g., 'alloy')")
                  provider_options_map[str(option_num)] = 'cloud_voice'
@@ -1217,6 +1349,10 @@ class MenuSystem:
                           cs_str = input(f"Enter text chunk size for TTS (chars) [current: {cfg.chunk_size}]: ").strip()
                           if cs_str.isdigit() and 50 <= int(cs_str) <= 10000: cfg.chunk_size = int(cs_str)
                           elif cs_str: ConsoleOutput.warning("Invalid chunk size (use 50-10000).")
+                     elif setting == 'quantization':
+                          quant = input(f"Enter quantization (none, 4bit, 8bit) [current: {cfg.quantization}]: ").strip().lower()
+                          if quant in ["none", "4bit", "8bit"]: cfg.quantization = quant
+                          elif quant: ConsoleOutput.warning("Invalid quantization.")
 
                 else:
                     ConsoleOutput.warning("Invalid selection.")
@@ -1563,7 +1699,8 @@ class MenuSystem:
                      provider=pipeline_config.audio_provider,
                      model_specifier=pipeline_config.audio_specifier,
                      api_keys=self.state.cloud_api_keys,
-                     config=pipeline_config.audio_config
+                     config=pipeline_config.audio_config,
+                     layer_split_config=pipeline_config.layer_split_config
                  )
                  if audio_backend is None:
                      raise ModelLoadError(f"Could not create audio backend for {pipeline_config.audio_provider}.")

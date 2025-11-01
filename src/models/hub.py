@@ -407,32 +407,17 @@ class ModelHub:
         return Path(model_path)
     
     def is_model_cached(self, model_id: str) -> bool:
-        """Check if a model snapshot exists in the cache."""
-        # Use snapshot_download with local_files_only=True to check the cache
-        # This is the most reliable way to see if a complete snapshot is present.
-        try:
-            model_path_str = snapshot_download(
-                repo_id=model_id,
-                cache_dir=str(self.model_cache_dir),
-                local_files_only=True,
-                # No need for allow/ignore patterns, just checking for existence
-            )
-            model_path = Path(model_path_str)
-            
-            if model_path.exists():
-                self.logger.debug(f"Found cached model {model_id} at {model_path}")
-                # Ensure registry is up-to-date
-                get_registry().mark_cached(model_id, model_path)
-                return True
-            return False
-            
-        except HfHubHTTPError as e:
-            # This specific error is raised by snapshot_download if not found in cache with local_files_only=True
-            self.logger.debug(f"Model {model_id} not found in cache: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"Error checking cache for {model_id}: {e}", exc_info=True)
-            return False
+        """Check if a model snapshot exists in the cache by checking for the directory."""
+        model_path_name = "models--" + model_id.replace("/", "--")
+        expected_path = self.model_cache_dir / model_path_name
+
+        if expected_path.exists() and expected_path.is_dir():
+            self.logger.debug(f"Found cached model {model_id} at {expected_path}")
+            get_registry().mark_cached(model_id, expected_path)
+            return True
+        
+        self.logger.debug(f"Model {model_id} not found at expected path: {expected_path}")
+        return False
 
 
 # --- Interactive Model Browser (Placeholder) ---

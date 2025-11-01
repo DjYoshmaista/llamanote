@@ -576,7 +576,8 @@ def run_cli_processing(args: argparse.Namespace, parser: argparse.ArgumentParser
                 provider=pipeline_config.audio_provider,
                 model_specifier=pipeline_config.audio_specifier,
                 api_keys=api_keys,
-                config=pipeline_config.audio_config # Pass the default config
+                config=pipeline_config.audio_config,  # Pass the default config
+                layer_split_config=pipeline_config.layer_split_config  # Pass memory optimization config
             )
             if audio_backend is None:
                  raise ModelLoadError(f"Could not create audio backend for provider '{pipeline_config.audio_provider}'.")

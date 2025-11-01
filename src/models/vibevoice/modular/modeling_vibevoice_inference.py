@@ -569,14 +569,37 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 for i, sample_idx in enumerate(diffusion_start_indices.tolist()):
                     negative_model_kwargs['attention_mask'][sample_idx, :] = 0
                     negative_model_kwargs['attention_mask'][sample_idx, -1] = 1
+
                 # update past key values
-                for layer_idx in range(len(negative_model_kwargs['past_key_values'])):
-                    k_cache, v_cache = negative_model_kwargs['past_key_values'][layer_idx]
-                    # Process each non-diffusion sample
-                    for sample_idx in diffusion_start_indices.tolist():
-                        # Shift cache for this sample
-                        k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
-                        v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+                # Handle both old tuple/list format and new DynamicCache format
+                past_kv = negative_model_kwargs['past_key_values']
+                # Check if it's NOT a tuple/list (more robust than hasattr check)
+                if not isinstance(past_kv, (tuple, list)):
+                    # New DynamicCache format - access via layers attribute
+                    # DynamicCache.layers is a list of DynamicLayer objects
+                    # Each DynamicLayer has .keys and .values attributes (plural!)
+                    if hasattr(past_kv, 'layers'):
+                        for layer_idx, layer in enumerate(past_kv.layers):
+                            k_cache = layer.keys  # Note: plural 'keys', not 'key'
+                            v_cache = layer.values  # Note: plural 'values', not 'value'
+                            # Process each non-diffusion sample
+                            for sample_idx in diffusion_start_indices.tolist():
+                                # Shift cache for this sample
+                                k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
+                                v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+                    else:
+                        # Unknown Cache type - log error
+                        raise TypeError(f"Unsupported cache type: {type(past_kv)}")
+                else:
+                    # Old tuple/list format
+                    for layer_idx in range(len(past_kv)):
+                        k_cache, v_cache = past_kv[layer_idx]
+                        # Process each non-diffusion sample
+                        for sample_idx in diffusion_start_indices.tolist():
+                            # Shift cache for this sample
+                            k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
+                            v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
+
                 # update negative_input_ids
                 for sample_idx in diffusion_start_indices.tolist():
                     negative_input_ids[sample_idx, -1] = generation_config.speech_start_id
@@ -623,14 +646,37 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                         negative_model_kwargs['attention_mask'][sample_idx, start_idx] = 0
 
                     # 2. Update past_key_values
-                    for layer_idx in range(len(negative_model_kwargs['past_key_values'])):
-                        k_cache, v_cache = negative_model_kwargs['past_key_values'][layer_idx]
-                        # Process each non-diffusion sample
-                        for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
-                            if start_idx + 1 < k_cache.shape[2] - 1:
-                                # Shift cache for this sample
-                                k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
-                                v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
+                    # Handle both old tuple/list format and new DynamicCache format
+                    past_kv = negative_model_kwargs['past_key_values']
+
+                    # Check if it's NOT a tuple/list (more robust than hasattr check)
+                    if not isinstance(past_kv, (tuple, list)):
+                        # New DynamicCache format - access via layers attribute
+                        # DynamicCache.layers is a list of DynamicLayer objects
+                        # Each DynamicLayer has .keys and .values attributes (plural!)
+                        if hasattr(past_kv, 'layers'):
+                            for layer_idx, layer in enumerate(past_kv.layers):
+                                k_cache = layer.keys  # Note: plural 'keys', not 'key'
+                                v_cache = layer.values  # Note: plural 'values', not 'value'
+                                # Process each non-diffusion sample
+                                for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
+                                    if start_idx + 1 < k_cache.shape[2] - 1:
+                                        # Shift cache for this sample
+                                        k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
+                                        v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
+                        else:
+                            # Unknown Cache type - log error
+                            raise TypeError(f"Unsupported cache type: {type(past_kv)}")
+                    else:
+                        # Old tuple/list format
+                        for layer_idx in range(len(past_kv)):
+                            k_cache, v_cache = past_kv[layer_idx]
+                            # Process each non-diffusion sample
+                            for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
+                                if start_idx + 1 < k_cache.shape[2] - 1:
+                                    # Shift cache for this sample
+                                    k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
+                                    v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
                     
                     # 3. Update negative_input_ids
                     for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):

@@ -14,6 +14,54 @@ from .vibevoice_tokenizer_processor import AudioNormalizer
 logger = logging.get_logger(__name__)
 
 
+import re
+
+def parse_script_1_based(script: str) -> Tuple[List[Tuple[int, str]], List[int]]:
+    """Parse script into list of (speaker_id, text) tuples and a list of unique speaker IDs."""
+    lines = script.strip().split("\n")
+    parsed_lines = []
+    unique_speaker_ids = set()
+    speaker_map = {"host": 1, "guest": 2}
+    current_speaker = None
+    capture_text = False
+
+    for line in lines:
+        if not line.strip():
+            continue
+
+        # Try to parse as "**[Speaker <name>]:**"
+        match = re.match(r'^\*\*\[Speaker\s+(.+?)\]:\*\*$', line.strip(), re.IGNORECASE)
+        if match:
+            speaker_name = match.group(1).lower()
+            if speaker_name in speaker_map:
+                current_speaker = speaker_map[speaker_name]
+            else:
+                # Assign a new ID to new speakers
+                if speaker_name not in speaker_map:
+                    speaker_map[speaker_name] = len(speaker_map) + 1
+                current_speaker = speaker_map[speaker_name]
+            capture_text = False # Reset text capture when a new speaker is found
+            continue
+
+        if line.strip().lower() == "assistant":
+            capture_text = True
+            continue
+
+        if capture_text and current_speaker is not None:
+            text = line.strip()
+            if text:
+                parsed_lines.append((current_speaker, text))
+                unique_speaker_ids.add(current_speaker)
+                capture_text = False # Only capture the first line of text after "assistant"
+
+    if not parsed_lines:
+        # If no speaker tags are found, treat the whole script as a single speaker
+        parsed_lines.append((1, script))
+        unique_speaker_ids.add(1)
+
+    return parsed_lines, sorted(list(unique_speaker_ids))
+
+
 class VibeVoiceProcessor:
     r"""
     Constructs a VibeVoice processor which wraps a VibeVoice tokenizer and audio processor into a single processor.
@@ -196,7 +244,7 @@ class VibeVoiceProcessor:
             if text is None:
                 raise ValueError("Either 'text' or 'parsed_scripts' must be provided.")
             # Fallback for raw text input (though the node won't use this path)
-            from ..modules.utils import parse_script_1_based
+            
             parsed_scripts = [parse_script_1_based(t)[0] for t in text]
 
         num_scripts = len(parsed_scripts)

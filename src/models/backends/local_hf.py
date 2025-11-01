@@ -61,6 +61,12 @@ from ...models.registry import ModelEntry
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.helpers import cleanup_resources, get_device_manager
 from ...utils.decorators import log_execution_time, log_resource_usage
+from ...utils.memory_manager import (
+    CUDAMemoryManager,
+    OOMRecoveryStrategy,
+    with_oom_handling,
+    log_memory_summary
+)
 from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_OFFLOAD_DIR
 
@@ -149,53 +155,115 @@ class LocalModelLoader:
             logger.error(f"Failed to load tokenizer for {self.model_id}: {e}", exc_info=True)
             raise ModelLoadError(f"Failed to load tokenizer: {e}", self.model_id) from e
 
-        # --- Load Model ---
-        try:
-            logger.info(f"Attempting to load model '{self.model_id}'...")
+        # --- Load Model with OOM Handling ---
+        # Log memory before loading
+        if self.device_manager.is_cuda_available():
+            log_memory_summary("before model loading", logger)
+
+        # Define model loading function for OOM handler
+        def load_model_fn(**strategy_params):
+            """Model loading function that can be retried with different parameters."""
+            # Merge strategy params with base config
+            config = load_config.copy()
+
+            # Override with strategy params if provided
+            if 'max_memory' in strategy_params:
+                config['max_memory'] = strategy_params['max_memory']
+            if 'device_map' in strategy_params:
+                config['device_map'] = strategy_params['device_map']
+            if 'low_cpu_mem_usage' in strategy_params:
+                config['low_cpu_mem_usage'] = strategy_params['low_cpu_mem_usage']
+            if 'offload_state_dict' in strategy_params:
+                config['offload_state_dict'] = strategy_params['offload_state_dict']
+
+            logger.info(f"Loading model with config: device_map={config.get('device_map')}, "
+                       f"max_memory={config.get('max_memory')}")
+
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
-                **load_config
+                **config
             )
-            logger.info(f"Successfully loaded model: {self.model_id}")
-            return model, tokenizer
-            
-        except Exception as e:
-            logger.error(f"Failed to load model {self.model_id} with config {load_config}: {e}", exc_info=True)
-            
-            # --- Fallback Logic ---
-            # If load failed with quantization or splitting, try a simpler config
-            if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
-                logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
-                fallback_config = {
-                    "cache_dir": str(self.model_cache_dir),
-                    "trust_remote_code": self.trust_remote_code,
-                    "torch_dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
-                    "device_map": "auto",
-                    "low_cpu_mem_usage": self.device_manager.is_cuda_available(),
-                }
-                try:
-                    model = AutoModelForCausalLM.from_pretrained(self.model_id, **fallback_config)
-                    logger.info("Successfully loaded model with standard 'auto' fallback.")
-                    return model, tokenizer
-                except Exception as e2:
-                    logger.error(f"Standard 'auto' fallback failed: {e2}", exc_info=True)
+            return model
 
-            # If that also failed (or wasn't applicable), try CPU
-            if load_config.get("device_map") != {"": "cpu"}:
-                 logger.warning("Falling back to CPU-only load.")
-                 cpu_config = {
-                    "cache_dir": str(self.model_cache_dir),
-                    "trust_remote_code": self.trust_remote_code,
-                    "torch_dtype": torch.float32,
-                    "device_map": {"": "cpu"},
-                 }
-                 try:
-                      model = AutoModelForCausalLM.from_pretrained(self.model_id, **cpu_config)
-                      logger.info("Successfully loaded model with CPU-only fallback.")
-                      return model, tokenizer
-                 except Exception as e3:
-                      logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
-                      
+        try:
+            # Use OOM handler if enabled and on CUDA
+            if self.split_config.auto_oom_handling and self.device_manager.is_cuda_available():
+                logger.info("🛡️  Automatic OOM handling enabled for LLM")
+
+                # Create OOM recovery strategy
+                initial_gpu_mem = list(self.split_config.max_gpu_memory.values())[0] if self.split_config.max_gpu_memory else "4GB"
+                recovery_strategy = OOMRecoveryStrategy(
+                    initial_gpu_memory=initial_gpu_mem,
+                    initial_cpu_memory=self.split_config.max_cpu_memory,
+                    min_gpu_memory="1GB",
+                    logger=logger
+                )
+
+                # Load with OOM handling
+                try:
+                    model, final_params = with_oom_handling(
+                        load_fn=load_model_fn,
+                        recovery_strategy=recovery_strategy,
+                        logger=logger
+                    )
+                    if final_params:
+                        logger.info(f"✓ Model loaded with adjusted parameters: {final_params}")
+                except Exception as e:
+                    if CUDAMemoryManager.is_oom_error(e):
+                        logger.error("Failed to load model: CUDA Out of Memory after all recovery attempts")
+                        logger.error("Consider: 1) Using smaller model, 2) Enabling disk offloading, 3) Using GGUF format")
+                    raise
+            else:
+                # Load without OOM handling
+                logger.info(f"Attempting to load model '{self.model_id}'...")
+                model = load_model_fn()
+
+            logger.info(f"✓ Successfully loaded model: {self.model_id}")
+
+            # Log memory after loading
+            if self.device_manager.is_cuda_available():
+                log_memory_summary("after model loading", logger)
+
+            return model, tokenizer
+
+        except Exception as e:
+            logger.error(f"Failed to load model {self.model_id}: {e}", exc_info=True)
+
+            # --- Fallback Logic (only if NOT an OOM error) ---
+            if not CUDAMemoryManager.is_oom_error(e):
+                # If load failed with quantization or splitting, try a simpler config
+                if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
+                    logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
+                    fallback_config = {
+                        "cache_dir": str(self.model_cache_dir),
+                        "trust_remote_code": self.trust_remote_code,
+                        "torch_dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
+                        "device_map": "auto",
+                        "low_cpu_mem_usage": self.device_manager.is_cuda_available(),
+                    }
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(self.model_id, **fallback_config)
+                        logger.info("Successfully loaded model with standard 'auto' fallback.")
+                        return model, tokenizer
+                    except Exception as e2:
+                        logger.error(f"Standard 'auto' fallback failed: {e2}", exc_info=True)
+
+                # If that also failed (or wasn't applicable), try CPU
+                if load_config.get("device_map") != {"": "cpu"}:
+                     logger.warning("Falling back to CPU-only load.")
+                     cpu_config = {
+                        "cache_dir": str(self.model_cache_dir),
+                        "trust_remote_code": self.trust_remote_code,
+                        "torch_dtype": torch.float32,
+                        "device_map": {"": "cpu"},
+                     }
+                     try:
+                          model = AutoModelForCausalLM.from_pretrained(self.model_id, **cpu_config)
+                          logger.info("Successfully loaded model with CPU-only fallback.")
+                          return model, tokenizer
+                     except Exception as e3:
+                          logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
+
             # All attempts failed
             raise ModelLoadError(f"All loading attempts failed. Last error: {e}", self.model_id) from e
 
@@ -231,22 +299,22 @@ class LocalHFBackend(LLMBackend):
         self.device = self.device_manager.get_device()
         self.logger.info(f"Initialized LocalHFBackend for {self.model_id}")
 
-        @log_execution_time(logger_name=__name__)
-        @log_resource_usage(logger_name=__name__)
-        def load(self, trust_remote_code: bool = True, **kwargs) -> bool:
-            """Loads the model and tokenizer using the ModelLoader helper."""
-            if self.is_loaded and self.model_handle is not None:
-                self.logger.info("Model is already loaded.")
-                return True
-            
-            config_manager = ConfigManager()
-            loader = LocalModelLoader(
-                self.model_specifier,
-                self.quant_config,
-                self.split_config,
-                trust_remote_code,
-                config_manager
-            )        
+    @log_execution_time(logger_name=__name__)
+    @log_resource_usage(logger_name=__name__)
+    def load(self, trust_remote_code: bool = True, **kwargs) -> bool:
+        """Loads the model and tokenizer using the ModelLoader helper."""
+        if self.is_loaded and self.model_handle is not None:
+            self.logger.info("Model is already loaded.")
+            return True
+        
+        config_manager = ConfigManager()
+        loader = LocalModelLoader(
+            self.model_specifier,
+            self.quant_config,
+            self.split_config,
+            trust_remote_code,
+            config_manager
+        )        
         try:
             model, tokenizer = loader.load()
             self.model_handle = model

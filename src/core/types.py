@@ -93,15 +93,19 @@ class LayerSplitConfig:
     """Configuration for splitting model layers between devices (GPU/CPU/Disk)."""
     enabled: bool = True # Whether to attempt splitting
     gpu_layers: int = -1  # GGUF: Num layers on GPU (-1=all). Transformers: Hint (less effective).
-    max_gpu_memory: Dict[int, str] = field(default_factory=dict) # Transformers: Max mem per GPU (e.g., {0: "10GB"})
-    max_cpu_memory: str = "30GB" # Transformers: Max RAM for offload
+    max_gpu_memory: Dict[int, str] = field(default_factory=lambda: {0: "4GB"}) # Transformers: Max mem per GPU (default: 4GB for dedicated GPU)
+    max_cpu_memory: str = "28GB" # Transformers: Max RAM for offload (leave some for OS)
     offload_folder: Optional[Path] = None # Transformers: Disk offload directory
-    offload_state_dict: bool = False # Transformers: Use state_dict for offloading
+    offload_state_dict: bool = True # Transformers: Use state_dict for offloading (more memory efficient)
+    low_cpu_mem_usage: bool = True # Enable low CPU memory usage mode
+    auto_oom_handling: bool = True # Enable automatic CUDA OOM error handling with progressive layer offloading
 
     def get_max_memory_dict(self) -> Dict[Union[int, str], str]:
         """Formats memory limits for Transformers device_map='auto'."""
         max_memory = {}
-        max_memory.update(self.max_gpu_memory)
+        # Ensure GPU device keys are integers, not strings
+        for k, v in self.max_gpu_memory.items():
+            max_memory[int(k)] = v  # Convert to int in case it's a string
         max_memory["cpu"] = self.max_cpu_memory
         return max_memory
 
@@ -212,7 +216,7 @@ class AudioConfig:
     speaker_embedding: Optional[str] = None # Path or ID for local models like SpeechT5
     sample_rate: int = 24000 # Target sample rate (common for modern TTS)
     output_format: str = "wav" # "wav", "mp3", "flac"
-    chunk_size: int = 3000  # Chars per chunk for local TTS if needed
+    chunk_size: int = 1500  # Chars per chunk for local TTS (reduced for 4GB VRAM compatibility)
     speed: float = 1.0 # Playback speed factor (applied via API or post-processing)
     pitch_shift: int = 0  # Semitones for pitch shift (post-processing only)
     volume_normalize: bool = True # Apply normalization (post-processing)
@@ -220,6 +224,11 @@ class AudioConfig:
     use_half_precision: bool = True # Use float16/bfloat16 (local CUDA models)
     # Cloud specific settings
     cloud_voice: str = "alloy" # Default voice for providers like OpenAI
+    quantization: str = "4bit" # "none", "4bit", "8bit" (default 4bit for memory efficiency)
+    # Memory optimization
+    enable_cpu_offload: bool = True # Enable CPU offloading for large models
+    enable_disk_offload: bool = False # Enable disk offloading (slower but saves RAM)
+    clear_cache_between_chunks: bool = True # Clear CUDA cache between audio chunks
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

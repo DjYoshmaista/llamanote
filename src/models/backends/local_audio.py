@@ -13,11 +13,17 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from .base import AudioBackend
-from ...core.types import AudioConfig, AudioResult
+from ...core.types import AudioConfig, AudioResult, QuantizationConfig, LayerSplitConfig
 from ...core.errors import ModelLoadError, GenerationError
 from ...utils.logger import get_logger_conf, ConsoleOutput, LoggingProgress
 from ...utils.decorators import log_execution_time
 from ...utils.helpers import get_device_manager, cleanup_resources
+from ...utils.memory_manager import (
+    CUDAMemoryManager,
+    OOMRecoveryStrategy,
+    with_oom_handling,
+    log_memory_summary
+)
 from ...models.hub import ModelHub
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
 from ...config.manager import ConfigManager # Import ConfigManager
@@ -99,6 +105,12 @@ def _import_vibevoice():
 
 logger = get_logger_conf(__name__)
 
+
+# Use centralized memory management utilities
+_get_gpu_memory_stats = CUDAMemoryManager.get_memory_stats
+_clear_gpu_cache = CUDAMemoryManager.clear_cache
+
+
 class LocalAudioBackend(AudioBackend):
     """Generate audio using local Hugging Face Transformers models."""
 
@@ -110,19 +122,22 @@ class LocalAudioBackend(AudioBackend):
         "vibevoice": ["microsoft/vibevoice-1.5b", "vibevoice/vibevoice"],
     }
 
-    def __init__(self, config: AudioConfig, model_specifier: str):
+    def __init__(self, config: AudioConfig, model_specifier: str, layer_split_config: Optional[LayerSplitConfig] = None):
         super().__init__("local_audio", model_specifier, config)
         _import_transformers() # Ensure transformers is available
-        
+
         self.model = None
         self.processor = None
         self.vocoder = None # Specific to SpeechT5
         self.pipeline = None # For pipeline-based models
         self.device = get_device_manager().get_device()
 
+        # Memory optimization configuration
+        self.layer_split_config = layer_split_config or LayerSplitConfig()
+
         self.config_manager = ConfigManager()
         self.model_cache_dir = self.config_manager.get_dir("model_cache")
-        
+
         self.model_hub = ModelHub(cache_dir=self.model_cache_dir)
         self.speaker_embeddings = None
         self.embeddings_dataset = None
@@ -193,8 +208,14 @@ class LocalAudioBackend(AudioBackend):
             raise ModelLoadError(f"Failed to load model {model_id}: {e}", model_id) from e
 
     def unload(self):
-        """Unload local model and free memory."""
+        """Unload local model and free memory with aggressive cleanup."""
         self.logger.info(f"Unloading local audio model: {self.model_specifier}")
+
+        # Log memory before unload
+        if self.device == "cuda":
+            mem_stats = _get_gpu_memory_stats()
+            self.logger.info(f"GPU memory before unload: {mem_stats.get('allocated_mb', 0):.1f}MB allocated")
+
         # Use resource cleanup helper
         cleanup_resources(
             [self.model, self.processor, self.vocoder, self.pipeline, self.embeddings_dataset],
@@ -207,6 +228,15 @@ class LocalAudioBackend(AudioBackend):
         self.model_handle = None # Clear base class handle
         self.speaker_embeddings = None
         self.embeddings_dataset = None
+
+        # Aggressive memory cleanup
+        _clear_gpu_cache(aggressive=True)
+
+        # Log memory after unload
+        if self.device == "cuda":
+            mem_stats = _get_gpu_memory_stats()
+            self.logger.info(f"GPU memory after unload: {mem_stats.get('allocated_mb', 0):.1f}MB allocated")
+
         self.logger.info("Local audio model unloaded.")
 
     def _load_bark_model(self, model_id: str):
@@ -315,7 +345,7 @@ class LocalAudioBackend(AudioBackend):
         self.logger.info(f"VITS/MMS model loaded. Sample Rate: {self.config.sample_rate}Hz")
 
     def _load_vibevoice_model(self, model_id: str):
-        """Load VibeVoice model using custom implementation."""
+        """Load VibeVoice model with processor and advanced memory optimizations including OOM handling."""
         self.logger.info(f"Loading VibeVoice model: {model_id}")
 
         # Import VibeVoice components
@@ -323,11 +353,19 @@ class LocalAudioBackend(AudioBackend):
             raise ModelLoadError("Failed to import VibeVoice components", model_id)
 
         try:
-            # Load processor
+            # Clear cache before loading
+            _clear_gpu_cache(aggressive=True)
+
+            # Load processor first (lightweight)
+            self.logger.info("Loading VibeVoice processor...")
             self.processor = _VibeVoiceProcessor.from_pretrained(
                 model_id,
                 cache_dir=self.model_cache_dir
             )
+
+            # Configure quantization for memory efficiency
+            quantization_config = QuantizationConfig(method=self.config.quantization)
+            bnb_config = quantization_config.to_bnb_config()
 
             # Configure dtype based on device and user settings
             if self.device == "cuda" and self.config.use_half_precision:
@@ -335,17 +373,111 @@ class LocalAudioBackend(AudioBackend):
             else:
                 dtype = torch.float32
 
-            # Load model
-            self.model = _VibeVoiceForConditionalGenerationInference.from_pretrained(
-                model_id,
-                cache_dir=self.model_cache_dir,
-                torch_dtype=dtype,
-                device_map="auto" if self.device == "cuda" else None,
-                attn_implementation="eager"  # Start with eager attention for compatibility
-            )
+            # Prepare offload folder for disk offloading
+            offload_folder = None
+            if self.config.enable_disk_offload and self.layer_split_config.offload_folder:
+                offload_folder = str(self.layer_split_config.offload_folder)
+                self.logger.info(f"Disk offloading enabled to: {offload_folder}")
 
-            if self.device != "cuda":
-                self.model = self.model.to(self.device)
+            # Log GPU memory before loading
+            if self.device == "cuda":
+                log_memory_summary("before VibeVoice loading", self.logger)
+
+            # Define model loading function for OOM handler
+            def load_model_fn(**strategy_params):
+                """Model loading function that can be retried with different parameters."""
+                # Merge strategy params with base config
+                device_map = strategy_params.get('device_map', 'auto' if self.layer_split_config.enabled and self.device == "cuda" else None)
+                max_memory = strategy_params.get('max_memory', self.layer_split_config.get_max_memory_dict() if self.layer_split_config.enabled else None)
+
+                # Override with strategy params if provided
+                low_cpu_mem = strategy_params.get('low_cpu_mem_usage', self.layer_split_config.low_cpu_mem_usage)
+                offload_state = strategy_params.get('offload_state_dict', self.layer_split_config.offload_state_dict)
+
+                self.logger.info("Loading VibeVoice model with memory optimizations...")
+                self.logger.info(f"  - Quantization: {self.config.quantization}")
+                self.logger.info(f"  - Dtype: {dtype}")
+                self.logger.info(f"  - Device map: {device_map}")
+                self.logger.info(f"  - Max memory: {max_memory}")
+                self.logger.info(f"  - Offload folder: {offload_folder}")
+                self.logger.info(f"  - Low CPU mem: {low_cpu_mem}")
+                self.logger.info(f"  - Offload state dict: {offload_state}")
+
+                # Build kwargs for from_pretrained
+                load_kwargs = {
+                    'cache_dir': self.model_cache_dir,
+                    'quantization_config': bnb_config,
+                    'torch_dtype': dtype,
+                    'attn_implementation': "eager",
+                }
+
+                # Only add device_map and memory params if using offloading
+                if device_map:
+                    load_kwargs['device_map'] = device_map
+                if max_memory:
+                    load_kwargs['max_memory'] = max_memory
+                if low_cpu_mem and device_map:
+                    load_kwargs['low_cpu_mem_usage'] = low_cpu_mem
+                if offload_folder and device_map:
+                    load_kwargs['offload_folder'] = offload_folder
+                if offload_state and device_map:
+                    load_kwargs['offload_state_dict'] = offload_state
+
+                self.logger.debug(f"from_pretrained kwargs: {load_kwargs}")
+
+                try:
+                    model = _VibeVoiceForConditionalGenerationInference.from_pretrained(
+                        model_id,
+                        **load_kwargs
+                    )
+                    return model
+                except Exception as e:
+                    self.logger.error(f"Exception during from_pretrained: {type(e).__name__}: {e}")
+                    raise
+
+            # Try to load the model
+            # First attempt without OOM handling to see if it works
+            try:
+                self.logger.info("Attempting initial model load...")
+                self.model = load_model_fn()
+                self.logger.info("✓ Model loaded successfully on first attempt")
+            except Exception as e:
+                # Check if OOM and if OOM handling is enabled
+                if CUDAMemoryManager.is_oom_error(e) and self.layer_split_config.auto_oom_handling and self.device == "cuda":
+                    self.logger.warning(f"Initial load failed with OOM error: {e}")
+                    self.logger.info("🛡️  Activating automatic OOM recovery")
+
+                    # Create OOM recovery strategy
+                    initial_gpu_mem = list(self.layer_split_config.max_gpu_memory.values())[0] if self.layer_split_config.max_gpu_memory else "4GB"
+                    recovery_strategy = OOMRecoveryStrategy(
+                        initial_gpu_memory=initial_gpu_mem,
+                        initial_cpu_memory=self.layer_split_config.max_cpu_memory,
+                        min_gpu_memory="1GB",
+                        logger=self.logger
+                    )
+
+                    # Load with OOM handling
+                    try:
+                        self.model, final_params = with_oom_handling(
+                            load_fn=load_model_fn,
+                            recovery_strategy=recovery_strategy,
+                            logger=self.logger
+                        )
+                        if final_params:
+                            self.logger.info(f"✓ Model loaded with adjusted parameters: {final_params}")
+                    except Exception as recovery_error:
+                        if CUDAMemoryManager.is_oom_error(recovery_error):
+                            self.logger.error("Failed to load model: CUDA Out of Memory after all recovery attempts")
+                            self.logger.error("Consider: 1) Enabling disk offloading, 2) Using smaller model, 3) Reducing context size")
+                        raise
+                else:
+                    # Not an OOM error or OOM handling disabled - re-raise original error
+                    self.logger.error(f"Model loading failed: {type(e).__name__}: {e}")
+                    raise
+
+            # Log GPU memory after loading
+            if self.device == "cuda":
+                log_memory_summary("after VibeVoice loading", self.logger)
 
             # Get sample rate from config
             if hasattr(self.processor, 'audio_processor') and hasattr(self.processor.audio_processor, 'sampling_rate'):
@@ -353,7 +485,16 @@ class LocalAudioBackend(AudioBackend):
             else:
                 self.config.sample_rate = 24000  # VibeVoice default is 24kHz
 
-            self.logger.info(f"VibeVoice model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
+            # Log successful loading with configuration summary
+            self.logger.info(f"✓ VibeVoice model loaded successfully")
+            self.logger.info(f"  - Sample Rate: {self.config.sample_rate}Hz")
+            self.logger.info(f"  - Dtype: {dtype}")
+            self.logger.info(f"  - CPU offloading: {'Enabled' if hasattr(self.model, 'hf_device_map') else 'Disabled'}")
+            if hasattr(self.model, 'hf_device_map'):
+                self.logger.info(f"  - Device distribution: {self.model.hf_device_map}")
+
+            # Final cache clear
+            _clear_gpu_cache()
 
         except Exception as e:
             self.logger.error(f"Failed to load VibeVoice model: {e}", exc_info=True)
@@ -541,7 +682,8 @@ class LocalAudioBackend(AudioBackend):
                  speech = spectrogram # This is likely wrong
 
         self.config.sample_rate = 16000 # SpeechT5 fixed SR
-        return speech.cpu().numpy().squeeze()
+        # Convert to float32 if needed (NumPy doesn't support bfloat16)
+        return speech.cpu().float().numpy().squeeze()
 
     def _generate_bark(self, text: str) -> Optional[np.ndarray]:
         if not self.model or not self.processor: return None
@@ -553,7 +695,8 @@ class LocalAudioBackend(AudioBackend):
         
         # Bark output is usually 24kHz
         self.config.sample_rate = self.model.generation_config.sample_rate
-        return audio_array.cpu().numpy().squeeze()
+        # Convert to float32 if needed (NumPy doesn't support bfloat16)
+        return audio_array.cpu().float().numpy().squeeze()
 
     def _generate_vits(self, text: str) -> Optional[np.ndarray]:
         if not self.model or not self.processor: return None
@@ -563,42 +706,62 @@ class LocalAudioBackend(AudioBackend):
             waveform = output.waveform if hasattr(output, 'waveform') else output[0]
 
         # SR should be in config from loading
-        return waveform.cpu().numpy().squeeze()
+        # Convert to float32 if needed (NumPy doesn't support bfloat16)
+        return waveform.cpu().float().numpy().squeeze()
 
     def _generate_vibevoice(self, text: str) -> Optional[np.ndarray]:
-        """Generate audio using VibeVoice model."""
+        """Generate audio using VibeVoice model with memory management and OOM recovery."""
         if not self.model or not self.processor:
             self.logger.error("VibeVoice components not fully loaded.")
             return None
 
-        try:
-            # Process input text with VibeVoice processor
-            # The processor expects text in dialogue format, e.g., "[1] Hello there"
-            # If text doesn't have speaker tags, add a default one
-            if not text.strip().startswith('['):
-                text = f"[1] {text}"
+        # Clear cache before generation if enabled
+        if self.config.clear_cache_between_chunks:
+            _clear_gpu_cache()
 
-            inputs = self.processor(
-                text=text,
-                return_tensors="pt",
-                padding=True
-            )
+        # Process input text with VibeVoice processor
+        inputs = self.processor(
+            text=text,
+            return_tensors="pt",
+            padding=True
+        )
 
-            # Move inputs to device
-            if self.device == "cuda":
-                inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        # Move inputs to device (might be CPU if offloaded)
+        if self.device == "cuda":
+            inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-            # Generate audio with the model
-            with torch.no_grad():
-                # VibeVoice generation with default parameters
-                output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=2048,  # Adjust based on text length
-                    temperature=0.7,
-                    do_sample=True,
-                    cfg_scale=1.3,  # Classifier-free guidance scale
-                    inference_steps=10  # Diffusion steps
-                )
+        # Progressive generation parameters for OOM recovery
+        generation_params = {
+            'max_new_tokens': 2048,
+            'inference_steps': 10,
+            'cfg_scale': 1.3
+        }
+
+        # Try generation with progressive parameter reduction on OOM
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                # Log generation parameters
+                if attempt > 0:
+                    self.logger.info(f"Generation attempt {attempt + 1}/{max_attempts} with reduced parameters:")
+                    self.logger.info(f"  - max_new_tokens: {generation_params['max_new_tokens']}")
+                    self.logger.info(f"  - inference_steps: {generation_params['inference_steps']}")
+
+                # Clear cache before each attempt
+                if attempt > 0:
+                    _clear_gpu_cache(aggressive=True)
+
+                # Generate audio with the model
+                with torch.no_grad():
+                    output = self.model.generate(
+                        **inputs,
+                        tokenizer=self.processor.tokenizer,
+                        max_new_tokens=generation_params['max_new_tokens'],
+                        temperature=0.7,
+                        do_sample=True,
+                        cfg_scale=generation_params['cfg_scale'],
+                        inference_steps=generation_params['inference_steps']
+                    )
 
                 # Extract audio array from output
                 # VibeVoice returns audio in speech_outputs
@@ -607,24 +770,83 @@ class LocalAudioBackend(AudioBackend):
                     audio_arrays = []
                     for speech_output in output.speech_outputs:
                         if isinstance(speech_output, torch.Tensor):
-                            audio_arrays.append(speech_output.cpu().numpy())
+                            # Convert to float32 if needed (NumPy doesn't support bfloat16)
+                            arr = speech_output.cpu().float().numpy().squeeze()
+                            audio_arrays.append(arr)
                         else:
-                            audio_arrays.append(np.array(speech_output))
+                            arr = np.array(speech_output).squeeze()
+                            audio_arrays.append(arr)
 
                     if len(audio_arrays) == 1:
                         audio_array = audio_arrays[0]
                     else:
-                        # Concatenate multiple segments
-                        audio_array = np.concatenate(audio_arrays)
+                        # Flatten each array to 1D and concatenate
+                        audio_arrays = [arr.flatten() for arr in audio_arrays]
+                        audio_array = np.concatenate(audio_arrays, axis=0)
+
+                    # Clear intermediate tensors and cache after generation
+                    del output
+                    if self.config.clear_cache_between_chunks:
+                        _clear_gpu_cache()
+
+                    if attempt > 0:
+                        self.logger.info(f"✓ Generation succeeded with reduced parameters on attempt {attempt + 1}")
 
                     return audio_array.squeeze()
                 else:
                     self.logger.error(f"Unexpected VibeVoice output format: {type(output)}")
                     return None
 
-        except Exception as e:
-            self.logger.error(f"Error during VibeVoice generation: {e}", exc_info=True)
-            return None
+            except Exception as e:
+                # Check if this is an OOM error
+                if CUDAMemoryManager.is_oom_error(e):
+                    mem_stats = _get_gpu_memory_stats()
+                    self.logger.warning(
+                        f"OOM during generation (attempt {attempt + 1}/{max_attempts}): "
+                        f"GPU {mem_stats.get('allocated_mb', 0):.0f}MB allocated, "
+                        f"{mem_stats.get('free_mb', 0):.0f}MB free"
+                    )
+
+                    # If not the last attempt, reduce parameters and retry
+                    if attempt < max_attempts - 1:
+                        # Progressive reduction strategy
+                        if attempt == 0:
+                            # First retry: Reduce inference steps
+                            generation_params['inference_steps'] = max(5, generation_params['inference_steps'] // 2)
+                            self.logger.info(f"Reducing inference_steps to {generation_params['inference_steps']}")
+                        elif attempt == 1:
+                            # Second retry: Further reduce inference steps and max tokens
+                            generation_params['inference_steps'] = 3
+                            generation_params['max_new_tokens'] = generation_params['max_new_tokens'] // 2
+                            self.logger.info(f"Reducing max_new_tokens to {generation_params['max_new_tokens']}, inference_steps to {generation_params['inference_steps']}")
+                        elif attempt == 2:
+                            # Third retry: Minimal settings
+                            generation_params['max_new_tokens'] = 512
+                            generation_params['inference_steps'] = 2
+                            generation_params['cfg_scale'] = 1.0
+                            self.logger.info("Using minimal generation settings")
+                        else:
+                            # Fourth retry: Absolute minimum
+                            generation_params['max_new_tokens'] = 256
+                            generation_params['inference_steps'] = 1
+                            generation_params['cfg_scale'] = 1.0
+                            self.logger.info("Using absolute minimum settings")
+
+                        # Continue to next attempt
+                        continue
+                    else:
+                        # Last attempt failed - log and return None
+                        self.logger.error(f"OOM error persists after {max_attempts} attempts with reduced parameters")
+                        self.logger.error("Text chunk may be too long. Consider reducing chunk_size in audio config.")
+                        return None
+                else:
+                    # Not an OOM error - log and return None
+                    self.logger.error(f"Error during VibeVoice generation: {e}", exc_info=True)
+                    return None
+
+        # If we exhausted all attempts without success
+        self.logger.error(f"Failed to generate audio after {max_attempts} attempts")
+        return None
 
     def _generate_with_pipeline(self, text: str) -> Optional[np.ndarray]:
         """Generate using the loaded Transformers pipeline."""

@@ -200,9 +200,21 @@ def get_audio_backend(
     provider: str,
     model_specifier: str,
     api_keys: Dict[str, str],
-    config: AudioConfig
+    config: AudioConfig,
+    layer_split_config: Optional[LayerSplitConfig] = None
 ) -> Optional[AudioBackend]:
-    """Factory function to create the appropriate audio backend."""
+    """Factory function to create the appropriate audio backend.
+
+    Args:
+        provider: The audio backend provider (e.g., "local_audio", "openai_audio").
+        model_specifier: The model ID or path.
+        api_keys: Dictionary of API keys.
+        config: Audio configuration.
+        layer_split_config: Layer splitting settings for local models.
+
+    Returns:
+        An initialized AudioBackend instance or None if creation fails.
+    """
     provider_lower = provider.lower()
     logger.info(f"Attempting to initialize audio backend for provider: {provider_lower}, model: {model_specifier}")
 
@@ -210,7 +222,11 @@ def get_audio_backend(
         if provider_lower == "local_audio":
             if not TTS_TRANSFORMERS_AVAILABLE:
                 raise ImportError("LocalAudioBackend not available. Check that transformers, datasets, torch, and numpy are installed.")
-            return LocalAudioBackend(config=config, model_specifier=model_specifier)
+            return LocalAudioBackend(
+                config=config,
+                model_specifier=model_specifier,
+                layer_split_config=layer_split_config or LayerSplitConfig()
+            )
         
         elif provider_lower == "openai_audio":
             if not OPENAI_AVAILABLE: # Reuse check
