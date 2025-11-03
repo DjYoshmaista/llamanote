@@ -43,6 +43,8 @@ from .models.backends import (
 from .models.registry import get_registry, ModelEntry
 from .models.hyperparameters import HyperparameterConfig, InteractiveHyperparameterEditor
 from .io.batch_manager import BatchFileManager
+from .menu_checkpoint import CheckpointMenuManager
+from .utils.file_browser import FileBrowser
 
 # Conditional import for GGUF
 try:
@@ -154,6 +156,10 @@ class AppState:
     run_audio_generation: bool = False
     cloud_api_keys: Dict[str, str] = field(default_factory=dict) # Loaded at runtime
     system_prompt: Optional[str] = PREPROCESS_PROMPT # Custom system prompt (if None, use defaults)
+
+    # --- Checkpoint resume data ---
+    checkpoint_data: Optional[Dict[str, Any]] = None  # Data from loaded checkpoint
+    checkpoint_metadata: Optional[Dict[str, Any]] = None  # Metadata from loaded checkpoint
 
     # --- Local model compute settings ---
     memory_profile: str = "medium_vram"
@@ -337,6 +343,7 @@ class MenuSystem:
         self.model_hub = ModelHub(cache_dir=DEFAULT_CACHE_DIR / "model_hub")
         self.registry = get_registry() # Get singleton instance
         self.file_manager = BatchFileManager(supported_formats=SUPPORTED_FORMATS)
+        self.checkpoint_manager = CheckpointMenuManager()  # Add checkpoint manager
 
         # Load API keys on startup
         self.state.cloud_api_keys = self.config_manager.load_cloud_keys()
@@ -386,12 +393,16 @@ class MenuSystem:
             MenuItem("5", 
                      "Load/Save Preset",
                      submenu=self._build_preset_menu()),
-            MenuItem("6", 
-                     "View Current Setup", 
+            MenuItem("6",
+                     "View Current Setup",
                      self._view_current_setup,
                      description="Review all settings"),
-            MenuItem("R", 
-                     "RUN PIPELINE", 
+            MenuItem("7",
+                     "Checkpoint Management",
+                     self._checkpoint_management_action,
+                     description="Manage pipeline checkpoints"),
+            MenuItem("R",
+                     "RUN PIPELINE",
                      self._confirm_and_run,
                      description="Start processing"),
         ]
@@ -491,44 +502,76 @@ class MenuSystem:
         return MenuAction.CONTINUE
 
     def _select_input_files(self):
-        """Handles selection of input file(s) or directory."""
-        ConsoleOutput.section("Select Input Source(s)")
-        print("Enter one or more file paths or directory paths, separated by commas.")
-        print(f"Current selection: {len(self.state.input_files)} file(s)")
-        print("Enter 'clear' to remove all files, or 'b' to go back.")
-        
-        path_input = input("\nPath(s): ").strip()
-        
+        """Handles selection of input file(s) with enhanced file browser and checkpoint support."""
+        while True:
+            ConsoleOutput.section("Select Input Source")
+            print(f"Current selection: {len(self.state.input_files)} file(s)")
+            print("\nOptions:")
+            print("  1. Browse by File Type (PDF, Text, Markdown, Transcript, Checkpoint)")
+            print("  2. Enter Path(s) Manually")
+            print("  3. Load from Checkpoint")
+            print("  4. Clear File List")
+            print("  B. Back")
+            print("-" * 60)
+
+            choice = input("Select option: ").strip().upper()
+
+            if choice == 'B':
+                return MenuAction.BACK
+            elif choice == '1':
+                result = FileBrowser.select_file_type_and_browse()
+                if result:
+                    file_path, file_type = result
+                    # Handle different file types
+                    if file_type == 'checkpoint':
+                        self._load_from_checkpoint_file(file_path)
+                    else:
+                        self._add_file_and_auto_populate_stages(file_path, file_type)
+                    input("\nPress Enter to continue...")
+            elif choice == '2':
+                self._manual_path_entry()
+            elif choice == '3':
+                self._browse_and_load_checkpoint()
+            elif choice == '4':
+                self.state.input_files = []
+                ConsoleOutput.info("Input file list cleared.")
+                input("\nPress Enter to continue...")
+            else:
+                ConsoleOutput.error("Invalid option")
+
+            # After any action, ask if user wants to continue or go back
+            if len(self.state.input_files) > 0:
+                continue_choice = input("\nAdd more files? (y/n): ").strip().lower()
+                if continue_choice != 'y':
+                    return MenuAction.CONTINUE
+
+    def _manual_path_entry(self):
+        """Manual path entry (original behavior)."""
+        print("\nEnter one or more file paths or directory paths, separated by commas.")
+        path_input = input("Path(s): ").strip()
+
         if not path_input:
             ConsoleOutput.warning("No input provided.")
-            return MenuAction.CONTINUE
-        if path_input.lower() == 'b':
-            return MenuAction.BACK
-        if path_input.lower() == 'clear':
-            self.state.input_files = []
-            ConsoleOutput.info("Input file list cleared.")
-            return MenuAction.CONTINUE
+            return
 
         paths = [p.strip().strip('"\'') for p in path_input.split(',')]
-        
+
         # Ask about recursive search if any directory is given
         recursive = False
         if any(Path(os.path.expanduser(p)).is_dir() for p in paths):
              rec_choice = input("Search directories recursively? (y/n) [y]: ").strip().lower()
              recursive = (rec_choice != 'n')
-             
+
         try:
             selected_files = self.file_manager.collect_input_files(paths, recursive=recursive)
         except Exception as e:
             ConsoleOutput.error(f"Error collecting files: {e}")
             logger.error(f"File collection failed: {e}", exc_info=True)
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
-            
+            return
+
         if not selected_files:
             ConsoleOutput.warning("No supported files found at the specified path(s).")
-            input("Press Enter to continue...")
-            return MenuAction.CONTINUE
+            return
 
         # Merge with existing list, ensuring no duplicates
         new_files_added = 0
@@ -538,11 +581,115 @@ class MenuSystem:
                 self.state.input_files.append(f)
                 current_set.add(f)
                 new_files_added += 1
-                
+
         ConsoleOutput.success(f"Added {new_files_added} new file(s).")
         ConsoleOutput.info(f"Total files to process: {len(self.state.input_files)}")
-        input("Press Enter to continue...")
-        return MenuAction.CONTINUE
+
+    def _add_file_and_auto_populate_stages(self, file_path: Path, file_type: str):
+        """Add file and auto-populate stages based on file type."""
+        # Add file to list
+        if file_path not in self.state.input_files:
+            self.state.input_files.append(file_path)
+            ConsoleOutput.success(f"Added: {file_path.name}")
+        else:
+            ConsoleOutput.info(f"File already in list: {file_path.name}")
+
+        # Auto-populate stages based on file type
+        if file_type in ['pdf', 'text', 'markdown']:
+            # Full pipeline
+            self.state.stages_to_run = list(DEFAULT_PIPELINE_STAGES)
+            ConsoleOutput.info("📋 Auto-populated all stages (full pipeline)")
+        elif file_type == 'transcript':
+            # Only format, save, and audio
+            self.state.stages_to_run = ['format', 'save']
+            self.state.run_audio_generation = True
+            ConsoleOutput.info("📋 Auto-populated stages: Format, Save, Audio")
+
+        ConsoleOutput.info(f"Total files: {len(self.state.input_files)}")
+
+    def _browse_and_load_checkpoint(self):
+        """Browse checkpoints and load selected one."""
+        result = self.checkpoint_manager.browse_checkpoints_menu()
+        if result:
+            checkpoint_path, metadata, data = result
+            self._load_checkpoint_data(checkpoint_path, metadata, data)
+
+    def _load_from_checkpoint_file(self, checkpoint_path: Path):
+        """Load data from a checkpoint file."""
+        result = self.checkpoint_manager.checkpoint_manager.load(checkpoint_path)
+        if not result:
+            ConsoleOutput.error(f"Failed to load checkpoint: {checkpoint_path.name}")
+            return
+
+        metadata, data = result
+        self._load_checkpoint_data(checkpoint_path, metadata, data)
+
+    def _load_checkpoint_data(self, checkpoint_path: Path, metadata: Dict[str, Any], data: Dict[str, Any]):
+        """Load checkpoint data into the current state."""
+        ConsoleOutput.success(f"Loaded checkpoint: {checkpoint_path.name}")
+
+        # Get input file from metadata
+        input_file_str = metadata.get('input_file')
+        if input_file_str:
+            input_file = Path(input_file_str)
+            if input_file.exists():
+                if input_file not in self.state.input_files:
+                    self.state.input_files.append(input_file)
+            else:
+                ConsoleOutput.warning(f"Original input file not found: {input_file}")
+
+        # Determine which stages are complete and which need to run
+        stage = metadata.get('stage')
+        stage_order = ["extract", "preprocess", "chunk", "process", "filter", "format", "save", "audio"]
+
+        try:
+            stage_idx = stage_order.index(stage)
+            # Set stages to run from the next stage onwards
+            remaining_stages = stage_order[stage_idx + 1:]
+            self.state.stages_to_run = [s for s in remaining_stages if s != "audio"]
+
+            # Check if audio was completed
+            if 'audio_result' in data and stage == 'audio':
+                self.state.run_audio_generation = False
+                ConsoleOutput.info("✅ Audio already generated")
+            elif 'audio' in remaining_stages:
+                self.state.run_audio_generation = True
+
+            ConsoleOutput.info(f"📋 Checkpoint at stage: {stage}")
+            ConsoleOutput.info(f"📋 Remaining stages: {', '.join(self.state.stages_to_run)}")
+
+        except ValueError:
+            ConsoleOutput.warning(f"Unknown stage: {stage}")
+
+        # Load configuration from checkpoint
+        config = metadata.get('config', {})
+
+        # Load model settings
+        text_model = config.get('text_model', '')
+        if ':' in text_model:
+            provider, model = text_model.split(':', 1)
+            self.state.text_model_provider = provider
+            self.state.text_model_specifier = model
+            ConsoleOutput.info(f"📝 Loaded text model: {text_model}")
+
+        # Load mode
+        mode_str = config.get('mode')
+        if mode_str:
+            try:
+                self.state.processing_mode = ProcessingMode(mode_str)
+            except:
+                pass
+
+        # Load output format
+        output_fmt = config.get('output_format')
+        if output_fmt:
+            self.state.output_format = output_fmt
+
+        # Store checkpoint data for pipeline resume
+        self.state.checkpoint_data = data
+        self.state.checkpoint_metadata = metadata
+
+        ConsoleOutput.success("Checkpoint loaded successfully!")
 
 
     def _select_stages_menu(self):
@@ -1599,6 +1746,11 @@ class MenuSystem:
                     errors.append(f"API key for audio provider '{self.state.audio_model_provider}' is missing.")
         
         return errors
+
+    def _checkpoint_management_action(self):
+        """Checkpoint management submenu."""
+        self.checkpoint_manager.checkpoint_management_menu()
+        return MenuAction.CONTINUE
 
     def _confirm_and_run(self) -> MenuAction:
         """Confirms the setup and returns RUN action if confirmed."""

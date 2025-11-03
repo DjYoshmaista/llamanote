@@ -298,6 +298,8 @@ class PipelineConfig:
 
     # Pipeline execution settings
     enable_checkpoints: bool = True
+    checkpoint_resume_mode: str = "auto"  # "auto", "interactive", or "disabled"
+    checkpoint_cleanup_keep: int = 3  # Number of checkpoints to keep per stage
     max_retries: int = 3
     fallback_on_error: bool = True
 

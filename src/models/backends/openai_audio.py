@@ -94,12 +94,18 @@ class OpenAIAudioBackend(AudioBackend):
         output_path = self._resolve_output_path(output_path)
         
         # OpenAI TTS API supports 'mp3', 'opus', 'aac', 'flac'.
-        # 'wav' is not directly supported, so we must generate 'flac' (lossless) or 'mp3'
-        # and then convert if 'wav' is requested.
+        # 'wav' is not directly supported, so we must generate another format and convert.
+        # NOTE: FLAC streaming from OpenAI has metadata issues (doesn't set frame count correctly),
+        # causing "array is too big" errors when loading. We use MP3 instead for reliability.
         api_format = self.config.output_format.lower()
-        if api_format not in ["mp3", "opus", "aac", "flac"]:
-             self.logger.info(f"Target format {api_format} not supported by OpenAI. Generating FLAC and will convert.")
-             api_format = "flac" # Use flac for best quality before conversion
+
+        # Force MP3 for FLAC to avoid metadata corruption issues
+        if api_format == "flac":
+             self.logger.warning("FLAC format has known issues with OpenAI TTS (corrupted frame count). Using MP3 instead.")
+             api_format = "mp3"
+        elif api_format not in ["mp3", "opus", "aac"]:
+             self.logger.info(f"Target format {api_format} not supported by OpenAI. Generating MP3 and will convert.")
+             api_format = "mp3" # Use mp3 for reliability with streaming
              
         # Temporary path for the API output if conversion or post-processing is needed
         needs_post_processing = (
@@ -155,8 +161,28 @@ class OpenAIAudioBackend(AudioBackend):
              # 1. Load all chunks
              audio_arrays = []
              api_sample_rate = -1
-             for f_path in audio_files_to_merge:
+             failed_chunks = []
+
+             for idx, f_path in enumerate(audio_files_to_merge):
                   try:
+                       # Validate file size first
+                       if not f_path.exists():
+                            self.logger.error(f"Chunk file {f_path} does not exist!")
+                            failed_chunks.append(idx)
+                            continue
+
+                       file_size = f_path.stat().st_size
+                       if file_size == 0:
+                            self.logger.error(f"Chunk file {f_path} is empty (0 bytes)")
+                            failed_chunks.append(idx)
+                            continue
+
+                       # Check for reasonable file size (< 100MB for a single chunk)
+                       if file_size > 100 * 1024 * 1024:
+                            self.logger.warning(f"Chunk file {f_path} is very large ({file_size / 1024 / 1024:.1f}MB)")
+
+                       self.logger.debug(f"Loading chunk {idx}: {f_path.name} ({file_size / 1024:.1f}KB)")
+
                        audio, sr = self.post_processor._load_audio(f_path, sr=None) # Load native SR
                        if api_sample_rate == -1: api_sample_rate = sr
                        if sr != api_sample_rate: # Should not happen with OpenAI, but good to check
@@ -164,14 +190,28 @@ class OpenAIAudioBackend(AudioBackend):
                             librosa = self.post_processor.get_librosa()
                             audio = librosa.resample(audio, orig_sr=sr, target_sr=api_sample_rate)
                        audio_arrays.append(audio)
+
+                       # Clean up successful chunk immediately
+                       try:
+                            f_path.unlink()
+                       except OSError:
+                            pass
+
                   except Exception as load_e:
-                       self.logger.error(f"Failed to load downloaded chunk {f_path}: {load_e}")
-                  finally:
-                       try: f_path.unlink() # Clean up temp chunk file
-                       except OSError: pass
+                       self.logger.error(f"Failed to load downloaded chunk {idx} ({f_path}): {load_e}")
+                       failed_chunks.append(idx)
+                       # Keep the failed file for debugging
+                       self.logger.info(f"Keeping failed chunk file for debugging: {f_path}")
+
+             # Report on failed chunks
+             if failed_chunks:
+                  self.logger.warning(f"Failed to load {len(failed_chunks)}/{len(audio_files_to_merge)} chunks: {failed_chunks}")
 
              if not audio_arrays:
-                  raise GenerationError("Failed to load any audio chunks from OpenAI.", self.model_specifier)
+                  raise GenerationError(f"Failed to load any audio chunks from OpenAI ({len(audio_files_to_merge)} total chunks, all failed).", self.model_specifier)
+
+             if len(audio_arrays) < len(audio_files_to_merge):
+                  self.logger.warning(f"Only loaded {len(audio_arrays)}/{len(audio_files_to_merge)} chunks successfully. Audio may be incomplete.")
              
              # 2. Combine chunks (using base class helper)
              combined_audio = self._combine_audio(audio_arrays, api_sample_rate)

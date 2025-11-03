@@ -66,7 +66,7 @@ except ImportError as e:
     logging.getLogger(__name__).warning(f"LocalAudioBackend not available: {e}")
     
 try:
-    from .openai_audio import OpenAITTSBackend
+    from .openai_audio import OpenAIAudioBackend as OpenAITTSBackend
     TTS_OPENAI_AVAILABLE = True # This relies on 'openai' package
 except ImportError:
     OpenAITTSBackend = None
@@ -229,8 +229,8 @@ def get_audio_backend(
             )
         
         elif provider_lower == "openai_audio":
-            if not OPENAI_AVAILABLE: # Reuse check
-                raise ImportError("OpenAI library not found. Please install 'openai'.")
+            if not TTS_OPENAI_AVAILABLE:
+                raise ImportError("OpenAI TTS backend not available. Please install 'openai'.")
             api_key = api_keys.get("openai") # Uses the 'openai' key
             if not api_key:
                 raise ConfigurationError("OpenAI API key not found in configuration.")

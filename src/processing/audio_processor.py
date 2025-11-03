@@ -62,10 +62,42 @@ class AudioPostProcessor:
     @staticmethod
     def _load_audio(path: Path, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
         """Loads an audio file using librosa, handling potential errors."""
+        sf = get_sf()
         librosa = get_librosa()
+
         try:
+            # First, validate the file using soundfile.info to check metadata
+            try:
+                info = sf.info(path)
+                # Check for unreasonable values that might indicate corruption
+                # Max reasonable duration: 1 hour, max reasonable SR: 192kHz
+                max_reasonable_samples = 192000 * 3600  # 1 hour at 192kHz
+                if info.frames > max_reasonable_samples:
+                    logger.error(f"Audio file {path} has corrupted metadata: claims {info.frames} frames "
+                               f"({info.frames / info.samplerate:.1f}s at {info.samplerate}Hz)")
+                    raise FileProcessingError(
+                        f"Audio file has corrupted metadata (impossibly large: {info.frames} frames)",
+                        str(path)
+                    )
+                logger.debug(f"Audio file info: {info.frames} frames, {info.samplerate}Hz, "
+                           f"{info.duration:.2f}s, {info.channels} channels")
+            except Exception as info_e:
+                logger.warning(f"Could not read audio file info for {path}: {info_e}")
+                # Continue anyway and try to load
+
+            # Try loading with librosa
             audio, sample_rate = librosa.load(path, sr=sr)
             return audio, sample_rate
+
+        except ValueError as ve:
+            if "array is too big" in str(ve):
+                logger.error(f"File {path} has corrupted metadata causing array overflow")
+                raise FileProcessingError(
+                    f"Audio file has corrupted metadata (array overflow)",
+                    str(path)
+                )
+            logger.error(f"ValueError loading audio file {path}: {ve}", exc_info=True)
+            raise FileProcessingError(f"Failed to load audio: {ve}", str(path))
         except Exception as e:
             logger.error(f"Failed to load audio file {path}: {e}", exc_info=True)
             raise FileProcessingError(f"Failed to load audio: {e}", str(path))

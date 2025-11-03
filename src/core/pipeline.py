@@ -119,6 +119,14 @@ class ProcessingPipeline:
         self.stages_to_run = [s for s in stages if s in DEFAULT_PIPELINE_STAGES]
         self.logger.info(f"Pipeline stages set to run: {self.stages_to_run}")
 
+    def _save_checkpoint(self, input_path: Path, stage: str, data_payload: Dict[str, Any]):
+        """Save a checkpoint for the current stage."""
+        if self.config.enable_checkpoints and self.checkpoint_manager:
+            try:
+                self.checkpoint_manager.save(input_path, self.config, stage, data_payload)
+            except Exception as e:
+                self.logger.warning(f"Failed to save checkpoint for stage '{stage}': {e}")
+
     @log_execution_time(logger_name=__name__)
     def process_file(self,
                     input_path: Path,
@@ -139,24 +147,61 @@ class ProcessingPipeline:
 
         # Setup per-file state
         self.checkpoint_name = f"{input_path.stem}_{int(start_time)}"
-        self.checkpoint_manager = CheckpointManager(self.file_handler.cache_dir, self.checkpoint_name)
+
+        # Initialize new checkpoint manager with resume capability
+        resume_mode = self.config.checkpoint_resume_mode if self.config.enable_checkpoints else "disabled"
+        self.checkpoint_manager = CheckpointManager(
+            base_checkpoint_dir=None,  # Uses default: project_root/checkpoints
+            resume_mode=resume_mode
+        )
+
         self.stage_executor = PipelineStageExecutor(self) # Re-init executor
         self.stages_completed = []
         self.current_stage = "setup"
 
         ConsoleOutput.header(f"Processing: {input_path.name}")
         self.logger.info(f"Starting pipeline for: {input_path}")
+
+        # Try to resume from checkpoint if enabled
+        resume_data = None
+        resume_from_stage = None
+        if self.config.enable_checkpoints and resume_mode != "disabled":
+            resume_result = self.checkpoint_manager.get_resume_checkpoint(
+                input_path, self.config, self.stages_to_run
+            )
+            if resume_result:
+                resume_from_stage, resume_data = resume_result
+                ConsoleOutput.success(f"Resuming from stage: {resume_from_stage}")
+                self.logger.info(f"Loaded checkpoint data with keys: {list(resume_data.keys())}")
         self.memory_monitor.start()
 
-        data_payload: Dict[str, Any] = {'input_path': input_path}
+        # Initialize data payload (from resume or fresh)
+        if resume_data:
+            data_payload: Dict[str, Any] = resume_data.copy()
+            # Ensure input_path is set
+            data_payload['input_path'] = input_path
+        else:
+            data_payload: Dict[str, Any] = {'input_path': input_path}
         final_output_path: Optional[Path] = None
         final_audio_path: Optional[Path] = None
         success = False
         error_message: Optional[str] = None
 
+        # Determine which stages to skip based on resume point
+        stage_order = ["extract", "preprocess", "chunk", "process", "filter", "format", "save", "audio"]
+        skip_stages = set()
+        if resume_from_stage:
+            try:
+                resume_idx = stage_order.index(resume_from_stage)
+                # Skip all stages before and including the resume stage
+                skip_stages = set(stage_order[:resume_idx + 1])
+                self.logger.info(f"Skipping stages: {skip_stages}")
+            except ValueError:
+                self.logger.warning(f"Unknown resume stage: {resume_from_stage}, starting fresh")
+
         try:
             # --- Stage 1: Extract ---
-            if "extract" in self.stages_to_run:
+            if "extract" in self.stages_to_run and "extract" not in skip_stages:
                 extract_result: Optional[ExtractionResult]
                 if input_path.suffix.lower() == '.pdf':
                     extract_result = self.stage_executor.execute("extract", 
@@ -179,8 +224,11 @@ class ProcessingPipeline:
                 data_payload['metadata'] = extract_result.metadata
                 data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
 
+                # Save checkpoint
+                self._save_checkpoint(input_path, "extract", data_payload)
+
             # --- Stage 2: Preprocess ---
-            if "preprocess" in self.stages_to_run:
+            if "preprocess" in self.stages_to_run and "preprocess" not in skip_stages:
                 def run_preprocess():
                     text = data_payload.get('text')
                     if text is None: # Need text from extract or checkpoint
@@ -192,8 +240,11 @@ class ProcessingPipeline:
                 data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
                 data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
 
+                # Save checkpoint
+                self._save_checkpoint(input_path, "preprocess", data_payload)
+
             # --- Stage 3: Chunk ---
-            if "chunk" in self.stages_to_run:
+            if "chunk" in self.stages_to_run and "chunk" not in skip_stages:
                 def run_chunk():
                      if 'text' not in data_payload: raise MissingDataError("chunk", "text")
                      return self.text_chunker.chunk_text(data_payload['text'])
@@ -201,9 +252,12 @@ class ProcessingPipeline:
                 chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
                 data_payload['chunks'] = [c.text for c in chunk_result.chunks]
                 data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
-            
+
+                # Save checkpoint
+                self._save_checkpoint(input_path, "chunk", data_payload)
+
             # --- Stage 4: Process ---
-            if "process" in self.stages_to_run:
+            if "process" in self.stages_to_run and "process" not in skip_stages:
                  # Check if chunking was skipped
                  if 'chunks' not in data_payload:
                       if 'text' in data_payload:
@@ -260,8 +314,11 @@ class ProcessingPipeline:
                      "total_time_sec": sum(r.generation_time for r in gen_results)
                  }
 
+                 # Save checkpoint
+                 self._save_checkpoint(input_path, "process", data_payload)
+
             # --- Stage 5: Filter ---
-            if "filter" in self.stages_to_run:
+            if "filter" in self.stages_to_run and "filter" not in skip_stages:
                 # Determine input for filtering
                 chunks_to_filter = data_payload.get('processed_chunks', data_payload.get('chunks'))
                 if not chunks_to_filter and 'text' in data_payload: chunks_to_filter = [data_payload['text']]
@@ -278,9 +335,11 @@ class ProcessingPipeline:
                 data_payload['filtered_text'] = self.stage_executor.execute("filter", run_filter, data_payload, [])
                 data_payload['stats_filter'] = {"chars": len(data_payload['filtered_text'])}
 
+                # Save checkpoint
+                self._save_checkpoint(input_path, "filter", data_payload)
 
             # --- Stage 6: Format ---
-            if "format" in self.stages_to_run:
+            if "format" in self.stages_to_run and "format" not in skip_stages:
                 def run_format():
                     # Find the best text to format
                     text_to_format = (
@@ -299,8 +358,11 @@ class ProcessingPipeline:
                 data_payload['formatted_text'] = self.stage_executor.execute("format", run_format, data_payload, [])
                 data_payload['stats_format'] = {"chars": len(data_payload['formatted_text'])}
 
+                # Save checkpoint
+                self._save_checkpoint(input_path, "format", data_payload)
+
             # --- Stage 7: Save ---
-            if "save" in self.stages_to_run:
+            if "save" in self.stages_to_run and "save" not in skip_stages:
                  def run_save():
                      text_to_save = data_payload.get('formatted_text', data_payload.get('filtered_text'))
                      # Fallback logic
@@ -336,9 +398,12 @@ class ProcessingPipeline:
                  final_output_path = self.stage_executor.execute("save", run_save, data_payload, [])
                  if not final_output_path:
                       raise PipelineError("Failed to save output file.", "save")
-            
+
+                 # Save checkpoint
+                 self._save_checkpoint(input_path, "save", data_payload)
+
             # --- Stage 8: Audio (Custom, not in default list) ---
-            if "audio" in self.stages_to_run or self.config.generate_audio: # Check both
+            if ("audio" in self.stages_to_run or self.config.generate_audio) and "audio" not in skip_stages: # Check both
                 if self.audio_backend is None:
                      ConsoleOutput.warning("Audio generation requested but no audio backend is set. Skipping.")
                 else:
@@ -396,7 +461,10 @@ class ProcessingPipeline:
                          ConsoleOutput.error("Audio generation failed.")
                          # Don't fail the whole pipeline, just log it
                          data_payload['audio_result'] = None
-                         
+
+                    # Save checkpoint
+                    self._save_checkpoint(input_path, "audio", data_payload)
+
                     self.stages_completed.append("audio")
                     self.memory_monitor.check("after audio generation")
 
@@ -413,7 +481,17 @@ class ProcessingPipeline:
         finally:
             self.memory_monitor.check(f"pipeline end for {input_path.name}")
             # Unloading is handled by the caller (run_cli_processing or MenuSystem)
-            
+
+            # Cleanup old checkpoints if pipeline succeeded
+            if success and self.checkpoint_manager and self.config.enable_checkpoints:
+                try:
+                    self.checkpoint_manager.cleanup_old_checkpoints(
+                        input_path,
+                        keep_latest=self.config.checkpoint_cleanup_keep
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to cleanup old checkpoints: {e}")
+
         processing_time = time.time() - start_time
         statistics = self._gather_statistics(data_payload)
         

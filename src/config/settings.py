@@ -89,6 +89,8 @@ DEFAULT_PIPELINE_STAGES: List[str] = [
 ]
 ENABLE_STAGE_CHECKPOINTS: bool = True
 CHECKPOINT_FORMAT: str = "pickle" # Currently only pickle supported
+CHECKPOINT_RESUME_MODE: str = "auto"  # "auto", "interactive", or "disabled"
+CHECKPOINT_CLEANUP_KEEP: int = 3  # Number of checkpoints to keep per stage
 
 # API/Service settings (Placeholder for future API mode)
 ENABLE_API_MODE: bool = False
