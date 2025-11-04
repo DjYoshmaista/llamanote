@@ -53,7 +53,10 @@ class CheckpointMenuManager:
                     metadata, _ = result
                     checkpoints.append((ckpt_file, metadata))
             except Exception as e:
-                self.logger.warning(f"Failed to load checkpoint metadata from {ckpt_file.name}: {e}")
+                # Silently skip corrupted checkpoints during listing
+                # Full error details are logged in checkpoints.py
+                self.logger.debug(f"Skipping corrupted checkpoint during listing: {ckpt_file.name}", exc_info=True)
+                continue
 
         # Sort by timestamp (newest first)
         checkpoints.sort(key=lambda x: x[1].get('timestamp', ''), reverse=True)
@@ -276,6 +279,8 @@ class CheckpointMenuManager:
             print("  5. Delete All Checkpoints")
             print("  6. Change Checkpoint Directory")
             print("  7. Cleanup Old Checkpoints")
+            print("  8. Cleanup Corrupted Checkpoints")
+            print("  9. Generate Checkpoint Report")
             print("  B. Back to Main Menu")
             print("-" * 80)
 
@@ -297,6 +302,10 @@ class CheckpointMenuManager:
                 self._change_checkpoint_directory()
             elif choice == '7':
                 self._cleanup_old_checkpoints()
+            elif choice == '8':
+                self._cleanup_corrupted_checkpoints()
+            elif choice == '9':
+                self._generate_checkpoint_report()
             else:
                 ConsoleOutput.error("Invalid option")
 
@@ -532,3 +541,69 @@ class CheckpointMenuManager:
 
         ConsoleOutput.success(f"Cleaned up {total_deleted} old checkpoint(s)")
         input("\nPress Enter to continue...")
+
+    def _cleanup_corrupted_checkpoints(self):
+        """Clean up corrupted checkpoint files."""
+        print("\n" + "=" * 80)
+        print("Cleanup Corrupted Checkpoints")
+        print("=" * 80)
+        print("\nScanning for corrupted or unreadable checkpoint files...")
+
+        deleted = self.checkpoint_manager.cleanup_corrupted_checkpoints()
+
+        if deleted > 0:
+            ConsoleOutput.success(f"Cleaned up {deleted} corrupted checkpoint(s)")
+        else:
+            ConsoleOutput.info("No corrupted checkpoints found!")
+
+        input("\nPress Enter to continue...")
+
+    def _generate_checkpoint_report(self):
+        """Generate a detailed report for a checkpoint."""
+        checkpoints = self.list_all_checkpoints()
+        if not checkpoints:
+            ConsoleOutput.warning("No checkpoints found.")
+            input("\nPress Enter to continue...")
+            return
+
+        print("\n" + "=" * 80)
+        print("Select Checkpoint for Detailed Report")
+        print("=" * 80)
+
+        for idx, (path, meta) in enumerate(checkpoints, 1):
+            stem = meta.get('input_stem', 'Unknown')
+            stage = meta.get('stage', '?')
+            timestamp = meta.get('timestamp', '')
+            try:
+                dt = datetime.fromisoformat(timestamp)
+                time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                time_str = timestamp
+            print(f"  {idx}. {stem} - {stage} - {time_str}")
+
+        choice = input("\nEnter number (or 'b' to go back): ").strip()
+        if choice.lower() == 'b':
+            return
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(checkpoints):
+                path, _ = checkpoints[idx]
+                report = self.checkpoint_manager.generate_checkpoint_report(path)
+                print("\n" + report)
+
+                # Ask if user wants to save report
+                save = input("\nSave report to file? (y/n): ").strip().lower()
+                if save == 'y':
+                    report_path = path.with_suffix('.txt')
+                    report_path.write_text(report)
+                    ConsoleOutput.success(f"Report saved to: {report_path}")
+
+                input("\nPress Enter to continue...")
+            else:
+                ConsoleOutput.error("Invalid number")
+        except ValueError:
+            ConsoleOutput.error("Invalid input")
+        except Exception as e:
+            ConsoleOutput.error(f"Failed to generate report: {e}")
+            input("\nPress Enter to continue...")

@@ -1,11 +1,12 @@
 # llamanote/models/backends/batch.py
 """
 Batch Processing Module
-Handles batch processing of text chunks through LLM backends.
+Handles batch processing of text chunks through LLM backends with checkpointing support.
 """
 
-from typing import List, Optional
-from ...utils.logger import get_logger_conf, LoggingProgress
+from typing import List, Optional, Callable, Any, Dict
+from pathlib import Path
+from ...utils.logger import get_logger_conf, LoggingProgress, DualProgressTracker
 from ...core.types import GenerationResult
 from ..hyperparameters import HyperparameterConfig
 from .base import LLMBackend
@@ -32,16 +33,25 @@ class BatchProcessor:
         system_prompt: str,
         hyperparams: Optional[HyperparameterConfig] = None,
         remove_thinking: bool = True,
+        checkpoint_callback: Optional[Callable[[int, List[GenerationResult], Dict[str, Any]], None]] = None,
+        checkpoint_interval: int = 10,
+        resume_from_chunk: Optional[int] = None,
+        dual_tracker: Optional[DualProgressTracker] = None,
         **kwargs
     ) -> List[GenerationResult]:
         """
-        Process a batch of text chunks sequentially.
+        Process a batch of text chunks sequentially with checkpointing support.
 
         Args:
             texts: List of text chunks to process.
             system_prompt: System prompt to use for all chunks.
             hyperparams: Hyperparameters for generation.
             remove_thinking: Whether to remove thinking tags from output.
+            checkpoint_callback: Optional callback function to save checkpoint.
+                                 Called with (chunk_index, results_so_far, extra_data)
+            checkpoint_interval: Save checkpoint every N chunks
+            resume_from_chunk: If provided, resume from this chunk index (skip earlier chunks)
+            dual_tracker: Optional dual progress tracker for displaying progress
             **kwargs: Additional arguments to pass to the backend.
 
         Returns:
@@ -52,10 +62,39 @@ class BatchProcessor:
             return []
 
         self.logger.info(f"Processing batch of {len(texts)} chunks...")
+
+        # Determine starting point
+        start_index = resume_from_chunk if resume_from_chunk is not None else 0
+        if start_index > 0:
+            self.logger.info(f"Resuming from chunk {start_index}/{len(texts)}")
+
         results = []
 
-        with LoggingProgress(self.logger, "Processing chunks", len(texts)) as progress:
-            for i, text in enumerate(texts):
+        # Initialize dual tracker stage progress BEFORE entering context
+        if dual_tracker:
+            dual_tracker.set_stage_progress(start_index, len(texts), "Processing chunks")
+
+        with LoggingProgress(self.logger, "Processing chunks", len(texts), dual_tracker=dual_tracker) as progress:
+            # If resuming, we need placeholder results for skipped chunks
+            if start_index > 0:
+                # Create placeholder results (these should be loaded from checkpoint)
+                for i in range(start_index):
+                    results.append(GenerationResult(
+                        raw_output="[Skipped - loaded from checkpoint]",
+                        filtered_output="[Skipped - loaded from checkpoint]",
+                        input_tokens=0,
+                        output_tokens=0,
+                        generation_time=0.0,
+                        memory_used=0,
+                        device_map={},
+                        error_message=None
+                    ))
+                # Update progress to reflect skipped chunks
+                for _ in range(start_index):
+                    progress.update(1)
+
+            for i in range(start_index, len(texts)):
+                text = texts[i]
                 try:
                     # Use chat-based processing if available
                     if hasattr(self.backend, 'process_with_chat_template'):
@@ -77,6 +116,12 @@ class BatchProcessor:
 
                     results.append(result)
                     progress.update(1)
+
+                    # Save checkpoint if callback provided and interval reached
+                    if checkpoint_callback and checkpoint_interval > 0:
+                        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(texts):
+                            self.logger.debug(f"Saving checkpoint at chunk {i + 1}/{len(texts)}")
+                            checkpoint_callback(i + 1, results, {"system_prompt": system_prompt})
 
                 except Exception as e:
                     self.logger.error(f"Error processing chunk {i+1}/{len(texts)}: {e}", exc_info=True)

@@ -58,15 +58,25 @@ LlamaNote Enhanced is a production-ready, modular document processing system tha
 
 ### 💾 Advanced Checkpointing System
 
-**Never lose progress again!** The checkpoint system saves pipeline state after each stage:
+**Never lose progress again!** The checkpoint system saves pipeline state with granular control:
 
-- ✅ **Auto-Resume**: Automatically detects and resumes from last successful stage
+- ✅ **Auto-Resume**: Automatically detects and resumes from last successful checkpoint
 - ✅ **Stage-Aware**: Intelligent compatibility checking - rerun only affected stages
+- ✅ **Mid-Stage Checkpointing**: Save progress during text processing and audio generation (every N chunks)
+- ✅ **Dual Progress Tracking**: See both overall pipeline progress and current stage progress simultaneously
 - ✅ **Hash-Based Organization**: Efficient storage organized by input file and configuration
 - ✅ **Interactive Management**: Browse, view, delete, and manage checkpoints via menu
 - ✅ **Single-File Format**: Each checkpoint is a self-contained `.ckpt` file with metadata
 
-**Example**: If processing fails at the "process" stage (e.g., model loading error), fix the issue and rerun - the system will skip extract, preprocess, and chunk stages, resuming directly from process!
+**Example 1 - Stage-Level Resume**: If processing fails at the "process" stage (e.g., model loading error), fix the issue and rerun - the system will skip extract, preprocess, and chunk stages, resuming directly from process!
+
+**Example 2 - Mid-Stage Resume**: If processing 100 text chunks and the system crashes at chunk 45, it will automatically resume from chunk 45 (not from chunk 1), saving significant time!
+
+**New in This Version:**
+- **Granular Text Processing Checkpoints**: Saves progress every N chunks during the "process" stage
+- **Granular Audio Generation Checkpoints**: Saves progress every N chunks during the "audio" stage
+- **Dual Progress Bars**: Displays both "Pipeline: Stage X/8" and "Processing chunks: Y/Z" simultaneously
+- **Configurable Checkpoint Interval**: Control how often mid-stage checkpoints are saved (default: every 10 chunks)
 
 ### 🎙️ Audio Generation
 
@@ -448,12 +458,50 @@ By default, the system automatically resumes from the latest compatible checkpoi
 ```python
 # In PipelineConfig
 checkpoint_resume_mode = "auto"  # Default
+checkpoint_interval = 10  # Save mid-stage checkpoint every N chunks
 ```
 
 Modes:
-- `"auto"` - Automatically resume from latest checkpoint
+- `"auto"` - Automatically resume from latest checkpoint (including mid-stage)
 - `"interactive"` - Show menu to select checkpoint
 - `"disabled"` - Never resume, always start fresh
+
+#### Mid-Stage Checkpointing
+
+The system now saves checkpoints **during** the "process" and "audio" stages, not just after they complete:
+
+**Text Processing (Process Stage)**:
+- Saves checkpoint every N chunks (default: 10)
+- Resume from specific chunk if interrupted
+- Particularly useful for large documents (100+ chunks)
+
+**Audio Generation (Audio Stage)**:
+- Saves checkpoint every N audio chunks (default: 10)
+- Resume from specific audio chunk if interrupted
+- Saves time when generating audio for long documents
+
+**Configuration**:
+```python
+from src.core.types import PipelineConfig
+
+config = PipelineConfig(
+    enable_checkpoints=True,
+    checkpoint_interval=10,  # Save every 10 chunks
+    checkpoint_resume_mode="auto"
+)
+```
+
+**Command Line**:
+```bash
+# Default: Save checkpoint every 10 chunks
+python main.py document.pdf
+
+# Custom interval: Save every 5 chunks
+python main.py document.pdf --checkpoint-interval 5
+
+# Disable mid-stage checkpointing (only save after each stage)
+python main.py document.pdf --checkpoint-interval 0
+```
 
 #### Manual Checkpoint Management
 
@@ -492,17 +540,27 @@ checkpoints/
     ├── e5f6g7h8_extract.ckpt
     ├── e5f6g7h8_preprocess.ckpt
     ├── e5f6g7h8_chunk.ckpt
-    ├── e5f6g7h8_process.ckpt
+    ├── e5f6g7h8_process.ckpt               # Final stage checkpoint
+    ├── e5f6g7h8_process_chunk0010.ckpt    # Mid-stage checkpoint (chunk 10)
+    ├── e5f6g7h8_process_chunk0020.ckpt    # Mid-stage checkpoint (chunk 20)
     ├── e5f6g7h8_filter.ckpt
     ├── e5f6g7h8_format.ckpt
     ├── e5f6g7h8_save.ckpt
-    └── e5f6g7h8_audio.ckpt
+    ├── e5f6g7h8_audio.ckpt                 # Final audio checkpoint
+    ├── e5f6g7h8_audio_chunk0005.ckpt      # Mid-stage audio checkpoint (chunk 5)
+    └── e5f6g7h8_audio_chunk0010.ckpt      # Mid-stage audio checkpoint (chunk 10)
 ```
 
 Each checkpoint contains:
 - Pipeline data (text, chunks, processed output)
 - Metadata (timestamp, model, settings)
+- Chunk index (for mid-stage checkpoints)
 - Hash information (for compatibility checking)
+
+**Mid-Stage Checkpoints**:
+- Named with format: `{hash}_{stage}_chunk{index:04d}.ckpt`
+- Automatically cleaned up after stage completion
+- System always resumes from the latest available checkpoint
 
 ---
 
@@ -546,6 +604,7 @@ Features preserved:
 
 ### Example 3: Resume After Failure
 
+**Stage-Level Resume**:
 ```bash
 # Initial run (fails at 'process' stage due to OOM)
 python main.py large_document.pdf --model large-model
@@ -555,6 +614,21 @@ python main.py large_document.pdf --model large-model
 python main.py large_document.pdf \
   --model qwen3-4b \
   --memory-profile low_vram
+```
+
+**Mid-Stage Resume** (New!):
+```bash
+# Initial run (crashes at chunk 45 of 100 during processing)
+python main.py large_document.pdf --model qwen3-4b
+
+# Rerun after system crash or manual interruption
+# System automatically resumes from chunk 40 (last saved checkpoint)!
+python main.py large_document.pdf --model qwen3-4b
+
+# With custom checkpoint interval for more frequent saves
+python main.py large_document.pdf \
+  --model qwen3-4b \
+  --checkpoint-interval 5  # Save every 5 chunks instead of 10
 ```
 
 ### Example 4: Batch Processing
@@ -611,6 +685,47 @@ else:
 ---
 
 ## 🛠️ Advanced Topics
+
+### Progress Tracking
+
+#### Dual Progress Bars (New!)
+
+The system now displays two progress bars simultaneously during processing:
+
+**Overall Pipeline Progress**:
+```
+Pipeline: |████████░░░░░░░░| 50% (Stage 4/8)
+```
+Shows which stage of the pipeline is currently executing.
+
+**Stage-Level Progress**:
+```
+Processing chunks: |█████████░░░░░░░| 60% (60/100)
+```
+Shows progress within the current stage (e.g., chunks processed).
+
+**Example Output During Processing**:
+```
+================================================================================
+                        Processing: research_paper.pdf
+================================================================================
+
+Pipeline: |██████░░░░░░░░░░| 37.5% (Stage 3/8)
+Chunking text: |████████████████████| 100% (1/1)
+
+Pipeline: |████████░░░░░░░░| 50% (Stage 4/8)
+Processing chunks: |████████░░░░░░░░| 50% (50/100)
+
+✅ Checkpoint saved at chunk 50
+```
+
+#### Progress Tracking Features
+
+- **Dual Display**: See both overall and stage-level progress
+- **Real-Time Updates**: Progress bars update as work completes
+- **Checkpoint Indicators**: See when checkpoints are saved
+- **Time Estimates**: Approximate time remaining (coming soon)
+- **Memory Usage**: Monitor RAM/VRAM during processing
 
 ### Custom System Prompts
 

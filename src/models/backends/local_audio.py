@@ -15,7 +15,7 @@ from typing import Optional, List, Dict, Any
 from .base import AudioBackend
 from ...core.types import AudioConfig, AudioResult, QuantizationConfig, LayerSplitConfig
 from ...core.errors import ModelLoadError, GenerationError
-from ...utils.logger import get_logger_conf, ConsoleOutput, LoggingProgress
+from ...utils.logger import get_logger_conf, ConsoleOutput, LoggingProgress, DualProgressTracker
 from ...utils.decorators import log_execution_time
 from ...utils.helpers import get_device_manager, cleanup_resources
 from ...utils.memory_manager import (
@@ -544,8 +544,27 @@ class LocalAudioBackend(AudioBackend):
                       text: str,
                       output_path: Optional[Path] = None,
                       chunk_text: bool = True,
+                      checkpoint_callback: Optional[Any] = None,
+                      checkpoint_interval: int = 5,
+                      resume_from_chunk: Optional[int] = None,
+                      dual_tracker: Optional[DualProgressTracker] = None,
                       **kwargs) -> Optional[AudioResult]:
-        """Generate audio from text using the loaded local model."""
+        """
+        Generate audio from text using the loaded local model with checkpointing support.
+
+        Args:
+            text: Text to convert to audio
+            output_path: Path to save audio file
+            chunk_text: Whether to split long text into chunks
+            checkpoint_callback: Optional callback function to save checkpoint
+            checkpoint_interval: Save checkpoint every N chunks
+            resume_from_chunk: If provided, resume from this chunk index
+            dual_tracker: Optional dual progress tracker for displaying progress
+            **kwargs: Additional arguments
+
+        Returns:
+            AudioResult object or None if generation failed
+        """
         if self.model_handle is None:
             self.logger.error("No local model or pipeline loaded.")
             return None
@@ -557,22 +576,91 @@ class LocalAudioBackend(AudioBackend):
         try:
             # Split text into chunks if needed
             audio_arrays = []
+            text_chunks = []
+
             if chunk_text and len(text) > self.config.chunk_size:
                 text_chunks = self._split_text(text)
                 self.logger.info(f"Splitting text into {len(text_chunks)} chunks.")
-                with LoggingProgress(self.logger, "Generating audio chunks", len(text_chunks)) as progress:
-                    for i, chunk in enumerate(text_chunks):
-                        audio_chunk = self._generate_single_chunk(chunk)
-                        if audio_chunk is not None and audio_chunk.size > 0:
-                            audio_arrays.append(audio_chunk)
-                        progress.update(1)
             else:
-                audio_chunk = self._generate_single_chunk(text)
-                if audio_chunk is not None and audio_chunk.size > 0:
-                    audio_arrays = [audio_chunk]
+                text_chunks = [text]
+
+            # Determine starting point
+            start_index = resume_from_chunk if resume_from_chunk is not None else 0
+            if start_index > 0:
+                self.logger.info(f"Resuming audio generation from chunk {start_index}/{len(text_chunks)}")
+                # For audio, we need placeholder arrays (these should be loaded from checkpoint)
+                for i in range(start_index):
+                    # Add empty placeholder - actual data should come from checkpoint
+                    audio_arrays.append(np.array([], dtype=np.float32))
+
+            # Initialize dual tracker stage progress BEFORE entering context
+            if dual_tracker:
+                dual_tracker.set_stage_progress(start_index, len(text_chunks), "Generating audio chunks")
+
+            with LoggingProgress(self.logger, "Generating audio chunks", len(text_chunks), dual_tracker=dual_tracker) as progress:
+                # Update progress for skipped chunks
+                for _ in range(start_index):
+                    progress.update(1)
+
+                for i in range(start_index, len(text_chunks)):
+                    chunk = text_chunks[i]
+                    audio_chunk = self._generate_single_chunk(chunk)
+                    if audio_chunk is not None and audio_chunk.size > 0:
+                        audio_arrays.append(audio_chunk)
+                    progress.update(1)
+
+                    # Save checkpoint if callback provided and interval reached
+                    if checkpoint_callback and checkpoint_interval > 0:
+                        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(text_chunks):
+                            self.logger.debug(f"Saving audio checkpoint at chunk {i + 1}/{len(text_chunks)}")
+
+                            # Save intermediate audio file for preview
+                            intermediate_audio_path = None
+                            if output_path and audio_arrays:
+                                try:
+                                    # Combine audio arrays so far
+                                    valid_arrays = [arr for arr in audio_arrays if arr.size > 0]
+                                    if valid_arrays:
+                                        combined_so_far = self._combine_audio(valid_arrays, self.config.sample_rate)
+                                        if combined_so_far is not None and combined_so_far.size > 0:
+                                            # Post-process
+                                            processed = self.post_processor._post_process_audio(
+                                                combined_so_far,
+                                                self.config.sample_rate,
+                                                self.config.speed,
+                                                self.config.pitch_shift,
+                                                self.config.volume_normalize
+                                            )
+                                            # Save with _checkpoint_chunk{index} suffix
+                                            intermediate_path = output_path.parent / f"{output_path.stem}_checkpoint_chunk{i+1:04d}{output_path.suffix}"
+                                            saved = self.post_processor._save_audio(
+                                                intermediate_path,
+                                                processed,
+                                                self.config.sample_rate,
+                                                self.config.output_format
+                                            )
+                                            if saved:
+                                                intermediate_audio_path = str(saved)
+                                                duration = len(processed) / self.config.sample_rate
+                                                self.logger.info(f"Saved intermediate audio: {saved.name} ({duration:.1f}s)")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to save intermediate audio: {e}")
+
+                            # Save checkpoint with current audio arrays and intermediate audio path
+                            checkpoint_callback(i + 1, audio_arrays, {
+                                "text_chunks": text_chunks,
+                                "sample_rate": self.config.sample_rate,
+                                "intermediate_audio_path": intermediate_audio_path
+                            })
 
             if not audio_arrays:
                  raise GenerationError("No valid audio generated from any chunks.", self.model_specifier)
+
+            # Filter out empty placeholder arrays from resume
+            audio_arrays = [arr for arr in audio_arrays if arr.size > 0]
+
+            if not audio_arrays:
+                raise GenerationError("No valid audio after filtering placeholders.", self.model_specifier)
 
             # Combine chunks
             combined_audio = self._combine_audio(audio_arrays, self.config.sample_rate)

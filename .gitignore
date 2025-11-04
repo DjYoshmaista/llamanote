@@ -1,3 +1,6 @@
+checkpoints/
+**checkpoints/
+*checkpoints/
 output/
 offload/
 **/output/

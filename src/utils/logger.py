@@ -121,7 +121,14 @@ class MemoryMonitor:
                 # Use max_memory_allocated for peak since last reset, or memory_allocated for current.  Using current for deltas
                 allocated = torch.cuda.memory_allocated()
                 # Reset peak stats if measuring peak between chunks
-                torch.cuda.reset_peak_memory_state()
+                # Try new name first (PyTorch 1.10+), fall back to old name
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except AttributeError:
+                    try:
+                        torch.cuda.reset_peak_memory_state()
+                    except AttributeError:
+                        pass  # Function not available, skip reset
                 return allocated
             except Exception as e:
                 self.logger.warning(f"Failed to get GPU VRAM usage: {e}")
@@ -330,9 +337,91 @@ class ConsoleOutput:
     def info(cls, message: str): print(f"{cls._colorize('ℹ️  ' + message, cls.OKCYAN)}")
 
 
+class DualProgressTracker:
+    """
+    Manages dual progress bars: one for stage-level progress, one for overall pipeline progress.
+    Uses ANSI escape codes to display both progress bars simultaneously.
+    """
+    def __init__(self, logger: Optional[ContextLogger] = None):
+        self.logger = logger
+        self.stage_current = 0
+        self.stage_total = 0
+        self.stage_name = ""
+        self.overall_current = 0
+        self.overall_total = 0
+        self.enabled = ConsoleOutput._is_color_supported()
+
+    def set_overall_progress(self, current: int, total: int):
+        """Set the overall pipeline progress (e.g., stage 4/8)."""
+        self.overall_current = current
+        self.overall_total = total
+        self._update_display()
+
+    def set_stage_progress(self, current: int, total: int, stage_name: str = ""):
+        """Set the stage-level progress (e.g., chunk 50/100)."""
+        self.stage_current = current
+        self.stage_total = total
+        self.stage_name = stage_name
+        self._update_display()
+
+    def update_stage(self, increment: int = 1):
+        """Increment stage progress by a given amount."""
+        self.stage_current += increment
+        self._update_display()
+
+    def _update_display(self):
+        """Update both progress bars on the console."""
+        if not self.enabled:
+            return
+
+        # Build overall progress bar
+        overall_bar = ""
+        if self.overall_total > 0:
+            overall_percentage = min(1.0, self.overall_current / self.overall_total)
+            overall_filled = int(40 * overall_percentage)
+            overall_bar_str = "█" * overall_filled + "░" * (40 - overall_filled)
+            overall_bar = f"{ConsoleOutput._colorize('Pipeline', ConsoleOutput.OKBLUE)}: |{overall_bar_str}| {overall_percentage:.1%} (Stage {self.overall_current}/{self.overall_total})"
+
+        # Build stage progress bar
+        stage_bar = ""
+        if self.stage_total > 0:
+            stage_percentage = min(1.0, self.stage_current / self.stage_total)
+            stage_filled = int(40 * stage_percentage)
+            stage_bar_str = "█" * stage_filled + "░" * (40 - stage_filled)
+            prefix = self.stage_name if self.stage_name else "Stage"
+            stage_bar = f"{ConsoleOutput._colorize(prefix, ConsoleOutput.OKCYAN)}: |{stage_bar_str}| {stage_percentage:.1%} ({self.stage_current}/{self.stage_total})"
+
+        # Display both bars (if available)
+        # Use ANSI codes: \r = carriage return, \033[K = clear to end of line
+        # \033[1A = move cursor up 1 line
+        if overall_bar and stage_bar:
+            # Print overall bar on first line, stage bar on second line
+            # Clear both lines before printing to avoid artifacts
+            print(f"\r\033[K{overall_bar}", end="", flush=True)
+            print(f"\n\r\033[K{stage_bar}", end="", flush=True)
+            # Move cursor back up to overall bar position for next update
+            print("\033[1A", end="", flush=True)
+        elif overall_bar:
+            print(f"\r\033[K{overall_bar}", end="", flush=True)
+        elif stage_bar:
+            print(f"\r\033[K{stage_bar}", end="", flush=True)
+
+    def clear(self):
+        """Clear the progress display and move to next line."""
+        if self.enabled and (self.overall_total > 0 or self.stage_total > 0):
+            # Clear both lines and move cursor down
+            # If we have both bars, we need to clear 2 lines
+            if self.overall_total > 0 and self.stage_total > 0:
+                print("\r\033[K", end="")  # Clear current line (stage bar)
+                print("\n\r\033[K", end="")  # Move down and clear (was overall bar line)
+                print()  # Final newline
+            else:
+                print("\r\033[K")  # Clear the single line and add newline
+
+
 class LoggingProgress:
     """Context manager for logging progress of long operations."""
-    def __init__(self, logger: ContextLogger, operation: str, total: Optional[int] = None, log_interval: int = 1):
+    def __init__(self, logger: ContextLogger, operation: str, total: Optional[int] = None, log_interval: int = 1, dual_tracker: Optional[DualProgressTracker] = None):
         self.logger = logger
         self.operation = operation
         self.total = total
@@ -340,12 +429,20 @@ class LoggingProgress:
         self.start_time = None
         self.log_interval = max(1, log_interval) # Log at least every item if interval=0
         self.last_log_time = 0
+        self.dual_tracker = dual_tracker
 
     def __enter__(self):
         self.start_time = time.time()
         total_str = f" (total: {self.total})" if self.total is not None else ""
         self.logger.info(f"Starting {self.operation}{total_str}")
         self.last_log_time = self.start_time
+
+        # Initialize stage progress display if using dual tracker
+        if self.dual_tracker and self.total is not None:
+            # Make sure stage progress is set (in case it wasn't set before context)
+            if self.dual_tracker.stage_total == 0:
+                self.dual_tracker.set_stage_progress(0, self.total, self.operation)
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -357,10 +454,18 @@ class LoggingProgress:
         else:
             self.logger.error(f"Failed {self.operation} after {elapsed:.3f}s at item {self.current+1}: {exc_val}", exc_info=False) # Keep exc_info False here
 
+        # Clear dual tracker display if used
+        if self.dual_tracker:
+            self.dual_tracker.clear()
+
     def update(self, increment: int = 1, message: Optional[str] = None):
         """Update progress counter and log periodically."""
         self.current += increment
         now = time.time()
+
+        # Update dual tracker on EVERY increment (not just when logging)
+        if self.dual_tracker:
+            self.dual_tracker.set_stage_progress(self.current, self.total, self.operation)
 
         # Log based on interval (either item count or time)
         should_log = False
@@ -385,6 +490,6 @@ class LoggingProgress:
             self.logger.debug(progress_msg)
             self.last_log_time = now
 
-            # Also update console progress bar if total is known
-            if self.total is not None:
-                 ConsoleOutput.progress_bar(self.current, self.total, prefix=self.operation)
+            # Use single progress bar only if dual tracker not available
+            if not self.dual_tracker and self.total is not None:
+                ConsoleOutput.progress_bar(self.current, self.total, prefix=self.operation)
