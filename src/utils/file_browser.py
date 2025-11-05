@@ -47,9 +47,9 @@ class FileBrowser:
                 ConsoleOutput.error(f"Permission denied: {current_dir}")
                 return None
 
-            # Filter files by extension
-            dirs = [item for item in items if item.is_dir()]
-            files = [item for item in items if item.is_file()]
+            # Filter files by extension and exclude hidden files
+            dirs = [item for item in items if item.is_dir() and not item.name.startswith('.')]
+            files = [item for item in items if item.is_file() and not item.name.startswith('.')]
 
             if file_extensions:
                 files = [f for f in files if f.suffix.lower() in file_extensions]

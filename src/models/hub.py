@@ -21,7 +21,7 @@ from tqdm import tqdm # Assuming tqdm is a dependency
 
 from ..utils.logger import get_logger_conf, ConsoleOutput # Use new logger
 from ..utils.decorators import log_execution_time
-from ..config.settings import DEFAULT_CACHE_DIR # Use central settings
+from ..config.settings import DEFAULT_CACHE_DIR, DEFAULT_MODEL_CACHE_DIR # Use central settings
 from .registry import get_registry
 
 logger = get_logger_conf(__name__)
@@ -255,9 +255,10 @@ class ModelHub:
     """Interface to HuggingFace Hub using refactored helpers."""
     
     def __init__(self, cache_dir: Optional[Path] = None):
-        self.base_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
-        self.model_cache_dir = self.base_cache_dir # Use the base cache dir directly
-        self.info_cache_dir = self.base_cache_dir / "info"
+        # Use separate directories: metadata in project cache, models in HF cache
+        self.base_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)  # For metadata/info
+        self.model_cache_dir = DEFAULT_MODEL_CACHE_DIR  # For actual model files (HF cache)
+        self.info_cache_dir = self.base_cache_dir / "info"  # For hub info cache
         self.logger = get_logger_conf(__name__)
         
         self.api = HfApi()

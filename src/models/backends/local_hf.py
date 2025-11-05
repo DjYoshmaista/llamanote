@@ -16,6 +16,7 @@ try:
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
+        AutoConfig,
         BitsAndBytesConfig,
         GenerationConfig
     )
@@ -69,6 +70,11 @@ from ...utils.memory_manager import (
 )
 from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_OFFLOAD_DIR
+from ..hybrid_kv_cache import HybridKVCache, CacheConfig
+from ..attention_patcher import AttentionPatcher
+from ..sliding_window_attention import SlidingWindowConfig
+from ..cache import LlamaNoteDynamicCache, CacheStrategyConfig, MemoryStrategy
+from ..cache.generation_wrapper import CachedGenerationWrapper
 
 logger = get_logger_conf(__name__)
 
@@ -103,14 +109,64 @@ class LocalModelLoader:
             self.load_config["low_cpu_mem_usage"] = False
             logger.info("Configuring model for CPU-only load.")
         elif self.split_config.enabled:
-            self.load_config["device_map"] = "auto"
-            self.load_config["max_memory"] = self.split_config.get_max_memory_dict()
-            self.load_config["low_cpu_mem_usage"] = True
+            # Try to load saved layer split configuration
+            from ...utils.device_map_builder import LayerSplitConfigManager
+            from ...utils.auto_layer_split import auto_discover_on_load
+
+            split_mgr = LayerSplitConfigManager()
+
+            # Extract GPU memory from config
+            gpu_memory_gb = 4.0  # Default
+            if self.split_config.max_gpu_memory:
+                gpu_mem_str = list(self.split_config.max_gpu_memory.values())[0]
+                gpu_memory_gb = float(gpu_mem_str.replace("GB", ""))
+
+            # Try to load saved split configuration
+            saved_splits = split_mgr.load_config(
+                model_id=self.model_id,
+                quant_method=self.quant_config.method,
+                gpu_memory_gb=gpu_memory_gb
+            )
+
+            # If no saved split, trigger automatic discovery
+            if not saved_splits and self.split_config.auto_discover_splits:
+                logger.info("No saved layer split found - triggering automatic discovery")
+
+                # Get quantization config for discovery
+                quant_config_for_discovery = self.quant_config.to_bnb_config() if self.quant_config.method != "none" else None
+
+                try:
+                    saved_splits = auto_discover_on_load(
+                        model_id=self.model_id,
+                        quant_method=self.quant_config.method,
+                        gpu_memory_gb=gpu_memory_gb,
+                        quantization_config=quant_config_for_discovery,
+                        force_rediscover=False
+                    )
+                except Exception as e:
+                    logger.warning(f"Automatic discovery failed: {e}")
+                    saved_splits = None
+
+            if saved_splits:
+                # Use saved explicit device map (minimum split = most GPU layers)
+                min_split, max_split = saved_splits
+                self.load_config["device_map"] = min_split.device_map
+                self.load_config["low_cpu_mem_usage"] = True
+                logger.info(f"Using saved layer split: {min_split.layers_on_gpu} GPU / {min_split.layers_on_cpu} CPU layers")
+                logger.info(f"Explicit device map loaded from cache (estimated GPU memory: {min_split.gpu_memory_used_mb:.1f}MB)")
+            else:
+                # Fall back to auto with max_memory constraint
+                self.load_config["device_map"] = "auto"
+                self.load_config["max_memory"] = self.split_config.get_max_memory_dict()
+                self.load_config["low_cpu_mem_usage"] = True
+                logger.info(f"No saved split found, using device_map='auto' with max_memory: {self.load_config['max_memory']}")
+                logger.info("Tip: Run LayerSplitFinder to discover and save optimal splits for this model")
+
+            # Add offload folder if configured
             offload_dir = self.split_config.offload_folder or DEFAULT_OFFLOAD_DIR
             if self.split_config.offload_state_dict or offload_dir:
                  self.load_config["offload_folder"] = str(offload_dir)
                  self.load_config["offload_state_dict"] = self.split_config.offload_state_dict
-            logger.info(f"Configuring model for layer splitting (device_map='auto') with max_memory: {self.load_config['max_memory']}")
         else:
             self.load_config["device_map"] = "auto"
             self.load_config["low_cpu_mem_usage"] = True
@@ -120,21 +176,48 @@ class LocalModelLoader:
         bnb_config = self.quant_config.to_bnb_config() if not is_cpu else None
         if bnb_config:
             self.load_config["quantization_config"] = bnb_config
-            self.load_config["torch_dtype"] = self.quant_config.compute_dtype
+            self.load_config["dtype"] = self.quant_config.compute_dtype
             logger.info(f"Applying {self.quant_config.method} quantization with {self.quant_config.compute_dtype}.")
         elif not is_cpu:
-            self.load_config["torch_dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            logger.info(f"Using default GPU dtype: {self.load_config['torch_dtype']}")
+            self.load_config["dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            logger.info(f"Using default GPU dtype: {self.load_config['dtype']}")
         else:
-             self.load_config["torch_dtype"] = torch.float32
+             self.load_config["dtype"] = torch.float32
              logger.info("Using default CPU dtype: float32")
-             
+
         # 3. Handle potential 16bit method (which just means setting dtype)
         if self.quant_config.method == "16bit" and "quantization_config" not in self.load_config:
-            self.load_config["torch_dtype"] = self.quant_config.compute_dtype or torch.float16
-            logger.info(f"Using 16-bit precision: {self.load_config['torch_dtype']}")
+            self.load_config["dtype"] = self.quant_config.compute_dtype or torch.float16
+            logger.info(f"Using 16-bit precision: {self.load_config['dtype']}")
 
         return self.load_config
+
+    def _get_model_num_layers(self) -> Optional[int]:
+        """
+        Get the number of layers in the model from config.
+
+        Returns:
+            Number of layers, or None if unable to determine
+        """
+        try:
+            config = AutoConfig.from_pretrained(
+                self.model_id,
+                cache_dir=str(self.model_cache_dir),
+                trust_remote_code=self.trust_remote_code
+            )
+
+            # Try common attribute names for layer count
+            for attr in ['num_hidden_layers', 'n_layer', 'num_layers', 'n_layers']:
+                if hasattr(config, attr):
+                    num_layers = getattr(config, attr)
+                    logger.info(f"Detected {num_layers} layers in model {self.model_id}")
+                    return num_layers
+
+            logger.warning(f"Could not determine number of layers for {self.model_id}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get model config for layer count: {e}")
+            return None
 
     def load(self) -> Tuple[Any, Any]:
         """Attempts to load the model and tokenizer."""
@@ -142,7 +225,26 @@ class LocalModelLoader:
             raise ModelLoadError("PyTorch/Transformers not installed.", self.model_id)
 
         load_config = self.build_load_config()
-        
+
+        # --- Display Memory Projection (if enabled) ---
+        if self.split_config.show_memory_projection:
+            from ...utils.memory_estimator import display_memory_projection
+            logger.info(f"Displaying memory projection for {self.model_id}")
+            try:
+                projection = display_memory_projection(
+                    model_id=self.model_id,
+                    quantization=self.quant_config.method,
+                    max_seq_length=4096,  # TODO: Get from hyperparameters
+                    cache_dir=self.model_cache_dir,
+                    trust_remote_code=self.trust_remote_code
+                )
+                # Log projection details
+                logger.info(f"Memory projection: Model={projection.model_size_mb:.0f}MB, "
+                           f"KV-Cache={projection.kv_cache_size_mb:.0f}MB, "
+                           f"Total={projection.total_size_mb:.0f}MB")
+            except Exception as e:
+                logger.warning(f"Could not display memory projection: {e}")
+
         # --- Load Tokenizer ---
         try:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -190,12 +292,20 @@ class LocalModelLoader:
             if self.split_config.auto_oom_handling and self.device_manager.is_cuda_available():
                 logger.info("🛡️  Automatic OOM handling enabled for LLM")
 
+                # Get model layer count for iterative splitting
+                model_num_layers = self._get_model_num_layers()
+
                 # Create OOM recovery strategy
                 initial_gpu_mem = list(self.split_config.max_gpu_memory.values())[0] if self.split_config.max_gpu_memory else "4GB"
                 recovery_strategy = OOMRecoveryStrategy(
                     initial_gpu_memory=initial_gpu_mem,
                     initial_cpu_memory=self.split_config.max_cpu_memory,
                     min_gpu_memory="1GB",
+                    model_num_layers=model_num_layers,
+                    use_iterative_layer_split=True,  # Enable iterative layer splitting
+                    offload_folder=self.split_config.offload_folder,  # Pass offload folder
+                    model_id=self.model_id,  # Pass model ID for explicit device maps
+                    use_explicit_device_map=True,  # Use explicit device maps for deterministic placement
                     logger=logger
                 )
 
@@ -229,15 +339,33 @@ class LocalModelLoader:
         except Exception as e:
             logger.error(f"Failed to load model {self.model_id}: {e}", exc_info=True)
 
-            # --- Fallback Logic (only if NOT an OOM error) ---
-            if not CUDAMemoryManager.is_oom_error(e):
-                # If load failed with quantization or splitting, try a simpler config
+            # --- Fallback Logic ---
+            is_oom = CUDAMemoryManager.is_oom_error(e)
+
+            if is_oom:
+                # OOM error - skip GPU fallback attempts, go directly to CPU
+                logger.warning("OOM detected - skipping GPU fallback attempts, trying CPU-only load.")
+                if load_config.get("device_map") != {"": "cpu"}:
+                     cpu_config = {
+                        "cache_dir": str(self.model_cache_dir),
+                        "trust_remote_code": self.trust_remote_code,
+                        "dtype": torch.float32,
+                        "device_map": {"": "cpu"},
+                     }
+                     try:
+                          model = AutoModelForCausalLM.from_pretrained(self.model_id, **cpu_config)
+                          logger.info("Successfully loaded model with CPU-only fallback.")
+                          return model, tokenizer
+                     except Exception as e3:
+                          logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
+            else:
+                # Non-OOM error - try simpler GPU config first, then CPU
                 if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
                     logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
                     fallback_config = {
                         "cache_dir": str(self.model_cache_dir),
                         "trust_remote_code": self.trust_remote_code,
-                        "torch_dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
+                        "dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
                         "device_map": "auto",
                         "low_cpu_mem_usage": self.device_manager.is_cuda_available(),
                     }
@@ -254,7 +382,7 @@ class LocalModelLoader:
                      cpu_config = {
                         "cache_dir": str(self.model_cache_dir),
                         "trust_remote_code": self.trust_remote_code,
-                        "torch_dtype": torch.float32,
+                        "dtype": torch.float32,
                         "device_map": {"": "cpu"},
                      }
                      try:
@@ -297,6 +425,61 @@ class LocalHFBackend(LLMBackend):
         )
         self.device_manager = get_device_manager()
         self.device = self.device_manager.get_device()
+
+        # Initialize advanced cache system (NEW INTEGRATED SYSTEM)
+        self.advanced_cache: Optional[LlamaNoteDynamicCache] = None
+        self.generation_wrapper: Optional[CachedGenerationWrapper] = None
+
+        if self.split_config.use_advanced_cache:
+            # Map strategy string to enum
+            strategy_map = {
+                "aggressive": MemoryStrategy.AGGRESSIVE,
+                "balanced": MemoryStrategy.BALANCED,
+                "quality": MemoryStrategy.QUALITY
+            }
+            strategy = strategy_map.get(
+                self.split_config.cache_strategy.lower(),
+                MemoryStrategy.BALANCED
+            )
+
+            cache_config = CacheStrategyConfig(strategy=strategy)
+
+            # Create advanced cache
+            self.advanced_cache = LlamaNoteDynamicCache(
+                strategy_config=cache_config,
+                enable_hybrid_cache=True,
+                enable_sliding_window=True
+            )
+
+            self.logger.info(f"Advanced cache system enabled: strategy={strategy.value}")
+            self.logger.info(f"  Window size: {cache_config.get_window_size()} tokens")
+            self.logger.info(f"  Prefix preservation: {cache_config.get_prefix_size()} tokens")
+            self.logger.info(f"  Hot cache: {cache_config.get_hot_cache_size():.0f} MB")
+            self.logger.info(f"  Cold cache: {cache_config.get_cold_cache_size():.0f} MB")
+
+        # Legacy cache systems (kept for backward compatibility)
+        self.hybrid_cache: Optional[HybridKVCache] = None
+        if self.split_config.use_hybrid_kv_cache and not self.split_config.use_advanced_cache:
+            cache_config = CacheConfig(
+                hot_cache_max_size_mb=self.split_config.kv_cache_hot_size_mb,
+                cold_cache_max_size_mb=self.split_config.kv_cache_cold_size_mb,
+                device_hot="cuda" if self.device_manager.is_cuda_available() else "cpu",
+                device_cold="cpu"
+            )
+            self.hybrid_cache = HybridKVCache(config=cache_config)
+            self.logger.info(f"Legacy hybrid KV-Cache enabled (hot={cache_config.hot_cache_max_size_mb}MB)")
+
+        self.attention_patcher: Optional[AttentionPatcher] = None
+        if self.split_config.use_sliding_window and not self.split_config.use_advanced_cache:
+            sliding_config = SlidingWindowConfig(
+                window_size=self.split_config.sliding_window_size,
+                stride=self.split_config.sliding_window_stride,
+                keep_prefix_tokens=self.split_config.sliding_window_keep_prefix,
+                device="cuda" if self.device_manager.is_cuda_available() else "cpu"
+            )
+            self.attention_patcher = AttentionPatcher(sliding_window_config=sliding_config)
+            self.logger.info(f"Legacy sliding window configured (window={sliding_config.window_size})")
+
         self.logger.info(f"Initialized LocalHFBackend for {self.model_id}")
 
     @log_execution_time(logger_name=__name__)
@@ -321,6 +504,24 @@ class LocalHFBackend(LLMBackend):
             self.tokenizer = tokenizer
             self._post_load_setup()
             self._log_model_info()
+
+            # Initialize generation wrapper with advanced cache if enabled
+            if self.advanced_cache:
+                self.generation_wrapper = CachedGenerationWrapper(
+                    model=self.model_handle,
+                    cache=self.advanced_cache,
+                    enable_hooks=self.split_config.enable_generation_hooks
+                )
+                self.logger.info("Generation wrapper initialized with advanced cache")
+
+            # Apply legacy sliding window patch if enabled (backward compatibility)
+            if self.attention_patcher:
+                self.logger.info("Applying sliding window attention patch...")
+                if self.attention_patcher.patch_model(self.model_handle, model_type="auto"):
+                    self.logger.info("Successfully patched model with sliding window attention")
+                else:
+                    self.logger.warning("Failed to patch model with sliding window attention")
+
             self.is_loaded = True
             return True
         except Exception as e:
@@ -430,13 +631,22 @@ class LocalHFBackend(LLMBackend):
              logger.error(f"Failed to create GenerationConfig: {e}. Using default.", exc_info=True)
              gen_config = GenerationConfig(max_new_tokens=max_new)
 
-        # Generate
+        # Generate - use wrapper if available for advanced cache integration
         start_time = time.time()
         with torch.no_grad():
-            outputs = self.model_handle.generate(
-                **inputs,
-                generation_config=gen_config
-            )
+            if self.generation_wrapper:
+                # Use advanced cache-integrated generation
+                outputs = self.generation_wrapper.generate(
+                    inputs=inputs['input_ids'],
+                    attention_mask=inputs.get('attention_mask'),
+                    generation_config=gen_config
+                )
+            else:
+                # Standard generation
+                outputs = self.model_handle.generate(
+                    **inputs,
+                    generation_config=gen_config
+                )
         gen_time = time.time() - start_time
         
         # Decode output
@@ -504,14 +714,53 @@ class LocalHFBackend(LLMBackend):
         # Delegate to the standard generate method
         return self._generate_request(prompt, hyperparams, **kwargs)
 
+    def get_cache_statistics(self) -> Optional[Dict[str, Any]]:
+        """Get hybrid cache statistics if cache is enabled."""
+        if self.hybrid_cache:
+            return self.hybrid_cache.get_statistics()
+        return None
+
+    def log_cache_statistics(self):
+        """Log hybrid cache statistics if cache is enabled."""
+        if self.hybrid_cache:
+            self.logger.info(self.hybrid_cache.format_statistics())
+
+    def log_attention_statistics(self):
+        """Log sliding window attention statistics if enabled."""
+        if self.attention_patcher:
+            self.logger.info(self.attention_patcher.format_statistics())
+
+    def log_advanced_cache_statistics(self):
+        """Log advanced cache statistics if enabled."""
+        if self.generation_wrapper:
+            self.generation_wrapper.log_cache_statistics()
+
     def unload(self):
         """Unload model and tokenizer, clear memory."""
         if not self.is_loaded:
             return
         self.logger.info(f"Unloading local HF model: {self.model_specifier}")
+
+        # Log advanced cache statistics if enabled (NEW SYSTEM)
+        if self.advanced_cache:
+            self.log_advanced_cache_statistics()
+            self.advanced_cache.reset()
+
+        # Log legacy cache statistics before unloading (BACKWARD COMPATIBILITY)
+        if self.hybrid_cache:
+            self.log_cache_statistics()
+            self.hybrid_cache.clear()
+
+        # Log attention statistics and unpatch if enabled (LEGACY)
+        if self.attention_patcher:
+            self.log_attention_statistics()
+            self.attention_patcher.unpatch_model()
+            self.attention_patcher.reset_statistics()
+
         cleanup_resources([self.model_handle, self.tokenizer], clear_cuda=True)
         self.model_handle = None
         self.tokenizer = None
         self.device_map = None
+        self.generation_wrapper = None
         self.is_loaded = False
         self.logger.info("Local HF model unloaded.")

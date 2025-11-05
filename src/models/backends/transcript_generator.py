@@ -74,7 +74,7 @@ class TranscriptGenerator:
                 "automatic-speech-recognition",
                 model=self.model_name,
                 device=0 if self.device == "cuda" else -1,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                dtype=torch.float16 if self.device == "cuda" else torch.float32
             )
 
             self.logger.info("Whisper model loaded successfully")

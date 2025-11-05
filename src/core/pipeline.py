@@ -31,6 +31,8 @@ from ..io.checkpoints import CheckpointManager
 from ..models.backends.base import LLMBackend, AudioBackend
 from ..models.registry import get_model_entry, ModelEntry
 from .errors import PipelineError, MissingDataError, ModelLoadError, FileProcessingError, GenerationError
+from .stage_analyzer import StageAnalyzer, create_lifecycle_plan
+from .model_lifecycle_manager import ModelLifecycleManager
 
 logger = get_logger_conf(__name__)
 
@@ -60,6 +62,13 @@ class ProcessingPipeline:
         self.stages_completed: List[str] = []
         self.checkpoint_name: Optional[str] = None
         self.stages_to_run: List[str] = self.config.stages if self.config.stages is not None else list(DEFAULT_PIPELINE_STAGES)
+
+        # Config UUID for checkpoint-config linking
+        self.config_uuid: Optional[str] = None
+
+        # Model lifecycle management
+        self.lifecycle_manager: Optional[ModelLifecycleManager] = None
+        self._lifecycle_plan = None
 
         # Initialize components based on config
         self._initialize_components()
@@ -118,12 +127,48 @@ class ProcessingPipeline:
         """Explicitly set which stages to run."""
         self.stages_to_run = [s for s in stages if s in DEFAULT_PIPELINE_STAGES]
         self.logger.info(f"Pipeline stages set to run: {self.stages_to_run}")
+        # Reinitialize lifecycle plan if already created
+        if self._lifecycle_plan is not None:
+            self._initialize_lifecycle_manager()
+
+    def _initialize_lifecycle_manager(self):
+        """Initialize the model lifecycle manager based on stages to run."""
+        # Create lifecycle plan
+        self._lifecycle_plan = create_lifecycle_plan(self.stages_to_run, verbose=False)
+
+        # Create lifecycle manager
+        enable_dynamic = getattr(self.config.layer_split_config, 'auto_discover_splits', True)
+        self.lifecycle_manager = ModelLifecycleManager(
+            self._lifecycle_plan,
+            enable_dynamic_loading=enable_dynamic
+        )
+
+        # Register backends if they exist
+        if self.llm_backend is not None:
+            self.lifecycle_manager.set_text_backend(self.llm_backend)
+        if self.audio_backend is not None:
+            self.lifecycle_manager.set_audio_backend(self.audio_backend)
+
+        self.logger.info(f"Lifecycle manager initialized (enabled={enable_dynamic})")
+
+        # Display lifecycle plan if verbose logging
+        try:
+            if hasattr(self.logger, 'level') and self.logger.level <= 10:  # DEBUG level
+                self.logger.debug(self._lifecycle_plan.format_plan())
+        except Exception:
+            pass  # Skip if logger doesn't support level attribute
 
     def _save_checkpoint(self, input_path: Path, stage: str, data_payload: Dict[str, Any]):
         """Save a checkpoint for the current stage."""
         if self.config.enable_checkpoints and self.checkpoint_manager:
             try:
-                self.checkpoint_manager.save(input_path, self.config, stage, data_payload)
+                self.checkpoint_manager.save(
+                    input_path,
+                    self.config,
+                    stage,
+                    data_payload,
+                    config_uuid=self.config_uuid  # Link checkpoint to configuration
+                )
             except Exception as e:
                 self.logger.warning(f"Failed to save checkpoint for stage '{stage}': {e}")
 
@@ -148,6 +193,13 @@ class ProcessingPipeline:
         # Setup per-file state
         self.checkpoint_name = f"{input_path.stem}_{int(start_time)}"
 
+        # Generate config UUID for checkpoint-config linking
+        if self.config.enable_checkpoints:
+            from ..io.checkpoint_config import CheckpointConfigManager
+            config_mgr = CheckpointConfigManager()
+            self.config_uuid = config_mgr.save_config(self.config)
+            self.logger.info(f"Configuration UUID: {self.config_uuid}")
+
         # Initialize new checkpoint manager with resume capability
         resume_mode = self.config.checkpoint_resume_mode if self.config.enable_checkpoints else "disabled"
         self.checkpoint_manager = CheckpointManager(
@@ -163,6 +215,10 @@ class ProcessingPipeline:
         self.stage_executor = PipelineStageExecutor(self) # Re-init executor
         self.stages_completed = []
         self.current_stage = "setup"
+
+        # Initialize lifecycle manager for this pipeline run
+        if self.lifecycle_manager is None or self._lifecycle_plan is None:
+            self._initialize_lifecycle_manager()
 
         ConsoleOutput.header(f"Processing: {input_path.name}")
         self.logger.info(f"Starting pipeline for: {input_path}")
@@ -187,6 +243,7 @@ class ProcessingPipeline:
             data_payload: Dict[str, Any] = resume_data.copy()
             # Ensure input_path is set
             data_payload['input_path'] = input_path
+            self.logger.debug(f"Resumed data_payload keys: {list(data_payload.keys())}")
         else:
             data_payload: Dict[str, Any] = {'input_path': input_path}
         final_output_path: Optional[Path] = None
@@ -214,66 +271,186 @@ class ProcessingPipeline:
             if "extract" in self.stages_to_run and "extract" not in skip_stages:
                 current_stage_num += 1
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
-                extract_result: Optional[ExtractionResult]
-                if input_path.suffix.lower() == '.pdf':
-                    extract_result = self.stage_executor.execute("extract", 
-                                                                lambda: self.pdf_processor.extract_text(input_path),
-                                                                data_payload, [])
-                    if not extract_result: raise PipelineError("PDF extraction failed.")
-                elif input_path.suffix.lower() in ['.txt', '.md']:
-                     def read_text():
-                         try:
-                             text = input_path.read_text(encoding='utf-8')
-                             meta = PDFMetadata(file_path=input_path, num_pages=1, file_size_mb=input_path.stat().st_size / (1024*1024), raw_metadata={})
-                             return ExtractionResult(text=text, metadata=meta, page_texts=[text], extraction_method="text_read", warnings=[], char_count=len(text), word_count=len(text.split()))
-                         except Exception as e: raise FileProcessingError(f"Failed to read input text file: {e}", str(input_path)) from e
-                    
-                     extract_result = self.stage_executor.execute("extract", read_text, data_payload, [])
-                else:
-                    raise FileProcessingError(f"Unsupported file type for extraction: {input_path.suffix}", str(input_path))
-                
-                data_payload['text'] = extract_result.text
-                data_payload['metadata'] = extract_result.metadata
-                data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
 
-                # Save checkpoint
-                self._save_checkpoint(input_path, "extract", data_payload)
+                # Check if text already exists from checkpoint (resume case)
+                if 'text' in data_payload and resume_from_stage:
+                    try:
+                        resume_idx = stage_order.index(resume_from_stage)
+                        extract_idx = stage_order.index("extract")
+                        if extract_idx < resume_idx:
+                            self.logger.info("Extract stage already completed from checkpoint, using existing data")
+                        else:
+                            # Run extract normally
+                            extract_result: Optional[ExtractionResult]
+                            if input_path.suffix.lower() == '.pdf':
+                                extract_result = self.stage_executor.execute("extract",
+                                                                            lambda: self.pdf_processor.extract_text(input_path),
+                                                                            data_payload, [])
+                                if not extract_result: raise PipelineError("PDF extraction failed.")
+                            elif input_path.suffix.lower() in ['.txt', '.md']:
+                                 def read_text():
+                                     try:
+                                         text = input_path.read_text(encoding='utf-8')
+                                         meta = PDFMetadata(file_path=input_path, num_pages=1, file_size_mb=input_path.stat().st_size / (1024*1024), raw_metadata={})
+                                         return ExtractionResult(text=text, metadata=meta, page_texts=[text], extraction_method="text_read", warnings=[], char_count=len(text), word_count=len(text.split()))
+                                     except Exception as e: raise FileProcessingError(f"Failed to read input text file: {e}", str(input_path)) from e
+
+                                 extract_result = self.stage_executor.execute("extract", read_text, data_payload, [])
+                            else:
+                                raise FileProcessingError(f"Unsupported file type for extraction: {input_path.suffix}", str(input_path))
+
+                            data_payload['text'] = extract_result.text
+                            data_payload['metadata'] = extract_result.metadata
+                            data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
+                            self._save_checkpoint(input_path, "extract", data_payload)
+                    except ValueError:
+                        # resume_from_stage not in stage_order, run normally
+                        extract_result: Optional[ExtractionResult]
+                        if input_path.suffix.lower() == '.pdf':
+                            extract_result = self.stage_executor.execute("extract",
+                                                                        lambda: self.pdf_processor.extract_text(input_path),
+                                                                        data_payload, [])
+                            if not extract_result: raise PipelineError("PDF extraction failed.")
+                        elif input_path.suffix.lower() in ['.txt', '.md']:
+                             def read_text():
+                                 try:
+                                     text = input_path.read_text(encoding='utf-8')
+                                     meta = PDFMetadata(file_path=input_path, num_pages=1, file_size_mb=input_path.stat().st_size / (1024*1024), raw_metadata={})
+                                     return ExtractionResult(text=text, metadata=meta, page_texts=[text], extraction_method="text_read", warnings=[], char_count=len(text), word_count=len(text.split()))
+                                 except Exception as e: raise FileProcessingError(f"Failed to read input text file: {e}", str(input_path)) from e
+
+                             extract_result = self.stage_executor.execute("extract", read_text, data_payload, [])
+                        else:
+                            raise FileProcessingError(f"Unsupported file type for extraction: {input_path.suffix}", str(input_path))
+
+                        data_payload['text'] = extract_result.text
+                        data_payload['metadata'] = extract_result.metadata
+                        data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
+                        self._save_checkpoint(input_path, "extract", data_payload)
+                else:
+                    # No resume, run normally
+                    extract_result: Optional[ExtractionResult]
+                    if input_path.suffix.lower() == '.pdf':
+                        extract_result = self.stage_executor.execute("extract",
+                                                                    lambda: self.pdf_processor.extract_text(input_path),
+                                                                    data_payload, [])
+                        if not extract_result: raise PipelineError("PDF extraction failed.")
+                    elif input_path.suffix.lower() in ['.txt', '.md']:
+                         def read_text():
+                             try:
+                                 text = input_path.read_text(encoding='utf-8')
+                                 meta = PDFMetadata(file_path=input_path, num_pages=1, file_size_mb=input_path.stat().st_size / (1024*1024), raw_metadata={})
+                                 return ExtractionResult(text=text, metadata=meta, page_texts=[text], extraction_method="text_read", warnings=[], char_count=len(text), word_count=len(text.split()))
+                             except Exception as e: raise FileProcessingError(f"Failed to read input text file: {e}", str(input_path)) from e
+
+                         extract_result = self.stage_executor.execute("extract", read_text, data_payload, [])
+                    else:
+                        raise FileProcessingError(f"Unsupported file type for extraction: {input_path.suffix}", str(input_path))
+
+                    data_payload['text'] = extract_result.text
+                    data_payload['metadata'] = extract_result.metadata
+                    data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
+                    self._save_checkpoint(input_path, "extract", data_payload)
 
             # --- Stage 2: Preprocess ---
             if "preprocess" in self.stages_to_run and "preprocess" not in skip_stages:
                 current_stage_num += 1
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
-                def run_preprocess():
-                    text = data_payload.get('text')
-                    if text is None: # Need text from extract or checkpoint
-                         raise MissingDataError("preprocess", "text")
-                    if self.config.clean_for_audio:
-                         text = self.text_preprocessor.clean_for_audio(text)
-                    return self.text_preprocessor.preprocess_for_llm(text)
-                
-                data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
-                data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
 
-                # Save checkpoint
-                self._save_checkpoint(input_path, "preprocess", data_payload)
+                # Check if preprocess data already exists from checkpoint (resume case)
+                if 'text' in data_payload and resume_from_stage:
+                    try:
+                        resume_idx = stage_order.index(resume_from_stage)
+                        preprocess_idx = stage_order.index("preprocess")
+                        # If we're resuming from a later stage, preprocess is already done
+                        if preprocess_idx < resume_idx:
+                            self.logger.info("Preprocess stage already completed from checkpoint, using existing data")
+                        else:
+                            # Run preprocess normally
+                            def run_preprocess():
+                                text = data_payload.get('text')
+                                if text is None:
+                                    raise MissingDataError("preprocess", "text")
+                                if self.config.clean_for_audio:
+                                    text = self.text_preprocessor.clean_for_audio(text)
+                                return self.text_preprocessor.preprocess_for_llm(text)
+
+                            data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
+                            data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
+                            self._save_checkpoint(input_path, "preprocess", data_payload)
+                    except ValueError:
+                        # resume_from_stage not in stage_order, run normally
+                        def run_preprocess():
+                            text = data_payload.get('text')
+                            if text is None:
+                                raise MissingDataError("preprocess", "text")
+                            if self.config.clean_for_audio:
+                                text = self.text_preprocessor.clean_for_audio(text)
+                            return self.text_preprocessor.preprocess_for_llm(text)
+
+                        data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
+                        data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
+                        self._save_checkpoint(input_path, "preprocess", data_payload)
+                else:
+                    # No resume, run normally
+                    def run_preprocess():
+                        text = data_payload.get('text')
+                        if text is None:
+                            raise MissingDataError("preprocess", "text")
+                        if self.config.clean_for_audio:
+                            text = self.text_preprocessor.clean_for_audio(text)
+                        return self.text_preprocessor.preprocess_for_llm(text)
+
+                    data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
+                    data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
+                    self._save_checkpoint(input_path, "preprocess", data_payload)
 
             # --- Stage 3: Chunk ---
             if "chunk" in self.stages_to_run and "chunk" not in skip_stages:
                 current_stage_num += 1
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
-                def run_chunk():
-                     if 'text' not in data_payload: raise MissingDataError("chunk", "text")
-                     return self.text_chunker.chunk_text(data_payload['text'])
-                
-                chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
-                data_payload['chunks'] = [c.text for c in chunk_result.chunks]
-                data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
 
-                # Save checkpoint
-                self._save_checkpoint(input_path, "chunk", data_payload)
+                # Check if chunks already exist from checkpoint (resume case)
+                if 'chunks' in data_payload and resume_from_stage:
+                    try:
+                        resume_idx = stage_order.index(resume_from_stage)
+                        chunk_idx = stage_order.index("chunk")
+                        if chunk_idx < resume_idx:
+                            self.logger.info("Chunk stage already completed from checkpoint, using existing data")
+                        else:
+                            def run_chunk():
+                                if 'text' not in data_payload: raise MissingDataError("chunk", "text")
+                                return self.text_chunker.chunk_text(data_payload['text'])
+
+                            chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                            data_payload['chunks'] = [c.text for c in chunk_result.chunks]
+                            data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                            self._save_checkpoint(input_path, "chunk", data_payload)
+                    except ValueError:
+                        def run_chunk():
+                            if 'text' not in data_payload: raise MissingDataError("chunk", "text")
+                            return self.text_chunker.chunk_text(data_payload['text'])
+
+                        chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                        data_payload['chunks'] = [c.text for c in chunk_result.chunks]
+                        data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                        self._save_checkpoint(input_path, "chunk", data_payload)
+                else:
+                    def run_chunk():
+                        if 'text' not in data_payload: raise MissingDataError("chunk", "text")
+                        return self.text_chunker.chunk_text(data_payload['text'])
+
+                    chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                    data_payload['chunks'] = [c.text for c in chunk_result.chunks]
+                    data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                    self._save_checkpoint(input_path, "chunk", data_payload)
 
             # --- Stage 4: Process ---
             if "process" in self.stages_to_run and "process" not in skip_stages:
+                 # Handle model lifecycle before stage
+                 if self.lifecycle_manager:
+                     self.lifecycle_manager.handle_stage_transition("process")
+
                  # Update overall progress
                  current_stage_num += 1
                  dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
@@ -362,26 +539,50 @@ class ProcessingPipeline:
 
             # --- Stage 5: Filter ---
             if "filter" in self.stages_to_run and "filter" not in skip_stages:
+                # Handle model lifecycle before stage
+                if self.lifecycle_manager:
+                    self.lifecycle_manager.handle_stage_transition("filter")
+
                 current_stage_num += 1
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
-                # Determine input for filtering
-                chunks_to_filter = data_payload.get('processed_chunks', data_payload.get('chunks'))
-                if not chunks_to_filter and 'text' in data_payload: chunks_to_filter = [data_payload['text']]
-                
-                def run_filter():
-                    if not chunks_to_filter: raise MissingDataError("filter", "processed_chunks or chunks")
-                    # Use the merged filter logic
-                    return self.response_filter.filter_and_merge(
-                        chunks_to_filter,
-                        remove_thinking=self.config.remove_thinking,
-                        remove_acknowledgments=True # Always remove acks
-                    )
-                
-                data_payload['filtered_text'] = self.stage_executor.execute("filter", run_filter, data_payload, [])
-                data_payload['stats_filter'] = {"chars": len(data_payload['filtered_text'])}
 
-                # Save checkpoint
-                self._save_checkpoint(input_path, "filter", data_payload)
+                # Determine input for filtering - check all possible sources
+                self.logger.debug(f"Filter stage - data_payload keys: {list(data_payload.keys())}")
+                chunks_to_filter = data_payload.get('processed_chunks')
+                self.logger.debug(f"processed_chunks: {chunks_to_filter is not None and len(chunks_to_filter) if chunks_to_filter else 'None'}")
+
+                # If no processed_chunks, try chunks
+                if not chunks_to_filter:
+                    chunks_to_filter = data_payload.get('chunks')
+                    self.logger.debug(f"chunks: {chunks_to_filter is not None and len(chunks_to_filter) if chunks_to_filter else 'None'}")
+
+                # If no chunks, try text as single chunk
+                if not chunks_to_filter and 'text' in data_payload:
+                    chunks_to_filter = [data_payload['text']]
+                    self.logger.debug("Using text as single chunk")
+
+                # If still no data, check if we already have filtered_text (from checkpoint)
+                if not chunks_to_filter and 'filtered_text' in data_payload:
+                    # Already filtered from checkpoint, skip this stage
+                    self.logger.info("Filtered text already exists from checkpoint, skipping filter stage")
+                    self.stages_completed.append("filter")
+                else:
+                    # Run the filter
+                    def run_filter():
+                        if not chunks_to_filter:
+                            raise MissingDataError("filter", "processed_chunks, chunks, or text")
+                        # Use the merged filter logic
+                        return self.response_filter.filter_and_merge(
+                            chunks_to_filter,
+                            remove_thinking=self.config.remove_thinking,
+                            remove_acknowledgments=True # Always remove acks
+                        )
+
+                    data_payload['filtered_text'] = self.stage_executor.execute("filter", run_filter, data_payload, [])
+                    data_payload['stats_filter'] = {"chars": len(data_payload['filtered_text'])}
+
+                    # Save checkpoint
+                    self._save_checkpoint(input_path, "filter", data_payload)
 
             # --- Stage 6: Format ---
             if "format" in self.stages_to_run and "format" not in skip_stages:
@@ -410,6 +611,10 @@ class ProcessingPipeline:
 
             # --- Stage 7: Save ---
             if "save" in self.stages_to_run and "save" not in skip_stages:
+                # Handle model lifecycle before stage
+                if self.lifecycle_manager:
+                    self.lifecycle_manager.handle_stage_transition("save")
+
                 current_stage_num += 1
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
                 def run_save():
@@ -456,6 +661,10 @@ class ProcessingPipeline:
                 if self.audio_backend is None:
                      ConsoleOutput.warning("Audio generation requested but no audio backend is set. Skipping.")
                 else:
+                    # Handle model lifecycle before stage
+                    if self.lifecycle_manager:
+                        self.lifecycle_manager.handle_stage_transition("audio")
+
                     # Update overall progress
                     current_stage_num += 1
                     dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
@@ -551,6 +760,14 @@ class ProcessingPipeline:
             ConsoleOutput.error(error_message)
         finally:
             self.memory_monitor.check(f"pipeline end for {input_path.name}")
+
+            # Cleanup lifecycle manager (unload any remaining models)
+            if self.lifecycle_manager:
+                try:
+                    self.lifecycle_manager.cleanup()
+                except Exception as e:
+                    self.logger.warning(f"Failed to cleanup lifecycle manager: {e}")
+
             # Unloading is handled by the caller (run_cli_processing or MenuSystem)
 
             # Cleanup old checkpoints if pipeline succeeded

@@ -12,7 +12,7 @@ from datetime import datetime
 import shutil
 
 from ..utils.logger import get_logger_conf
-from .settings import BASE_DIR, DEFAULT_MODEL_KEY # Use central settings
+from .settings import BASE_DIR, DEFAULT_MODEL_KEY, DEFAULT_MODEL_CACHE_DIR # Use central settings
 from .cloud_keys import CloudKeyManager # Import the dedicated key manager
 
 logger = get_logger_conf(__name__)
@@ -141,7 +141,7 @@ class ConfigManager:
             "pipeline": self.base_dir / "pipelines",    # Saved pipeline configurations
             "audio": self.base_dir / "audio_configs",   # Saved audio configurations
             "model": self.base_dir / "model_prefs",     # Model preferences (future use)
-            "model_cache": Path.home() / ".cache" / "huggingface" / "hub", # Default to standard HF cache
+            "model_cache": DEFAULT_MODEL_CACHE_DIR,    # Use centralized HF cache from settings
             "cloud": self.base_dir / "cloud",          # Cloud API keys storage
             "backup": self.base_dir / "backups",       # Backup location
             # Custom paths config lives within 'config' directory

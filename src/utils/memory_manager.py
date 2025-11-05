@@ -75,7 +75,8 @@ class CUDAMemoryManager:
             "cudnn error: out of memory",
             "out of memory",
             "cuda error: out of memory",
-            "cuda error: device memory allocation failed"
+            "cuda error: device memory allocation failed",
+            "oom recovery failed"  # Catch our own OOM recovery failures
         ]
         return any(pattern in error_msg for pattern in oom_patterns)
 
@@ -133,6 +134,11 @@ class OOMRecoveryStrategy:
                  initial_gpu_memory: str = "4GB",
                  initial_cpu_memory: str = "28GB",
                  min_gpu_memory: str = "1GB",
+                 model_num_layers: Optional[int] = None,
+                 use_iterative_layer_split: bool = True,
+                 offload_folder: Optional[Path] = None,
+                 model_id: Optional[str] = None,
+                 use_explicit_device_map: bool = True,
                  logger=None):
         """
         Initialize OOM recovery strategy.
@@ -141,21 +147,47 @@ class OOMRecoveryStrategy:
             initial_gpu_memory: Initial GPU memory allocation
             initial_cpu_memory: CPU memory allocation for offloading
             min_gpu_memory: Minimum GPU memory to maintain
+            model_num_layers: Number of layers in the model (for iterative splitting)
+            use_iterative_layer_split: Use layer-by-layer splitting instead of percentage-based
+            offload_folder: Folder for disk offloading (optional)
+            model_id: Model ID for building explicit device maps (optional)
+            use_explicit_device_map: Use explicit device maps instead of max_memory (default: True)
             logger: Logger instance
         """
         self.initial_gpu_memory = initial_gpu_memory
         self.initial_cpu_memory = initial_cpu_memory
         self.min_gpu_memory = min_gpu_memory
+        self.model_num_layers = model_num_layers
+        self.use_iterative_layer_split = use_iterative_layer_split
+        self.offload_folder = offload_folder
+        self.model_id = model_id
+        self.use_explicit_device_map = use_explicit_device_map
         self.logger = logger or get_logger_conf(__name__)
 
         self.attempt_count = 0
-        self.max_attempts = 10
+        self.max_attempts = 50  # Increased to allow for layer-by-layer attempts
 
         # Track what we've tried
         self.tried_cache_offload = False
         self.tried_context_offload = False
+        self.tried_disk_offload = False
         self.current_gpu_memory_gb = self._parse_gb(initial_gpu_memory)
         self.min_gpu_memory_gb = self._parse_gb(min_gpu_memory)
+
+        # Layer-based splitting state
+        self.layers_offloaded_to_cpu = 0  # Number of layers moved to CPU
+        self.layer_split_increment = 1  # Move layers one at a time initially
+
+        # Device map builder for explicit layer placement
+        self.device_map_builder = None
+        if self.use_explicit_device_map and self.model_id and self.model_num_layers:
+            try:
+                from .device_map_builder import DeviceMapBuilder
+                self.device_map_builder = DeviceMapBuilder(self.model_id)
+                self.logger.info(f"Initialized DeviceMapBuilder for explicit layer placement ({self.model_num_layers} layers)")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize DeviceMapBuilder: {e}. Falling back to max_memory approach.")
+                self.device_map_builder = None
 
     def _parse_gb(self, mem_str: str) -> float:
         """Parse memory string to GB float."""
@@ -204,26 +236,100 @@ class OOMRecoveryStrategy:
             self.logger.info("Strategy 3: Offloading context/activations to CPU")
             return strategy
 
-        # Strategy 4+: Progressive GPU memory reduction (offload more layers)
-        # Reduce GPU memory by 20% each time
-        reduction_factor = 0.8
-        new_gpu_memory_gb = max(
-            self.current_gpu_memory_gb * reduction_factor,
-            self.min_gpu_memory_gb
-        )
+        # Strategy 4+: Progressive GPU memory reduction
+        # NOTE: Transformers doesn't support direct "X layers on GPU, Y on CPU" specification
+        # Instead, we progressively reduce max_gpu_memory which forces accelerate to offload more layers
+        if self.use_iterative_layer_split and self.model_num_layers:
+            # Calculate memory reduction based on layers we want to offload
+            if self.layers_offloaded_to_cpu < self.model_num_layers:
+                self.layers_offloaded_to_cpu += self.layer_split_increment
 
-        if new_gpu_memory_gb < self.current_gpu_memory_gb:
-            self.current_gpu_memory_gb = new_gpu_memory_gb
-            strategy['action'] = 'reduce_gpu_memory'
-            strategy['params'] = {
-                'max_gpu_memory': {0: f"{self.current_gpu_memory_gb:.1f}GB"},
-                'max_cpu_memory': self.initial_cpu_memory,
-                'device_map': 'auto',
-                'offload_state_dict': True,
-                'low_cpu_mem_usage': True
-            }
-            self.logger.info(f"Strategy {self.attempt_count}: Reducing GPU memory to {self.current_gpu_memory_gb:.1f}GB")
-            return strategy
+                # Accelerate offloading if we're past 50% of attempts
+                if self.attempt_count > 25 and self.layer_split_increment == 1:
+                    self.layer_split_increment = 2  # Move 2 layers at a time
+                    self.logger.info(f"Accelerating layer offload: moving {self.layer_split_increment} layers per attempt")
+
+                layers_on_gpu = max(0, self.model_num_layers - self.layers_offloaded_to_cpu)
+
+                # Calculate proportional GPU memory allocation
+                # Reduce GPU memory proportionally to force more layer offloading
+                if layers_on_gpu > 0:
+                    # Calculate what percentage of layers should be on GPU
+                    gpu_layer_ratio = layers_on_gpu / self.model_num_layers
+                    # Reduce initial GPU memory by this ratio (plus some overhead for embeddings/buffers)
+                    target_gpu_memory_gb = max(
+                        self.current_gpu_memory_gb * gpu_layer_ratio * 0.85,  # 0.85 to force offloading
+                        self.min_gpu_memory_gb
+                    )
+                else:
+                    # All layers to CPU - use minimum GPU memory (just for buffers/embeddings)
+                    target_gpu_memory_gb = self.min_gpu_memory_gb
+
+                self.current_gpu_memory_gb = target_gpu_memory_gb
+
+                strategy['action'] = 'split_layers'
+
+                # Use explicit device map if available, otherwise fall back to max_memory
+                if self.device_map_builder:
+                    # Build explicit device map for deterministic layer placement
+                    device_map = self.device_map_builder.build_device_map(layers_on_gpu)
+                    strategy['params'] = {
+                        'device_map': device_map,  # Explicit layer placement
+                        'offload_state_dict': True,
+                        'low_cpu_mem_usage': True
+                    }
+                    self.logger.info(f"Using explicit device map: {layers_on_gpu} GPU layers, {self.layers_offloaded_to_cpu} CPU layers")
+                else:
+                    # Fall back to max_memory approach (less deterministic)
+                    strategy['params'] = {
+                        'max_memory': {0: f"{self.current_gpu_memory_gb:.2f}GB", 'cpu': self.initial_cpu_memory},
+                        'device_map': 'auto',  # Let accelerate decide layer placement based on max_memory
+                        'offload_state_dict': True,
+                        'low_cpu_mem_usage': True
+                    }
+
+                # Add offload_folder if available and not tried yet
+                if self.offload_folder and not self.tried_disk_offload:
+                    strategy['params']['offload_folder'] = str(self.offload_folder)
+                    # Mark as tried after a certain number of attempts
+                    if self.attempt_count > 10:
+                        self.tried_disk_offload = True
+
+                if layers_on_gpu > 0:
+                    self.logger.info(
+                        f"Strategy {self.attempt_count}: Targeting {layers_on_gpu}/{self.model_num_layers} layers on GPU "
+                        f"by reducing GPU memory to {self.current_gpu_memory_gb:.2f}GB"
+                    )
+                else:
+                    self.logger.info(
+                        f"Strategy {self.attempt_count}: Forcing all {self.model_num_layers} layers to CPU "
+                        f"(GPU memory: {self.current_gpu_memory_gb:.2f}GB for buffers only)"
+                    )
+
+                return strategy
+        else:
+            # Fallback to percentage-based GPU memory reduction
+            reduction_factor = 0.8
+            new_gpu_memory_gb = max(
+                self.current_gpu_memory_gb * reduction_factor,
+                self.min_gpu_memory_gb
+            )
+
+            if new_gpu_memory_gb < self.current_gpu_memory_gb:
+                self.current_gpu_memory_gb = new_gpu_memory_gb
+                strategy['action'] = 'reduce_gpu_memory'
+                strategy['params'] = {
+                    'max_memory': {0: f"{self.current_gpu_memory_gb:.1f}GB", 'cpu': self.initial_cpu_memory},
+                    'device_map': 'auto',
+                    'offload_state_dict': True,
+                    'low_cpu_mem_usage': True
+                }
+                # Add offload_folder if available
+                if self.offload_folder:
+                    strategy['params']['offload_folder'] = str(self.offload_folder)
+
+                self.logger.info(f"Strategy {self.attempt_count}: Reducing GPU memory to {self.current_gpu_memory_gb:.1f}GB")
+                return strategy
 
         # No more strategies available
         strategy['action'] = 'exhausted'
@@ -288,14 +394,21 @@ def with_oom_handling(
                 result = load_fn(**strategy['params'])
                 return result, strategy['params']
 
-            elif strategy['action'] == 'reduce_gpu_memory':
-                # Apply memory reduction
+            elif strategy['action'] in ['reduce_gpu_memory', 'split_layers']:
+                # Apply memory reduction or layer splitting
                 if on_strategy_change:
                     on_strategy_change(strategy['params'])
 
                 result = load_fn(**strategy['params'])
                 final_params = strategy['params']
-                logger.info(f"✓ Successfully loaded with reduced GPU memory")
+
+                if strategy['action'] == 'split_layers':
+                    layers_gpu = strategy['params'].get('layers_on_gpu', 0)
+                    layers_cpu = strategy['params'].get('layers_on_cpu', 0)
+                    logger.info(f"✓ Successfully loaded with layer split: {layers_gpu} GPU / {layers_cpu} CPU")
+                else:
+                    logger.info(f"✓ Successfully loaded with reduced GPU memory")
+
                 return result, final_params
 
             else:

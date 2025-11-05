@@ -81,8 +81,9 @@ class QuantizationConfig:
             )
         elif self.method == "8bit":
             return BitsAndBytesConfig(
-                load_in_8bit=True
-                # Add llm_int8 specific params here if needed
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=True  # Enable CPU offloading for better memory management
+                # Add other llm_int8 specific params here if needed (e.g., llm_int8_threshold)
             )
         # 16bit doesn't use BnB config, handled via torch_dtype directly
         return None
@@ -99,6 +100,27 @@ class LayerSplitConfig:
     offload_state_dict: bool = True # Transformers: Use state_dict for offloading (more memory efficient)
     low_cpu_mem_usage: bool = True # Enable low CPU memory usage mode
     auto_oom_handling: bool = True # Enable automatic CUDA OOM error handling with progressive layer offloading
+    auto_discover_splits: bool = True # Automatically discover optimal layer splits on first model load
+
+    # Advanced memory management settings
+    kv_cache_device: str = "auto"  # "auto", "cpu", "gpu" - Where to store KV cache
+    context_device: str = "auto"  # "auto", "cpu", "gpu" - Where to store context
+    show_memory_projection: bool = True  # Show memory estimates before loading
+    use_iterative_layer_split: bool = True  # Use layer-by-layer splitting in OOM recovery
+
+    # Integrated Cache System (replaces old hybrid/sliding implementations)
+    use_advanced_cache: bool = True  # Enable advanced cache with hot/cold + sliding window
+    cache_strategy: str = "balanced"  # "aggressive", "balanced", or "quality"
+    enable_generation_hooks: bool = True  # Enable hooks for future extensibility
+
+    # Legacy settings (deprecated but kept for compatibility)
+    use_hybrid_kv_cache: bool = False  # Deprecated: use use_advanced_cache instead
+    kv_cache_hot_size_mb: float = 512.0  # Hot cache size in MB (GPU)
+    kv_cache_cold_size_mb: float = 2048.0  # Cold cache size in MB (CPU)
+    use_sliding_window: bool = False  # Deprecated: use use_advanced_cache instead
+    sliding_window_size: int = 2048  # Window size for sliding attention
+    sliding_window_keep_prefix: int = 128  # Number of prefix tokens to preserve
+    sliding_window_stride: int = 512  # Sliding stride
 
     def get_max_memory_dict(self) -> Dict[Union[int, str], str]:
         """Formats memory limits for Transformers device_map='auto'."""

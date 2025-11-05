@@ -21,7 +21,7 @@ except NameError:
 # Default directories relative to BASE_DIR
 DEFAULT_OUTPUT_DIR = BASE_DIR / "output"
 DEFAULT_LOG_DIR = BASE_DIR / "logs"
-DEFAULT_CACHE_DIR = BASE_DIR / "cache"
+DEFAULT_CACHE_DIR = BASE_DIR / "cache"  # For metadata/info cache (NOT for model files)
 DEFAULT_OFFLOAD_DIR = BASE_DIR / "offload"
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "llamanote" # User config
 
@@ -36,8 +36,15 @@ DEFAULT_CONFIG_DIR = Path.home() / ".config" / "llamanote" # User config
 #          pass # Avoid crashing on startup
 
 # === Model Cache Settings ===
-USER_MODEL_CACHE_DIR = None  # User-defined cache path
-DEFAULT_MODEL_CACHE_DIR = DEFAULT_CACHE_DIR # Default to project's cache/ folder
+# Use HuggingFace's standard cache directory to avoid duplication
+# HuggingFace Hub cache location (respects HF_HOME environment variable)
+import os
+HF_CACHE_HOME = Path(os.getenv('HF_HOME', Path.home() / '.cache' / 'huggingface'))
+HF_HUB_CACHE = HF_CACHE_HOME / 'hub'
+
+USER_MODEL_CACHE_DIR = None  # User-defined cache path (overrides default)
+# Default to HuggingFace hub cache to consolidate all model downloads
+DEFAULT_MODEL_CACHE_DIR = HF_HUB_CACHE
 # === Core Constants ===
 QUANTIZATION_OPTIONS: List[str] = ["none", "4bit", "8bit", "16bit"] # 16bit often means float16/bfloat16
 DEFAULT_QUANTIZATION: str = "4bit"

@@ -299,7 +299,8 @@ class CheckpointManager:
              config: PipelineConfig,
              stage: str,
              data: Dict[str, Any],
-             chunk_index: Optional[int] = None) -> bool:
+             chunk_index: Optional[int] = None,
+             config_uuid: Optional[str] = None) -> bool:
         """
         Save a checkpoint for the given stage.
 
@@ -309,6 +310,7 @@ class CheckpointManager:
             stage: Stage name
             data: Data payload dictionary to save
             chunk_index: Optional chunk index for mid-stage checkpoints
+            config_uuid: Optional UUID linking to saved configuration
 
         Returns:
             True if save succeeded, False otherwise
@@ -319,6 +321,10 @@ class CheckpointManager:
             # Create metadata
             data_keys = list(data.keys())
             metadata = self._create_metadata(input_path, config, stage, data_keys)
+
+            # Add config UUID to metadata if provided
+            if config_uuid:
+                metadata["config_uuid"] = config_uuid
 
             # Add chunk index to metadata if provided
             if chunk_index is not None:
@@ -429,11 +435,14 @@ class CheckpointManager:
         incompatibilities = []
         checkpoint_config = checkpoint_metadata.get("config", {})
 
-        # Check version
-        if checkpoint_metadata.get("version") != CHECKPOINT_VERSION:
-            incompatibilities.append(f"Version mismatch: checkpoint v{checkpoint_metadata.get('version')} vs current v{CHECKPOINT_VERSION}")
+        # Check version (allow backwards compatibility with 1.0)
+        checkpoint_version = checkpoint_metadata.get("version", "1.0")
+        if checkpoint_version not in [CHECKPOINT_VERSION, "1.0"]:
+            incompatibilities.append(f"Version mismatch: checkpoint v{checkpoint_version} vs current v{CHECKPOINT_VERSION}")
 
-        # Get relevant fields for stages from resume point onwards
+        # Get relevant fields for the resume stage itself (not future stages)
+        # We only care that the checkpoint stage was created with compatible settings
+        # Future stages can use different settings
         stage_order = ["extract", "preprocess", "chunk", "process", "filter", "format", "save", "audio"]
         try:
             resume_idx = stage_order.index(resume_from_stage)
@@ -441,14 +450,16 @@ class CheckpointManager:
             incompatibilities.append(f"Unknown stage: {resume_from_stage}")
             return False, incompatibilities
 
-        # Collect relevant fields for upcoming stages
-        relevant_fields = set()
-        for s in stage_order[resume_idx:]:
-            relevant_fields.update(STAGE_RELEVANT_FIELDS.get(s, []))
+        # Only check relevant fields for the resume stage itself
+        relevant_fields = set(STAGE_RELEVANT_FIELDS.get(resume_from_stage, []))
 
-        # Check text model if process stage or later
+        # Check text model only if the resume stage requires it
         if "model_provider" in relevant_fields or "model_specifier" in relevant_fields:
-            checkpoint_model = checkpoint_config.get("text_model", "")
+            checkpoint_model_dict = checkpoint_config.get("text_model", {})
+            if isinstance(checkpoint_model_dict, dict):
+                checkpoint_model = checkpoint_model_dict.get("full_name", "")
+            else:
+                checkpoint_model = str(checkpoint_model_dict)
             current_model = f"{config.model_provider}:{config.model_specifier}"
             if checkpoint_model != current_model:
                 incompatibilities.append(f"Text model mismatch: {checkpoint_model} vs {current_model}")
@@ -527,9 +538,17 @@ class CheckpointManager:
 
                 metadata, _ = result
 
-                # Check if stage is in our pipeline
-                if stages_to_run and stage not in stages_to_run:
-                    continue
+                # Check if this checkpoint stage could be useful for the stages we want to run
+                # A checkpoint is useful if:
+                # 1. Its stage is in stages_to_run (we're resuming exactly that stage), OR
+                # 2. Its stage comes before any stage in stages_to_run (provides data for later stages)
+                if stages_to_run:
+                    checkpoint_stage_idx = stage_order.index(stage) if stage in stage_order else -1
+                    earliest_run_stage_idx = min([stage_order.index(s) for s in stages_to_run if s in stage_order], default=-1)
+
+                    # Skip checkpoint if it's after all stages we want to run
+                    if checkpoint_stage_idx > earliest_run_stage_idx:
+                        continue
 
                 # Check compatibility
                 is_compatible, incompatibilities = self._check_stage_compatibility(metadata, config, stage)
@@ -537,7 +556,7 @@ class CheckpointManager:
                 if is_compatible:
                     compatible_checkpoints.append((stage, ckpt_file, metadata))
                 else:
-                    self.logger.debug(f"Checkpoint {ckpt_file.name} incompatible: {', '.join(incompatibilities)}")
+                    self.logger.info(f"Checkpoint {ckpt_file.name} incompatible: {', '.join(incompatibilities)}")
 
             except Exception as e:
                 self.logger.warning(f"Error checking checkpoint {ckpt_file.name}: {e}")

@@ -1167,24 +1167,38 @@ class MenuSystem:
             ac = self.state.audio_config
 
             print("Current Settings:")
-            print(f"  CPU Offloading:         {'ENABLED' if lsc.enabled else 'DISABLED'}")
-            print(f"  Auto OOM Handling:      {'ENABLED' if lsc.auto_oom_handling else 'DISABLED'}")
-            print(f"  Max GPU Memory:         {list(lsc.max_gpu_memory.values())[0] if lsc.max_gpu_memory else 'N/A'}")
-            print(f"  Max CPU Memory:         {lsc.max_cpu_memory}")
-            print(f"  Disk Offloading:        {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
-            print(f"  Cache Clearing (Audio): {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
-            print(f"  Low CPU Mem Mode:       {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
+            print(f"  CPU Offloading:          {'ENABLED' if lsc.enabled else 'DISABLED'}")
+            print(f"  Auto OOM Handling:       {'ENABLED' if lsc.auto_oom_handling else 'DISABLED'}")
+            print(f"  Iterative Layer Split:   {'ENABLED' if lsc.use_iterative_layer_split else 'DISABLED'}")
+            print(f"  Max GPU Memory:          {list(lsc.max_gpu_memory.values())[0] if lsc.max_gpu_memory else 'N/A'}")
+            print(f"  Max CPU Memory:          {lsc.max_cpu_memory}")
+            print(f"  KV-Cache Device:         {lsc.kv_cache_device.upper()}")
+            print(f"  Context Device:          {lsc.context_device.upper()}")
+            print(f"  Show Memory Projection:  {'YES' if lsc.show_memory_projection else 'NO'}")
+            print(f"  Advanced Cache System:   {'ENABLED' if lsc.use_advanced_cache else 'DISABLED'}")
+            print(f"  Cache Strategy:          {lsc.cache_strategy.upper()}")
+            print(f"  Generation Hooks:        {'ENABLED' if lsc.enable_generation_hooks else 'DISABLED'}")
+            print(f"  Disk Offloading:         {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
+            print(f"  Cache Clearing (Audio):  {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
+            print(f"  Low CPU Mem Mode:        {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
             print("-" * 70)
 
             print("\nConfiguration Options:")
             print("  1. Toggle CPU Offloading")
             print("  2. Toggle Auto OOM Handling (Progressive Layer Offloading)")
-            print("  3. Set Max GPU Memory")
-            print("  4. Set Max CPU Memory")
-            print("  5. Toggle Disk Offloading")
-            print("  6. Toggle Cache Clearing Between Audio Chunks")
-            print("  7. Toggle Low CPU Memory Mode")
-            print("  8. Reset to Recommended Defaults (4GB VRAM + 28GB RAM)")
+            print("  3. Toggle Iterative Layer Splitting (Layer-by-Layer vs Percentage-Based)")
+            print("  4. Set Max GPU Memory")
+            print("  5. Set Max CPU Memory")
+            print("  6. Set KV-Cache Device (auto/cpu/gpu)")
+            print("  7. Set Context Device (auto/cpu/gpu)")
+            print("  8. Toggle Memory Projection Display")
+            print("  9. Toggle Advanced Cache System (Hot/Cold + Sliding Window)")
+            print(" 10. Set Cache Strategy (aggressive/balanced/quality)")
+            print(" 11. Toggle Generation Hooks")
+            print(" 12. Toggle Disk Offloading")
+            print(" 13. Toggle Cache Clearing Between Audio Chunks")
+            print(" 14. Toggle Low CPU Memory Mode")
+            print(" 15. Reset to Recommended Defaults (4GB VRAM + 28GB RAM)")
             print("\n  b. Back to Model Settings")
             print("-" * 70)
 
@@ -1205,6 +1219,14 @@ class MenuSystem:
                         ConsoleOutput.info("The system will automatically reduce GPU memory allocation if CUDA OOM errors occur")
 
                 elif choice == '3':
+                    lsc.use_iterative_layer_split = not lsc.use_iterative_layer_split
+                    ConsoleOutput.success(f"Iterative Layer Splitting {'ENABLED' if lsc.use_iterative_layer_split else 'DISABLED'}")
+                    if lsc.use_iterative_layer_split:
+                        ConsoleOutput.info("Will move layers one-by-one from GPU to CPU during OOM recovery")
+                    else:
+                        ConsoleOutput.info("Will use percentage-based GPU memory reduction during OOM recovery")
+
+                elif choice == '4':
                     current_val = list(lsc.max_gpu_memory.values())[0] if lsc.max_gpu_memory else "4GB"
                     val = input(f"Enter Max GPU Memory (e.g., 4GB, 3.5GB) [current: {current_val}]: ").strip()
                     if val:
@@ -1214,7 +1236,7 @@ class MenuSystem:
                         else:
                             ConsoleOutput.warning("Invalid format. Use numbers followed by GB, GiB, MB, or MiB.")
 
-                elif choice == '4':
+                elif choice == '5':
                     val = input(f"Enter Max CPU Memory (e.g., 28GB) [current: {lsc.max_cpu_memory}]: ").strip()
                     if val:
                         if re.match(r"^\d+(\.\d+)?(GB|GiB|MB|MiB)$", val, re.IGNORECASE):
@@ -1223,26 +1245,97 @@ class MenuSystem:
                         else:
                             ConsoleOutput.warning("Invalid format. Use numbers followed by GB, GiB, MB, or MiB.")
 
-                elif choice == '5':
+                elif choice == '6':
+                    print("\nKV-Cache Device Options:")
+                    print("  auto - Follow layer placement (GPU layers → GPU cache, CPU layers → CPU cache)")
+                    print("  cpu  - Always store KV cache in system RAM")
+                    print("  gpu  - Always store KV cache in VRAM (if available)")
+                    val = input(f"Select device (auto/cpu/gpu) [current: {lsc.kv_cache_device}]: ").strip().lower()
+                    if val in ['auto', 'cpu', 'gpu']:
+                        lsc.kv_cache_device = val
+                        ConsoleOutput.success(f"KV-Cache Device set to {val.upper()}")
+                    elif val:
+                        ConsoleOutput.warning("Invalid choice. Use auto, cpu, or gpu.")
+
+                elif choice == '7':
+                    print("\nContext Device Options:")
+                    print("  auto - Follow first layer placement")
+                    print("  cpu  - Store context in system RAM")
+                    print("  gpu  - Store context in VRAM (if available)")
+                    val = input(f"Select device (auto/cpu/gpu) [current: {lsc.context_device}]: ").strip().lower()
+                    if val in ['auto', 'cpu', 'gpu']:
+                        lsc.context_device = val
+                        ConsoleOutput.success(f"Context Device set to {val.upper()}")
+                    elif val:
+                        ConsoleOutput.warning("Invalid choice. Use auto, cpu, or gpu.")
+
+                elif choice == '8':
+                    lsc.show_memory_projection = not lsc.show_memory_projection
+                    ConsoleOutput.success(f"Memory Projection Display {'ENABLED' if lsc.show_memory_projection else 'DISABLED'}")
+                    if lsc.show_memory_projection:
+                        ConsoleOutput.info("Will show estimated memory usage before loading models")
+
+                elif choice == '9':
+                    lsc.use_advanced_cache = not lsc.use_advanced_cache
+                    ConsoleOutput.success(f"Advanced Cache System {'ENABLED' if lsc.use_advanced_cache else 'DISABLED'}")
+                    if lsc.use_advanced_cache:
+                        ConsoleOutput.info("Advanced cache integrates hot/cold KV-cache + sliding window attention")
+                        ConsoleOutput.info(f"Current strategy: {lsc.cache_strategy.upper()}")
+                        ConsoleOutput.info("Compatible with: LLaMA, Qwen, DeepSeek, Gemma, GPT-NeoX")
+                    else:
+                        ConsoleOutput.warning("Disabling advanced cache - will use standard generation")
+
+                elif choice == '10':
+                    print("\nCache Strategy Options:")
+                    print("  aggressive - Smallest windows, maximum memory savings (may impact quality)")
+                    print("  balanced   - Moderate windows, good balance (RECOMMENDED)")
+                    print("  quality    - Large windows, prioritize quality over memory")
+                    val = input(f"Select strategy (aggressive/balanced/quality) [current: {lsc.cache_strategy}]: ").strip().lower()
+                    if val in ['aggressive', 'balanced', 'quality']:
+                        lsc.cache_strategy = val
+                        ConsoleOutput.success(f"Cache Strategy set to {val.upper()}")
+                        if val == 'aggressive':
+                            ConsoleOutput.info("Window: 1024 tokens | Prefix: 64 | Hot cache: 256MB")
+                        elif val == 'balanced':
+                            ConsoleOutput.info("Window: 2048 tokens | Prefix: 128 | Hot cache: 512MB")
+                        else:  # quality
+                            ConsoleOutput.info("Window: 4096 tokens | Prefix: 256 | Hot cache: 1024MB")
+                    elif val:
+                        ConsoleOutput.warning("Invalid choice. Use aggressive, balanced, or quality.")
+
+                elif choice == '11':
+                    lsc.enable_generation_hooks = not lsc.enable_generation_hooks
+                    ConsoleOutput.success(f"Generation Hooks {'ENABLED' if lsc.enable_generation_hooks else 'DISABLED'}")
+                    if lsc.enable_generation_hooks:
+                        ConsoleOutput.info("Hooks allow custom logic at various generation stages")
+
+                elif choice == '12':
                     ac.enable_disk_offload = not ac.enable_disk_offload
                     ConsoleOutput.success(f"Disk Offloading {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
                     if ac.enable_disk_offload:
                         ConsoleOutput.warning("Disk offloading is SLOW but saves RAM. Only use if necessary.")
 
-                elif choice == '6':
+                elif choice == '13':
                     ac.clear_cache_between_chunks = not ac.clear_cache_between_chunks
                     ConsoleOutput.success(f"Cache Clearing {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
 
-                elif choice == '7':
+                elif choice == '14':
                     lsc.low_cpu_mem_usage = not lsc.low_cpu_mem_usage
                     ConsoleOutput.success(f"Low CPU Memory Mode {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
 
-                elif choice == '8':
+                elif choice == '15':
                     # Reset to recommended defaults
                     lsc.enabled = True
                     lsc.auto_oom_handling = True
+                    lsc.use_iterative_layer_split = True
                     lsc.max_gpu_memory = {0: "4GB"}
                     lsc.max_cpu_memory = "28GB"
+                    lsc.kv_cache_device = "auto"
+                    lsc.context_device = "auto"
+                    lsc.show_memory_projection = True
+                    lsc.use_advanced_cache = True  # NEW: Enable advanced cache by default
+                    lsc.cache_strategy = "balanced"  # NEW: Use balanced strategy by default
+                    lsc.enable_generation_hooks = True  # NEW: Enable hooks by default
                     lsc.low_cpu_mem_usage = True
                     lsc.offload_state_dict = True
                     ac.enable_disk_offload = False
@@ -1250,6 +1343,7 @@ class MenuSystem:
                     ac.quantization = "4bit"
                     ac.enable_cpu_offload = True
                     ConsoleOutput.success("Reset to recommended defaults for 4GB VRAM + 32GB RAM system")
+                    ConsoleOutput.info("Advanced cache system enabled with balanced strategy")
 
                 else:
                     ConsoleOutput.warning("Invalid selection.")

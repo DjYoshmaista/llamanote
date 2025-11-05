@@ -153,10 +153,31 @@ class LocalAudioBackend(AudioBackend):
         if self.model_handle is not None:
             self.logger.info("Local audio model already loaded.")
             return True
-            
+
         model_id = self.model_specifier
         self.logger.info(f"Loading local TTS model: {model_id} onto {self.device}")
         ConsoleOutput.info(f"Loading local audio model: {model_id}...")
+
+        # --- Display Memory Projection for Audio Model (if enabled) ---
+        try:
+            from ...core.types import LayerSplitConfig
+            from ...utils.memory_estimator import display_memory_projection
+
+            # Check if show_memory_projection is enabled (from config or kwargs)
+            show_projection = kwargs.get('show_memory_projection', True)  # Default to True for audio
+
+            if show_projection:
+                self.logger.info(f"Displaying memory projection for audio model: {model_id}")
+                projection = display_memory_projection(
+                    model_id=model_id,
+                    quantization=self.config.quantization or "none",
+                    max_seq_length=512,  # Audio models typically use shorter sequences
+                    cache_dir=self.model_cache_dir,
+                    trust_remote_code=True
+                )
+                self.logger.info(f"Audio model memory projection: Total={projection.total_size_mb:.0f}MB")
+        except Exception as e:
+            self.logger.debug(f"Could not display audio model memory projection: {e}")
 
         try:
             # Check if model is already cached/downloaded
@@ -242,7 +263,7 @@ class LocalAudioBackend(AudioBackend):
     def _load_bark_model(self, model_id: str):
         self.processor = _AutoProcessor.from_pretrained(model_id, cache_dir=self.model_cache_dir)
         dtype = torch.float16 if self.config.use_half_precision and self.device == "cuda" else torch.float32
-        self.model = _BarkModel.from_pretrained(model_id, torch_dtype=dtype, cache_dir=self.model_cache_dir).to(self.device)
+        self.model = _BarkModel.from_pretrained(model_id, dtype=dtype, cache_dir=self.model_cache_dir).to(self.device)
         self.config.sample_rate = self.model.generation_config.sample_rate # Get SR from model
         self.logger.info(f"Bark model loaded with dtype: {dtype}, Sample Rate: {self.config.sample_rate}Hz")
 
@@ -407,7 +428,7 @@ class LocalAudioBackend(AudioBackend):
                 load_kwargs = {
                     'cache_dir': self.model_cache_dir,
                     'quantization_config': bnb_config,
-                    'torch_dtype': dtype,
+                    'dtype': dtype,
                     'attn_implementation': "eager",
                 }
 
@@ -453,6 +474,7 @@ class LocalAudioBackend(AudioBackend):
                         initial_gpu_memory=initial_gpu_mem,
                         initial_cpu_memory=self.layer_split_config.max_cpu_memory,
                         min_gpu_memory="1GB",
+                        offload_folder=self.layer_split_config.offload_folder,  # Pass offload folder
                         logger=self.logger
                     )
 
