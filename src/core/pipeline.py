@@ -517,7 +517,7 @@ class ProcessingPipeline:
                      dual_tracker.set_stage_progress(0, total_chunks, "Processing chunks")
 
                      # Define checkpoint callback
-                     def save_process_checkpoint(chunk_idx, results, extra_data):
+                     def save_process_checkpoint(chunk_idx, results, extra_data, **kwargs):
                          checkpoint_data = data_payload.copy()
                          # Convert results to raw outputs
                          processed_so_far = [r.raw_output if not r.error_message else data_payload['chunks'][i]
@@ -759,7 +759,7 @@ class ProcessingPipeline:
                         self.logger.info(f"Resuming audio stage from chunk {resume_from_chunk_audio}")
 
                     # Define checkpoint callback for audio
-                    def save_audio_checkpoint(chunk_idx, audio_arrays, extra_data):
+                    def save_audio_checkpoint(chunk_idx, audio_arrays, extra_data, **kwargs):
                         checkpoint_data = data_payload.copy()
                         checkpoint_data['audio_arrays'] = audio_arrays
                         checkpoint_data['audio_checkpoint_index'] = chunk_idx

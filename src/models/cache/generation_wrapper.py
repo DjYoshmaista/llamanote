@@ -167,6 +167,10 @@ class CachedGenerationWrapper:
         """Get statistics from the internal cache."""
         return self.cache.get_statistics()
 
+    def log_cache_statistics(self):
+        """Logs the current statistics of the internal cache."""
+        logger.info(self.cache.format_statistics())
+
     def __getattr__(self, name: str) -> Any:
         """
         Forward any other attribute access to the underlying model.
