@@ -16,7 +16,7 @@ import sys
 # --- LlamaNote Modules ---
 from ...utils.logger import get_logger_conf, ConsoleOutput
 from ...utils.decorators import log_execution_time
-from ...utils.helpers import cleanup_resources
+from ...utils.helpers import cleanup_resources, is_llama_cpp_installed
 from ..hyperparameters import HyperparameterConfig
 from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_GPU_LAYERS
@@ -25,12 +25,12 @@ from ...core.errors import ModelLoadError, GenerationError, ConfigurationError
 from .base import LLMBackend # Import the abstract base class
 from .mapper import HyperparamMapper # Import the mapper
 
-# Try importing llama-cpp-python
-try:
+# Check if llama-cpp-python is installed
+LLAMACPP_AVAILABLE = is_llama_cpp_installed()
+
+if LLAMACPP_AVAILABLE:
     from llama_cpp import Llama, LlamaGrammar
-    LLAMACPP_AVAILABLE = True
-except ImportError:
-    LLAMACPP_AVAILABLE = False
+else:
     # Define dummy types for type hinting if import fails
     Llama = type('Llama', (object,), {})
     LlamaGrammar = type('LlamaGrammar', (object,), {})

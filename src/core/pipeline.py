@@ -227,15 +227,27 @@ class ProcessingPipeline:
         resume_data = None
         resume_from_stage = None
         resume_chunk_index = None
+        restored_config = None
         if self.config.enable_checkpoints and resume_mode != "disabled":
             resume_result = self.checkpoint_manager.get_resume_checkpoint(
                 input_path, self.config, self.stages_to_run
             )
             if resume_result:
-                resume_from_stage, resume_data, resume_chunk_index = resume_result
+                resume_from_stage, resume_data, resume_chunk_index, restored_config = resume_result
                 chunk_str = f" (chunk {resume_chunk_index})" if resume_chunk_index is not None else ""
                 ConsoleOutput.success(f"Resuming from stage: {resume_from_stage}{chunk_str}")
                 self.logger.info(f"Loaded checkpoint data with keys: {list(resume_data.keys())}")
+
+                # Optionally use restored config (keep current config's stages_to_run)
+                if restored_config:
+                    # Calculate remaining stages automatically
+                    remaining_stages = self.checkpoint_manager.calculate_remaining_stages(
+                        resume_from_stage, self.stages_to_run
+                    )
+                    self.logger.info(f"Auto-calculated remaining stages: {remaining_stages}")
+                    # You could optionally apply restored_config here, but preserve stages_to_run
+                    # self.config = restored_config
+                    # self.config.stages = remaining_stages
         self.memory_monitor.start()
 
         # Initialize data payload (from resume or fresh)
@@ -465,9 +477,27 @@ class ProcessingPipeline:
 
                  # Determine resume point for this stage
                  resume_from_chunk_process = None
+                 resume_process_results = None
                  if resume_from_stage == "process" and resume_chunk_index is not None:
                      resume_from_chunk_process = resume_chunk_index
                      self.logger.info(f"Resuming process stage from chunk {resume_from_chunk_process}")
+
+                     # Reconstruct GenerationResult objects from checkpoint data
+                     if 'processed_chunks' in data_payload:
+                         processed_chunks = data_payload['processed_chunks']
+                         resume_process_results = []
+                         for chunk_text in processed_chunks[:resume_from_chunk_process]:
+                             resume_process_results.append(GenerationResult(
+                                 raw_output=chunk_text,
+                                 filtered_output=chunk_text,
+                                 input_tokens=0,  # Stats not preserved in checkpoint
+                                 output_tokens=0,
+                                 generation_time=0.0,
+                                 memory_used=0,
+                                 device_map={},
+                                 error_message=None
+                             ))
+                         self.logger.info(f"Reconstructed {len(resume_process_results)} results from checkpoint")
 
                  def run_process():
                      if self.llm_backend is None: raise PipelineError("LLM Backend not set.")
@@ -494,7 +524,19 @@ class ProcessingPipeline:
                                             for i, r in enumerate(results)]
                          checkpoint_data['processed_chunks'] = processed_so_far
                          checkpoint_data['process_checkpoint_index'] = chunk_idx
-                         self.checkpoint_manager.save(input_path, self.config, "process", checkpoint_data, chunk_index=chunk_idx)
+                         try:
+                             self.checkpoint_manager.save(
+                                 input_path=input_path,
+                                 config=self.config,
+                                 stage="process",
+                                 data=checkpoint_data,
+                                 chunk_index=chunk_idx,
+                                 total_chunks=len(data_payload['chunks']),
+                                 config_uuid=self.config_uuid
+                             )
+                         except TypeError as e:
+                             # Handle case where save method signature doesn't match expected
+                             self.logger.warning(f"Failed to save checkpoint: {e}")
 
                      # Run batch (sequentially) with checkpointing
                      results = batch_processor.process_batch(
@@ -505,6 +547,7 @@ class ProcessingPipeline:
                          checkpoint_callback=save_process_checkpoint if self.config.enable_checkpoints else None,
                          checkpoint_interval=self.config.checkpoint_interval,
                          resume_from_chunk=resume_from_chunk_process,
+                         resume_results=resume_process_results,
                          dual_tracker=dual_tracker
                      )
 
@@ -721,7 +764,21 @@ class ProcessingPipeline:
                         checkpoint_data['audio_arrays'] = audio_arrays
                         checkpoint_data['audio_checkpoint_index'] = chunk_idx
                         checkpoint_data.update(extra_data)
-                        self.checkpoint_manager.save(input_path, self.config, "audio", checkpoint_data, chunk_index=chunk_idx)
+                        # Get total chunks from extra_data if available
+                        total_audio_chunks = extra_data.get('total_segments', None)
+                        try:
+                            self.checkpoint_manager.save(
+                                input_path=input_path,
+                                config=self.config,
+                                stage="audio",
+                                data=checkpoint_data,
+                                chunk_index=chunk_idx,
+                                total_chunks=total_audio_chunks,
+                                config_uuid=self.config_uuid
+                            )
+                        except TypeError as e:
+                            # Handle case where save method signature doesn't match expected
+                            self.logger.warning(f"Failed to save checkpoint: {e}")
 
                     # Generate with checkpointing support
                     audio_result = self.audio_backend.generate_audio(

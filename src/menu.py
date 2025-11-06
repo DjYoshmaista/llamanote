@@ -8,12 +8,14 @@ import sys
 import os
 import re
 import time
+import importlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Union
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
 # --- LlamaNote Modules ---
+from . import utils
 from .utils.logger import ConsoleOutput, get_logger_conf, LoggingProgress
 from .utils.validators import validate_file_path, validate_directory_path
 from .config.manager import ConfigCRUD, ConfigManager
@@ -38,7 +40,7 @@ from .core.errors import ModelLoadError, PipelineError, FileProcessingError
 
 from .models.hub import InteractiveModelBrowser, ModelHub, ModelHubInfo
 from .models.backends import (
-    get_llm_backend, get_audio_backend, LLMBackend, AudioBackend
+    get_llm_backend, get_audio_backend, LLMBackend, AudioBackend, local_gguf
 )
 from .models.registry import get_registry, ModelEntry
 from .models.hyperparameters import HyperparameterConfig, InteractiveHyperparameterEditor
@@ -454,6 +456,12 @@ class MenuSystem:
                 "Configure Audio Settings",
                 self._set_audio_config,
                 description="e.g., Voice, Speed, Format"
+            ),
+            MenuItem(
+                "7",
+                "Speaker Embeddings (Multi-Speaker TTS)",
+                self._speaker_embeddings_menu,
+                description=lambda: f"Method: {self.state.audio_config.speaker_embedding_method} | Multi-Speaker: {'ON' if self.state.audio_config.enable_multi_speaker else 'OFF'}"
             ),
         ]
         return Menu("Model Settings", items)
@@ -912,13 +920,15 @@ class MenuSystem:
 
     def _select_local_gguf_model(self) -> MenuAction:
         """Handles selection of a local GGUF model."""
-        if not LLAMACPP_AVAILABLE:
+        importlib.reload(utils.helpers)
+        importlib.reload(local_gguf)
+        if not local_gguf.LLAMACPP_AVAILABLE:
             ConsoleOutput.error("llama-cpp-python is not installed.")
             ConsoleOutput.info("Please install it (e.g., `pip install llama-cpp-python`) to use GGUF models.")
             input("Press Enter to continue...")
             return MenuAction.BACK
 
-        manager = GGUFModelManager()
+        manager = local_gguf.GGUFModelManager()
         
         while True:
             ConsoleOutput.subsection("Select Local GGUF Model")
@@ -1603,6 +1613,171 @@ class MenuSystem:
             except Exception as e:
                  ConsoleOutput.error(f"Error updating setting: {e}")
                  input("Press Enter...")
+
+    def _speaker_embeddings_menu(self):
+        """Interactive configuration for multi-speaker TTS."""
+        ConsoleOutput.section("Speaker Embeddings Configuration")
+        cfg = self.state.audio_config
+
+        while True:
+            ConsoleOutput.header("Multi-Speaker TTS Settings")
+            print(f"  Provider: {self.state.audio_model_provider}")
+            print(f"  Model: {self.state.audio_model_specifier}")
+            print("-" * 60)
+            print(f"  1. Multi-Speaker Mode: {'ENABLED' if cfg.enable_multi_speaker else 'DISABLED'}")
+            print(f"  2. Generation Method : {cfg.speaker_embedding_method}")
+            print(f"       (auto, random, dataset, audio)")
+            print(f"  3. Default Gender    : {cfg.default_speaker_gender}")
+            print(f"       (neutral, male, female - for dataset filtering)")
+            print(f"  4. Random Seed       : {cfg.speaker_embedding_seed or 'None (non-deterministic)'}")
+            print(f"  5. Distribution      : {cfg.speaker_random_distribution}")
+            print(f"       (gaussian, uniform - for random generation)")
+            print(f"  6. Dataset Name      : {cfg.speaker_dataset_name}")
+            print(f"  7. View Cached Speakers")
+            print(f"  8. Clear Speaker Cache")
+            print(f"  9. Test Voice Preview (coming soon)")
+            print("\n  i. Info: How Multi-Speaker TTS Works")
+            print("  b. Back to Model Settings Menu")
+            print("-" * 60)
+
+            choice = input("Select setting to change (or command): ").strip().lower()
+
+            try:
+                if choice == 'b':
+                    return MenuAction.CONTINUE
+
+                elif choice == '1':  # Toggle multi-speaker
+                    cfg.enable_multi_speaker = not cfg.enable_multi_speaker
+                    ConsoleOutput.info(f"Multi-speaker mode {'ENABLED' if cfg.enable_multi_speaker else 'DISABLED'}")
+                    if cfg.enable_multi_speaker:
+                        ConsoleOutput.info("Multi-speaker TTS will detect speakers in markdown format:")
+                        ConsoleOutput.info("  **[Speaker Host]:** Welcome to the show!")
+                        ConsoleOutput.info("  **[Speaker Guest]:** Thanks for having me.")
+
+                elif choice == '2':  # Generation method
+                    print("\nGeneration Methods:")
+                    print("  auto    - Automatic selection (currently uses random)")
+                    print("  random  - Generate synthetic embeddings (fast, infinite variety)")
+                    print("  dataset - Sample from cmu-arctic-xvectors (7000+ real speakers)")
+                    print("  audio   - Extract from audio files (Phase 3, not yet implemented)")
+                    method = input(f"Enter method [current: {cfg.speaker_embedding_method}]: ").strip().lower()
+                    if method in ["auto", "random", "dataset", "audio"]:
+                        cfg.speaker_embedding_method = method
+                        ConsoleOutput.success(f"Method set to: {method}")
+                    elif method:
+                        ConsoleOutput.warning("Invalid method")
+
+                elif choice == '3':  # Default gender
+                    print("\nGender filtering (heuristic-based, for dataset sampling):")
+                    print("  neutral - No filtering (all speakers)")
+                    print("  male    - Prefer male voices (indices 0-4000)")
+                    print("  female  - Prefer female voices (indices 4000-7000)")
+                    gender = input(f"Enter gender [current: {cfg.default_speaker_gender}]: ").strip().lower()
+                    if gender in ["neutral", "male", "female"]:
+                        cfg.default_speaker_gender = gender
+                        ConsoleOutput.success(f"Default gender set to: {gender}")
+                    elif gender:
+                        ConsoleOutput.warning("Invalid gender (use neutral, male, or female)")
+
+                elif choice == '4':  # Random seed
+                    seed_input = input(f"Enter random seed (blank for non-deterministic) [current: {cfg.speaker_embedding_seed or 'None'}]: ").strip()
+                    if seed_input:
+                        try:
+                            cfg.speaker_embedding_seed = int(seed_input)
+                            ConsoleOutput.success(f"Seed set to: {cfg.speaker_embedding_seed}")
+                            ConsoleOutput.info("Same speaker names will now always get the same voice")
+                        except ValueError:
+                            ConsoleOutput.warning("Invalid seed (must be an integer)")
+                    else:
+                        cfg.speaker_embedding_seed = None
+                        ConsoleOutput.info("Seed cleared - voices will vary between runs")
+
+                elif choice == '5':  # Distribution
+                    print("\nDistribution types (for random generation):")
+                    print("  gaussian - Normal distribution (most common)")
+                    print("  uniform  - Uniform distribution (all values equally likely)")
+                    dist = input(f"Enter distribution [current: {cfg.speaker_random_distribution}]: ").strip().lower()
+                    if dist in ["gaussian", "uniform"]:
+                        cfg.speaker_random_distribution = dist
+                        ConsoleOutput.success(f"Distribution set to: {dist}")
+                    elif dist:
+                        ConsoleOutput.warning("Invalid distribution")
+
+                elif choice == '6':  # Dataset name
+                    ConsoleOutput.info(f"Current dataset: {cfg.speaker_dataset_name}")
+                    print("\nWarning: Changing the dataset requires it to be downloaded.")
+                    print("The default dataset (cmu-arctic-xvectors) contains 7000+ speakers.")
+                    change = input("Change dataset? (y/n): ").strip().lower()
+                    if change == 'y':
+                        dataset = input("Enter HuggingFace dataset name: ").strip()
+                        if dataset:
+                            cfg.speaker_dataset_name = dataset
+                            ConsoleOutput.success(f"Dataset set to: {dataset}")
+
+                elif choice == '7':  # View cached speakers
+                    ConsoleOutput.info("Cached speakers will be shown when audio generation is run.")
+                    ConsoleOutput.info("Speaker embeddings are cached in: cache/speakers/")
+                    input("\nPress Enter to continue...")
+
+                elif choice == '8':  # Clear cache
+                    ConsoleOutput.warning("This will remove all cached speaker embeddings.")
+                    confirm = input("Are you sure? (yes/no): ").strip().lower()
+                    if confirm == 'yes':
+                        import shutil
+                        cache_dir = Path("cache/speakers")
+                        if cache_dir.exists():
+                            shutil.rmtree(cache_dir)
+                            cache_dir.mkdir(parents=True)
+                            ConsoleOutput.success("Speaker cache cleared")
+                        else:
+                            ConsoleOutput.info("Cache directory doesn't exist yet")
+                    else:
+                        ConsoleOutput.info("Cache clearing cancelled")
+
+                elif choice == '9':  # Voice preview
+                    ConsoleOutput.warning("Voice preview feature coming in future update")
+                    input("Press Enter to continue...")
+
+                elif choice == 'i':  # Info
+                    ConsoleOutput.section("How Multi-Speaker TTS Works")
+                    print("\nLlamaNote can generate audio with multiple distinct voices!")
+                    print("\n1. FORMAT YOUR MARKDOWN:")
+                    print("   Use speaker labels in your generated text:")
+                    print("   **[Speaker Host]:** Welcome to the podcast!")
+                    print("   **[Speaker Guest]:** Thanks for having me.")
+                    print("\n2. SPEAKER DETECTION:")
+                    print("   LlamaNote automatically detects unique speakers in your document.")
+                    print("\n3. VOICE ASSIGNMENT:")
+                    print("   Each speaker gets a unique voice based on your chosen method:")
+                    print("   - Random: Synthetic voices generated on-the-fly")
+                    print("   - Dataset: Samples from 7000+ real speaker embeddings")
+                    print("\n4. AUDIO GENERATION:")
+                    print("   Each speaker segment is generated with its assigned voice.")
+                    print("\n5. PERSISTENCE:")
+                    print("   Speaker voices are cached - same speaker = same voice across runs!")
+                    print("\nPROS:")
+                    print("  + Distinct, recognizable voices for each speaker")
+                    print("  + Consistent across multiple generations")
+                    print("  + Works with any SpeechT5-based model")
+                    print("\nCONS:")
+                    print("  - Requires properly formatted markdown")
+                    print("  - Random voices may occasionally sound unnatural")
+                    print("  - Gender filtering is heuristic-based, not guaranteed")
+                    print("\nTIPS:")
+                    print("  - Use a seed for deterministic voice assignment")
+                    print("  - Dataset method typically sounds more natural")
+                    print("  - Clear cache if you want to reassign voices")
+                    print("-" * 60)
+                    input("\nPress Enter to continue...")
+
+                else:
+                    ConsoleOutput.warning("Invalid selection.")
+
+            except Exception as e:
+                ConsoleOutput.error(f"Error updating setting: {e}")
+                import traceback
+                traceback.print_exc()
+                input("Press Enter...")
 
 
     def _output_settings_menu(self):

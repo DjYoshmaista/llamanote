@@ -36,6 +36,13 @@ STAGE_RELEVANT_FIELDS = {
     "audio": ["audio_provider", "audio_specifier", "audio_config", "generate_audio"]
 }
 
+# Define which config fields can have fuzzy matching (allow minor differences)
+FUZZY_MATCH_FIELDS = {
+    "system_prompt": 0.9,  # 90% similarity required
+    "chunk_size": 0.1,  # Allow 10% variation
+    "chunk_overlap": 0.2,  # Allow 20% variation
+}
+
 
 class CheckpointManager:
     """
@@ -144,9 +151,9 @@ class CheckpointManager:
         hash_obj = hashlib.sha256(hash_str.encode('utf-8'))
         return hash_obj.hexdigest()[:12]
 
-    def _get_checkpoint_path(self, input_path: Path, config: PipelineConfig, stage: str, timestamp: Optional[str] = None, chunk_index: Optional[int] = None) -> Path:
+    def _get_checkpoint_path(self, input_path: Path, config: PipelineConfig, stage: str, timestamp: Optional[str] = None, chunk_index: Optional[int] = None, total_chunks: Optional[int] = None) -> Path:
         """
-        Get the full path for a checkpoint file.
+        Get the full path for a checkpoint file with descriptive naming.
 
         Args:
             input_path: Input file path
@@ -154,9 +161,14 @@ class CheckpointManager:
             stage: Stage name
             timestamp: Optional timestamp for hash
             chunk_index: Optional chunk index for mid-stage checkpoints
+            total_chunks: Optional total number of chunks (for progress display)
 
         Returns:
             Path to checkpoint file
+
+        Filename format:
+            <filename>_<stage>_<progress>_<timestamp>.ckpt
+            Example: paper_process_chunk040of055_20251106_142151.ckpt
         """
         input_hash = self._generate_input_hash(input_path)
         config_hash = self._generate_config_hash(config, stage, timestamp)
@@ -164,11 +176,24 @@ class CheckpointManager:
         checkpoint_dir = self.base_dir / input_hash
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Include chunk index in filename if provided (for mid-stage checkpoints)
-        if chunk_index is not None:
-            filename = f"{config_hash}_{stage}_chunk{chunk_index:04d}.ckpt"
+        # Get input file stem (filename without extension)
+        file_stem = input_path.stem
+
+        # Generate timestamp for filename
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Build descriptive filename with progress information
+        if chunk_index is not None and total_chunks is not None:
+            # Show progress: chunk040of055
+            progress = f"chunk{chunk_index:04d}of{total_chunks:04d}"
+            filename = f"{file_stem}_{stage}_{progress}_{ts}.ckpt"
+        elif chunk_index is not None:
+            # Only chunk index known
+            filename = f"{file_stem}_{stage}_chunk{chunk_index:04d}_{ts}.ckpt"
         else:
-            filename = f"{config_hash}_{stage}.ckpt"
+            # Stage-level checkpoint (no chunks)
+            filename = f"{file_stem}_{stage}_{ts}.ckpt"
+
         return checkpoint_dir / filename
 
     def _create_metadata(self,
@@ -292,7 +317,65 @@ class CheckpointManager:
                 "quantization": config.audio_config.quantization if config.audio_config else None,
             }
 
+        # Store FULL configuration as serializable dict for restoration
+        metadata["full_config"] = self._serialize_full_config(config)
+
         return metadata
+
+    def _serialize_full_config(self, config: PipelineConfig) -> Dict[str, Any]:
+        """
+        Serialize complete PipelineConfig to dictionary for checkpoint restoration.
+
+        Args:
+            config: Pipeline configuration to serialize
+
+        Returns:
+            Dictionary containing all config values in serializable format
+        """
+        full_config = {}
+
+        try:
+            # Try dataclass conversion first
+            if hasattr(config, '__dataclass_fields__'):
+                full_config = asdict(config)
+            else:
+                # Manual conversion for non-dataclass configs
+                for key, value in config.__dict__.items():
+                    full_config[key] = self._serialize_value(value)
+
+            # Convert specific known types
+            if 'mode' in full_config:
+                full_config['mode'] = str(full_config['mode'])
+            if 'chunking_strategy' in full_config:
+                full_config['chunking_strategy'] = str(full_config['chunking_strategy'])
+            if 'output_dir' in full_config and full_config['output_dir']:
+                full_config['output_dir'] = str(full_config['output_dir'])
+
+        except Exception as e:
+            self.logger.warning(f"Could not fully serialize config: {e}")
+            # Return partial config as fallback
+            full_config = {"_serialization_error": str(e)}
+
+        return full_config
+
+    def _serialize_value(self, value: Any) -> Any:
+        """Helper to serialize various types to JSON-compatible format."""
+        if isinstance(value, Path):
+            return str(value)
+        elif hasattr(value, '__dataclass_fields__'):
+            return asdict(value)
+        elif hasattr(value, '__dict__') and not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+            # Try to convert object to dict
+            try:
+                return {k: self._serialize_value(v) for k, v in value.__dict__.items()}
+            except:
+                return str(value)
+        elif isinstance(value, (list, tuple)):
+            return [self._serialize_value(item) for item in value]
+        elif isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        else:
+            return value
 
     def save(self,
              input_path: Path,
@@ -300,6 +383,7 @@ class CheckpointManager:
              stage: str,
              data: Dict[str, Any],
              chunk_index: Optional[int] = None,
+             total_chunks: Optional[int] = None,
              config_uuid: Optional[str] = None) -> bool:
         """
         Save a checkpoint for the given stage.
@@ -310,13 +394,18 @@ class CheckpointManager:
             stage: Stage name
             data: Data payload dictionary to save
             chunk_index: Optional chunk index for mid-stage checkpoints
+            total_chunks: Optional total number of chunks (for progress display)
             config_uuid: Optional UUID linking to saved configuration
 
         Returns:
             True if save succeeded, False otherwise
         """
         try:
-            checkpoint_path = self._get_checkpoint_path(input_path, config, stage, chunk_index=chunk_index)
+            checkpoint_path = self._get_checkpoint_path(
+                input_path, config, stage,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks
+            )
 
             # Create metadata
             data_keys = list(data.keys())
@@ -326,9 +415,11 @@ class CheckpointManager:
             if config_uuid:
                 metadata["config_uuid"] = config_uuid
 
-            # Add chunk index to metadata if provided
+            # Add chunk index and total to metadata if provided
             if chunk_index is not None:
                 metadata["chunk_index"] = chunk_index
+            if total_chunks is not None:
+                metadata["total_chunks"] = total_chunks
 
             # Create checkpoint object
             checkpoint = {
@@ -369,9 +460,40 @@ class CheckpointManager:
             self.logger.error(f"Failed to save checkpoint for stage '{stage}': {e}", exc_info=True)
             return False
 
+    def load_metadata_only(self, checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Load only the metadata from a checkpoint file (more efficient for discovery).
+
+        Args:
+            checkpoint_path: Path to the checkpoint file
+
+        Returns:
+            Metadata dict if successful, None otherwise
+        """
+        if not checkpoint_path.exists():
+            return None
+
+        try:
+            # Try loading with gzip first (for compressed checkpoints)
+            try:
+                with gzip.open(checkpoint_path, 'rb') as f:
+                    checkpoint = pickle.load(f)
+            except (OSError, gzip.BadGzipFile):
+                # Not gzipped, try regular pickle
+                with open(checkpoint_path, 'rb') as f:
+                    checkpoint = pickle.load(f)
+
+            if isinstance(checkpoint, dict) and "metadata" in checkpoint:
+                return checkpoint["metadata"]
+            return None
+
+        except Exception as e:
+            self.logger.debug(f"Failed to load metadata from {checkpoint_path.name}: {e}")
+            return None
+
     def load(self, checkpoint_path: Path) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """
-        Load a checkpoint file.
+        Load a checkpoint file (both metadata and data).
 
         Args:
             checkpoint_path: Path to the checkpoint file
@@ -470,8 +592,25 @@ class CheckpointManager:
             if checkpoint_chunking:
                 if str(checkpoint_chunking.get("strategy")) != str(config.chunking_strategy):
                     incompatibilities.append(f"Chunking strategy mismatch")
-                if checkpoint_chunking.get("chunk_size") != config.chunk_size:
-                    incompatibilities.append(f"Chunk size mismatch")
+
+                # Allow fuzzy matching for chunk_size
+                checkpoint_chunk_size = checkpoint_chunking.get("chunk_size")
+                if checkpoint_chunk_size and checkpoint_chunk_size != config.chunk_size:
+                    # Check if within acceptable variation
+                    variation = abs(checkpoint_chunk_size - config.chunk_size) / checkpoint_chunk_size
+                    if variation > FUZZY_MATCH_FIELDS.get("chunk_size", 0.1):
+                        incompatibilities.append(f"Chunk size mismatch: {checkpoint_chunk_size} vs {config.chunk_size}")
+                    else:
+                        self.logger.info(f"Chunk size differs slightly ({checkpoint_chunk_size} vs {config.chunk_size}) but within tolerance")
+
+                # Allow fuzzy matching for chunk_overlap
+                checkpoint_overlap = checkpoint_chunking.get("chunk_overlap")
+                if checkpoint_overlap and checkpoint_overlap != config.chunk_overlap:
+                    variation = abs(checkpoint_overlap - config.chunk_overlap) / max(checkpoint_overlap, 1)
+                    if variation > FUZZY_MATCH_FIELDS.get("chunk_overlap", 0.2):
+                        incompatibilities.append(f"Chunk overlap mismatch: {checkpoint_overlap} vs {config.chunk_overlap}")
+                    else:
+                        self.logger.info(f"Chunk overlap differs slightly but within tolerance")
 
         # Check audio settings if audio stage
         if "audio_provider" in relevant_fields and config.generate_audio:
@@ -531,12 +670,10 @@ class CheckpointManager:
                     self.logger.warning(f"Unexpected checkpoint filename format: {ckpt_file.name}")
                     continue
 
-                # Load and check compatibility
-                result = self.load(ckpt_file)
-                if result is None:
+                # Load only metadata for compatibility check (more efficient)
+                metadata = self.load_metadata_only(ckpt_file)
+                if metadata is None:
                     continue
-
-                metadata, _ = result
 
                 # Check if this checkpoint stage could be useful for the stages we want to run
                 # A checkpoint is useful if:
@@ -576,7 +713,7 @@ class CheckpointManager:
     def get_resume_checkpoint(self,
                              input_path: Path,
                              config: PipelineConfig,
-                             stages_to_run: Optional[List[str]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[int]]]:
+                             stages_to_run: Optional[List[str]] = None) -> Optional[Tuple[str, Dict[str, Any], Optional[int], Optional[PipelineConfig]]]:
         """
         Get the best checkpoint to resume from based on resume_mode.
 
@@ -586,8 +723,9 @@ class CheckpointManager:
             stages_to_run: List of stages to run
 
         Returns:
-            Tuple of (stage_name, data, chunk_index) if resuming, None otherwise
+            Tuple of (stage_name, data, chunk_index, restored_config) if resuming, None otherwise
             chunk_index is None for stage-level checkpoints, or an int for mid-stage checkpoints
+            restored_config is the configuration from checkpoint (or None if not available)
         """
         if self.resume_mode == "disabled":
             return None
@@ -607,7 +745,11 @@ class CheckpointManager:
                 chunk_index = metadata.get("chunk_index")
                 chunk_str = f" (chunk {chunk_index})" if chunk_index is not None else ""
                 ConsoleOutput.info(f"Resuming from checkpoint: stage '{stage}'{chunk_str} ({metadata['timestamp']})")
-                return stage, data, chunk_index
+
+                # Attempt to restore configuration from checkpoint
+                restored_config = self.restore_config_from_checkpoint(metadata, config)
+
+                return stage, data, chunk_index, restored_config
             return None
 
         elif self.resume_mode == "interactive":
@@ -615,6 +757,57 @@ class CheckpointManager:
             return self._interactive_checkpoint_selection(compatible)
 
         return None
+
+    def restore_config_from_checkpoint(self, metadata: Dict[str, Any], current_config: PipelineConfig) -> Optional[PipelineConfig]:
+        """
+        Restore PipelineConfig from checkpoint metadata.
+
+        Args:
+            metadata: Checkpoint metadata containing full_config
+            current_config: Current configuration (used as fallback)
+
+        Returns:
+            Restored configuration or None if restoration failed
+        """
+        try:
+            full_config = metadata.get("full_config")
+            if not full_config or "_serialization_error" in full_config:
+                self.logger.warning("No complete config in checkpoint, using current config")
+                return None
+
+            # Create new config from stored values
+            # Note: This is a simplified restoration - may need model-specific handling
+            restored = PipelineConfig(**full_config)
+            self.logger.info("Successfully restored configuration from checkpoint")
+            return restored
+
+        except Exception as e:
+            self.logger.warning(f"Could not restore config from checkpoint: {e}")
+            return None
+
+    def calculate_remaining_stages(self, checkpoint_stage: str, all_stages: Optional[List[str]] = None) -> List[str]:
+        """
+        Calculate which stages remain to be completed after a checkpoint.
+
+        Args:
+            checkpoint_stage: The stage where the checkpoint was saved
+            all_stages: Complete list of stages (defaults to standard pipeline stages)
+
+        Returns:
+            List of stages that still need to be run
+        """
+        if all_stages is None:
+            all_stages = ["extract", "preprocess", "chunk", "process", "filter", "format", "save", "audio"]
+
+        try:
+            checkpoint_idx = all_stages.index(checkpoint_stage)
+            # Return stages after the checkpoint stage
+            remaining = all_stages[checkpoint_idx + 1:]
+            self.logger.info(f"Checkpoint at '{checkpoint_stage}', remaining stages: {remaining}")
+            return remaining
+        except ValueError:
+            self.logger.warning(f"Unknown checkpoint stage '{checkpoint_stage}', cannot calculate remaining stages")
+            return all_stages
 
     def _interactive_checkpoint_selection(self,
                                          compatible_checkpoints: List[Tuple[str, Path, Dict[str, Any]]]) -> Optional[Tuple[str, Dict[str, Any], Optional[int]]]:

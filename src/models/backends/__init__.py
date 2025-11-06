@@ -143,7 +143,7 @@ def get_llm_backend(
             )
             return LlamaCppBackend(
                 config=gguf_config,
-                hyperparameters=hyperparameters
+                hyperparams=hyperparameters
             )
 
         elif provider_lower == "openai":

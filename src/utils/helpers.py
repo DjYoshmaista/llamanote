@@ -289,3 +289,11 @@ class DeviceManager:
 # Convenience function to access the manager
 def get_device_manager() -> DeviceManager:
     return DeviceManager()
+
+def is_llama_cpp_installed() -> bool:
+    """
+    Checks if llama-cpp-python is installed and accessible.
+    Uses importlib.util.find_spec for a reliable check.
+    """
+    import importlib.util
+    return importlib.util.find_spec("llama_cpp") is not None

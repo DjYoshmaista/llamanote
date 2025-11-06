@@ -83,7 +83,10 @@ class CUDAMemoryManager:
     @staticmethod
     def parse_memory_string(mem_str: str) -> int:
         """
-        Parse memory string (e.g., "4GB", "2048MB") to bytes.
+        Parse memory string (e.g., "4GB", "2048MB", "4GiB") to bytes.
+        Handles both IEC (GiB, MiB) and SI-like (GB, MB) units, treating
+        GB/MB/KB as their binary equivalents (GiB/MiB/KiB) for consistency
+        in memory calculations.
 
         Args:
             mem_str: Memory string to parse
@@ -93,22 +96,33 @@ class CUDAMemoryManager:
         """
         mem_str = mem_str.upper().strip()
 
-        # Match pattern like "4GB" or "2048MB"
-        match = re.match(r'(\d+(?:\.\d+)?)\s*(GB|MB|KB|B)?', mem_str)
+        # Regex to capture value and unit, including "GiB", "GB", "G"
+        match = re.match(r'(\d+(?:\.\d+)?)\s*(GIB|MIB|KIB|GB|MB|KB|G|M|K|B)?', mem_str)
         if not match:
-            raise ValueError(f"Invalid memory string: {mem_str}")
+            raise ValueError(f"Invalid memory string format: {mem_str}")
 
         value = float(match.group(1))
         unit = match.group(2) or 'B'
 
+        # Treat GB/MB/KB as GiB/MiB/KiB for memory calculations
         multipliers = {
             'B': 1,
+            'K': 1024,
             'KB': 1024,
+            'KIB': 1024,
+            'M': 1024**2,
             'MB': 1024**2,
-            'GB': 1024**3
+            'MIB': 1024**2,
+            'G': 1024**3,
+            'GB': 1024**3,
+            'GIB': 1024**3,
         }
 
-        return int(value * multipliers[unit])
+        if unit in multipliers:
+            return int(value * multipliers[unit])
+        
+        # This part should not be reached with the current regex, but is a safeguard
+        raise ValueError(f"Unknown memory unit: {unit}")
 
     @staticmethod
     def format_bytes(bytes_val: int) -> str:

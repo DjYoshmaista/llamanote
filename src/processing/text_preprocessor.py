@@ -199,5 +199,198 @@ class TextPreprocessor:
             
         if normalize_whitespace:
             text = self._normalize_whitespace(text)
-            
+
         return text
+
+
+class SpeakerSegmentParser:
+    """
+    Parser for multi-speaker markdown segments.
+
+    Extracts speaker-labeled text segments from markdown documents following
+    the format: **[Speaker Name]:** text content
+
+    This parser is designed to work with the output of the LLM-based markdown
+    generation, which formats multi-speaker conversations with speaker labels.
+
+    Example markdown format:
+        **[Speaker Host]:** Welcome to the show!
+        **[Speaker Guest]:** Thanks for having me.
+        **[Speaker Host]:** Let's dive into the topic.
+
+    Features:
+    - Extracts speaker name and associated text
+    - Handles multi-line speaker segments
+    - Identifies unique speakers in document
+    - Preserves original text content
+    """
+
+    # Regex pattern for speaker labels
+    # Matches: **[Speaker Name]:** followed by text until next speaker or end
+    SPEAKER_PATTERN = r'\*\*\[Speaker\s+([^\]]+)\]:\*\*\s*(.+?)(?=\n\*\*\[Speaker|$)'
+
+    def __init__(self):
+        """Initialize the speaker parser."""
+        self.logger = get_logger_conf(f"{__name__}.SpeakerSegmentParser")
+
+    def parse_speakers(self, markdown_text: str) -> List[Dict[str, str]]:
+        """
+        Parse all speaker segments from markdown text.
+
+        Args:
+            markdown_text: Markdown document with speaker labels
+
+        Returns:
+            List of dicts with keys:
+                - 'speaker': Speaker name (e.g., "Host", "Guest")
+                - 'text': Text content for this segment
+                - 'index': Sequential index in document
+
+        Example:
+            parser = SpeakerSegmentParser()
+            segments = parser.parse_speakers(markdown_text)
+            for seg in segments:
+                print(f"{seg['speaker']}: {seg['text']}")
+        """
+        matches = re.findall(
+            self.SPEAKER_PATTERN,
+            markdown_text,
+            re.DOTALL
+        )
+
+        segments = []
+        for idx, (speaker, text) in enumerate(matches):
+            segments.append({
+                'speaker': speaker.strip(),
+                'text': text.strip(),
+                'index': idx
+            })
+
+        self.logger.debug(f"Parsed {len(segments)} speaker segments")
+        return segments
+
+    def get_unique_speakers(self, markdown_text: str) -> List[str]:
+        """
+        Get list of unique speakers in the document.
+
+        Args:
+            markdown_text: Markdown document with speaker labels
+
+        Returns:
+            List of unique speaker names in order of first appearance
+
+        Example:
+            speakers = parser.get_unique_speakers(markdown_text)
+            # Returns: ["Host", "Guest", "Narrator"]
+        """
+        segments = self.parse_speakers(markdown_text)
+
+        # Preserve order of first appearance
+        seen = set()
+        unique_speakers = []
+        for seg in segments:
+            speaker = seg['speaker']
+            if speaker not in seen:
+                seen.add(speaker)
+                unique_speakers.append(speaker)
+
+        self.logger.info(f"Found {len(unique_speakers)} unique speakers: {unique_speakers}")
+        return unique_speakers
+
+    def count_speaker_segments(self, markdown_text: str) -> Dict[str, int]:
+        """
+        Count number of segments per speaker.
+
+        Args:
+            markdown_text: Markdown document with speaker labels
+
+        Returns:
+            Dict mapping speaker name to segment count
+
+        Example:
+            counts = parser.count_speaker_segments(markdown_text)
+            # Returns: {"Host": 15, "Guest": 12, "Narrator": 3}
+        """
+        segments = self.parse_speakers(markdown_text)
+
+        counts = {}
+        for seg in segments:
+            speaker = seg['speaker']
+            counts[speaker] = counts.get(speaker, 0) + 1
+
+        return counts
+
+    def has_multiple_speakers(self, markdown_text: str) -> bool:
+        """
+        Check if document has multiple speakers.
+
+        Args:
+            markdown_text: Markdown document
+
+        Returns:
+            bool: True if 2+ unique speakers found
+        """
+        unique_speakers = self.get_unique_speakers(markdown_text)
+        return len(unique_speakers) >= 2
+
+    def get_speaker_turns(self, markdown_text: str) -> List[tuple[str, str]]:
+        """
+        Get sequential speaker turns as (speaker, text) tuples.
+
+        Simpler interface than parse_speakers() for basic iteration.
+
+        Args:
+            markdown_text: Markdown document
+
+        Returns:
+            List of (speaker_name, text_content) tuples
+
+        Example:
+            for speaker, text in parser.get_speaker_turns(markdown_text):
+                print(f"{speaker}: {text[:50]}...")
+        """
+        segments = self.parse_speakers(markdown_text)
+        return [(seg['speaker'], seg['text']) for seg in segments]
+
+    def replace_speaker_name(
+        self,
+        markdown_text: str,
+        old_name: str,
+        new_name: str
+    ) -> str:
+        """
+        Replace all occurrences of a speaker name.
+
+        Useful for renaming speakers in the document.
+
+        Args:
+            markdown_text: Original markdown
+            old_name: Speaker name to replace
+            new_name: New speaker name
+
+        Returns:
+            str: Modified markdown with renamed speaker
+
+        Example:
+            text = parser.replace_speaker_name(text, "Guest", "Expert")
+        """
+        pattern = rf'\*\*\[Speaker\s+{re.escape(old_name)}\]:\*\*'
+        replacement = f'**[Speaker {new_name}]:**'
+        return re.sub(pattern, replacement, markdown_text)
+
+    def strip_speaker_labels(self, markdown_text: str) -> str:
+        """
+        Remove all speaker labels, leaving only text content.
+
+        Args:
+            markdown_text: Markdown with speaker labels
+
+        Returns:
+            str: Plain text with labels removed
+
+        Example:
+            plain_text = parser.strip_speaker_labels(markdown_text)
+        """
+        # Remove speaker labels but keep text
+        pattern = r'\*\*\[Speaker\s+[^\]]+\]:\*\*\s*'
+        return re.sub(pattern, '', markdown_text)

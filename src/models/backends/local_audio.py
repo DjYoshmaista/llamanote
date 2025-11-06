@@ -26,6 +26,8 @@ from ...utils.memory_manager import (
 )
 from ...models.hub import ModelHub
 from ...processing.audio_processor import AudioPostProcessor # Import post-processor
+from ...processing.text_preprocessor import SpeakerSegmentParser # Import speaker parser
+from ...models.speaker_embeddings import SpeakerEmbeddingManager, EmbeddingConfig # Import speaker manager
 from ...config.manager import ConfigManager # Import ConfigManager
 from ...config.settings import DEFAULT_CACHE_DIR
 
@@ -143,9 +145,47 @@ class LocalAudioBackend(AudioBackend):
         self.embeddings_dataset = None
         self.post_processor = AudioPostProcessor() # Use the separated class
 
+        # Multi-speaker support (Phase 2)
+        self.speaker_parser = SpeakerSegmentParser()
+        self.speaker_manager: Optional[SpeakerEmbeddingManager] = None
+        self._init_speaker_manager()
+
     @property
     def provider_identifier(self) -> str:
         return "local_audio"
+
+    def _init_speaker_manager(self):
+        """Initialize the speaker embedding manager based on config."""
+        if not self.config.enable_multi_speaker:
+            self.logger.debug("Multi-speaker support disabled")
+            return
+
+        try:
+            # Create embedding config from AudioConfig
+            embedding_config = EmbeddingConfig(
+                embedding_dim=512,  # SpeechT5 standard
+                normalize=True,
+                seed=self.config.speaker_embedding_seed,
+                distribution=self.config.speaker_random_distribution,
+                dataset_name=self.config.speaker_dataset_name,
+                gender_filter=self.config.default_speaker_gender if self.config.default_speaker_gender != "neutral" else None
+            )
+
+            # Create speaker manager
+            cache_dir = self.config.speaker_embedding_cache_dir or (self.model_cache_dir / "speakers")
+            self.speaker_manager = SpeakerEmbeddingManager(
+                method=self.config.speaker_embedding_method,
+                config=embedding_config,
+                cache_dir=cache_dir,
+                enable_cache=True,
+                enable_persistence=True
+            )
+
+            self.logger.info(f"Speaker embedding manager initialized: method={self.config.speaker_embedding_method}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize speaker manager: {e}", exc_info=True)
+            self.speaker_manager = None
 
     @log_execution_time(logger_name=__name__)
     def load(self, **kwargs) -> bool:
@@ -596,6 +636,17 @@ class LocalAudioBackend(AudioBackend):
         start_time = time.time()
 
         try:
+            # Check for multi-speaker content
+            if self.config.enable_multi_speaker and self.speaker_manager:
+                has_speakers = self.speaker_parser.has_multiple_speakers(text)
+                if has_speakers:
+                    self.logger.info("Multi-speaker content detected, using speaker-specific voices")
+                    return self._generate_multispeaker_audio(
+                        text, output_path, checkpoint_callback, checkpoint_interval,
+                        resume_from_chunk, dual_tracker, **kwargs
+                    )
+
+            # Single speaker or multi-speaker disabled - use standard generation
             # Split text into chunks if needed
             audio_arrays = []
             text_chunks = []
@@ -716,6 +767,223 @@ class LocalAudioBackend(AudioBackend):
             self.logger.error(f"Failed to generate local audio: {e}", exc_info=True)
             # Ensure model handle is cleared if it's a critical error?
             return None # Propagate failure
+
+    def _generate_multispeaker_audio(
+        self,
+        text: str,
+        output_path: Path,
+        checkpoint_callback: Optional[Any] = None,
+        checkpoint_interval: int = 5,
+        resume_from_chunk: Optional[int] = None,
+        dual_tracker: Optional[DualProgressTracker] = None,
+        **kwargs
+    ) -> Optional[AudioResult]:
+        """
+        Generate audio with multiple speakers using distinct voices.
+
+        Parses speaker segments from text and generates audio for each segment
+        with the appropriate speaker embedding.
+        """
+        start_time = time.time()
+
+        try:
+            # Parse speaker segments
+            segments = self.speaker_parser.parse_speakers(text)
+            if not segments:
+                self.logger.warning("No speaker segments found, falling back to single-speaker mode")
+                return self._generate_single_speaker_fallback(text, output_path, **kwargs)
+
+            unique_speakers = self.speaker_parser.get_unique_speakers(text)
+            self.logger.info(f"Found {len(segments)} segments from {len(unique_speakers)} speakers: {unique_speakers}")
+
+            # Get embeddings for all speakers
+            speaker_embeddings = {}
+            for speaker in unique_speakers:
+                embedding = self.speaker_manager.get_embedding(speaker, device=str(self.device))
+                speaker_embeddings[speaker] = embedding
+                self.logger.debug(f"Generated embedding for speaker '{speaker}'")
+
+            # Generate audio for each segment
+            audio_arrays = []
+            start_index = resume_from_chunk if resume_from_chunk is not None else 0
+
+            if dual_tracker:
+                dual_tracker.set_stage_progress(start_index, len(segments), "Generating multi-speaker audio")
+
+            with LoggingProgress(self.logger, "Generating speaker segments", len(segments), dual_tracker=dual_tracker) as progress:
+                # Update progress for skipped chunks
+                for _ in range(start_index):
+                    progress.update(1)
+
+                for i in range(start_index, len(segments)):
+                    segment = segments[i]
+                    speaker_name = segment['speaker']
+                    segment_text = segment['text']
+
+                    # Get speaker embedding
+                    speaker_emb = speaker_embeddings.get(speaker_name)
+                    if speaker_emb is None:
+                        self.logger.warning(f"No embedding for speaker '{speaker_name}', using default")
+                        speaker_emb = self.speaker_embeddings
+
+                    # Temporarily swap speaker embedding
+                    original_embedding = self.speaker_embeddings
+                    self.speaker_embeddings = speaker_emb.unsqueeze(0) if len(speaker_emb.shape) == 1 else speaker_emb
+
+                    # Generate audio for this segment
+                    audio_chunk = self._generate_single_chunk(segment_text)
+
+                    # Restore original embedding
+                    self.speaker_embeddings = original_embedding
+
+                    if audio_chunk is not None and audio_chunk.size > 0:
+                        audio_arrays.append(audio_chunk)
+                    else:
+                        self.logger.warning(f"Failed to generate audio for segment {i} (speaker: {speaker_name})")
+
+                    progress.update(1)
+
+                    # Checkpoint saving
+                    if checkpoint_callback and checkpoint_interval > 0:
+                        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(segments):
+                            self.logger.debug(f"Saving checkpoint at segment {i + 1}/{len(segments)}")
+
+                            # Save intermediate audio
+                            if output_path and audio_arrays:
+                                try:
+                                    valid_arrays = [arr for arr in audio_arrays if arr.size > 0]
+                                    if valid_arrays:
+                                        combined_so_far = self._combine_audio(valid_arrays, self.config.sample_rate)
+                                        if combined_so_far is not None and combined_so_far.size > 0:
+                                            processed = self.post_processor._post_process_audio(
+                                                combined_so_far,
+                                                self.config.sample_rate,
+                                                self.config.speed,
+                                                self.config.pitch_shift,
+                                                self.config.volume_normalize
+                                            )
+                                            intermediate_path = output_path.parent / f"{output_path.stem}_checkpoint_seg{i+1:04d}{output_path.suffix}"
+                                            saved = self.post_processor._save_audio(
+                                                intermediate_path,
+                                                processed,
+                                                self.config.sample_rate,
+                                                self.config.output_format
+                                            )
+                                            if saved:
+                                                checkpoint_callback(
+                                                    stage="audio",
+                                                    chunk_index=i + 1,
+                                                    total_chunks=len(segments),
+                                                    intermediate_audio_path=str(intermediate_path)
+                                                )
+                                except Exception as checkpoint_err:
+                                    self.logger.warning(f"Failed to save checkpoint: {checkpoint_err}")
+
+            # Combine all audio segments
+            if not audio_arrays:
+                self.logger.error("No audio segments were generated")
+                return None
+
+            valid_arrays = [arr for arr in audio_arrays if arr.size > 0]
+            if not valid_arrays:
+                self.logger.error("All audio segments are empty")
+                return None
+
+            combined_audio = self._combine_audio(valid_arrays, self.config.sample_rate)
+            if combined_audio is None or combined_audio.size == 0:
+                self.logger.error("Failed to combine audio segments")
+                return None
+
+            # Post-process and save
+            processed_audio = self.post_processor._post_process_audio(
+                combined_audio,
+                self.config.sample_rate,
+                self.config.speed,
+                self.config.pitch_shift,
+                self.config.volume_normalize
+            )
+
+            saved_path = self.post_processor._save_audio(
+                output_path,
+                processed_audio,
+                self.config.sample_rate,
+                self.config.output_format
+            )
+
+            if not saved_path:
+                return None
+
+            # Create result
+            duration = len(processed_audio) / self.config.sample_rate
+            processing_time = time.time() - start_time
+
+            result = AudioResult(
+                audio_path=saved_path,
+                duration_seconds=duration,
+                sample_rate=self.config.sample_rate,
+                num_samples=len(processed_audio),
+                model_used=f"{self.model_identifier} (multi-speaker: {len(unique_speakers)} voices)",
+                processing_time=processing_time,
+                chunks_processed=len(segments)
+            )
+
+            self.logger.info(
+                f"Multi-speaker audio generated: {result.duration_formatted} duration, "
+                f"{len(unique_speakers)} speakers, {len(segments)} segments"
+            )
+
+            # Save speaker mappings
+            if self.speaker_manager:
+                self.speaker_manager.save_mappings()
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Failed to generate multi-speaker audio: {e}", exc_info=True)
+            return None
+
+    def _generate_single_speaker_fallback(
+        self,
+        text: str,
+        output_path: Path,
+        **kwargs
+    ) -> Optional[AudioResult]:
+        """Fallback to single-speaker generation if multi-speaker parsing fails."""
+        self.logger.info("Using single-speaker fallback")
+        # Just call the regular generation logic
+        text_chunks = self._split_text(text) if len(text) > self.config.chunk_size else [text]
+
+        audio_arrays = []
+        for chunk in text_chunks:
+            audio_chunk = self._generate_single_chunk(chunk)
+            if audio_chunk is not None and audio_chunk.size > 0:
+                audio_arrays.append(audio_chunk)
+
+        if not audio_arrays:
+            return None
+
+        combined = self._combine_audio(audio_arrays, self.config.sample_rate)
+        processed = self.post_processor._post_process_audio(
+            combined, self.config.sample_rate,
+            self.config.speed, self.config.pitch_shift, self.config.volume_normalize
+        )
+
+        saved_path = self.post_processor._save_audio(
+            output_path, processed, self.config.sample_rate, self.config.output_format
+        )
+
+        if saved_path:
+            duration = len(processed) / self.config.sample_rate
+            return AudioResult(
+                audio_path=saved_path,
+                duration_seconds=duration,
+                sample_rate=self.config.sample_rate,
+                num_samples=len(processed),
+                model_used=self.model_identifier,
+                processing_time=0,
+                chunks_processed=len(audio_arrays)
+            )
+        return None
 
     def _generate_single_chunk(self, text: str) -> Optional[np.ndarray]:
         """Generate audio for a single text chunk using the appropriate method."""

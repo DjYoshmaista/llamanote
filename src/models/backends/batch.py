@@ -36,6 +36,7 @@ class BatchProcessor:
         checkpoint_callback: Optional[Callable[[int, List[GenerationResult], Dict[str, Any]], None]] = None,
         checkpoint_interval: int = 10,
         resume_from_chunk: Optional[int] = None,
+        resume_results: Optional[List[GenerationResult]] = None,
         dual_tracker: Optional[DualProgressTracker] = None,
         **kwargs
     ) -> List[GenerationResult]:
@@ -51,6 +52,7 @@ class BatchProcessor:
                                  Called with (chunk_index, results_so_far, extra_data)
             checkpoint_interval: Save checkpoint every N chunks
             resume_from_chunk: If provided, resume from this chunk index (skip earlier chunks)
+            resume_results: Optional pre-computed results for chunks before resume_from_chunk
             dual_tracker: Optional dual progress tracker for displaying progress
             **kwargs: Additional arguments to pass to the backend.
 
@@ -75,20 +77,26 @@ class BatchProcessor:
             dual_tracker.set_stage_progress(start_index, len(texts), "Processing chunks")
 
         with LoggingProgress(self.logger, "Processing chunks", len(texts), dual_tracker=dual_tracker) as progress:
-            # If resuming, we need placeholder results for skipped chunks
+            # If resuming, use actual results from checkpoint or create placeholders
             if start_index > 0:
-                # Create placeholder results (these should be loaded from checkpoint)
-                for i in range(start_index):
-                    results.append(GenerationResult(
-                        raw_output="[Skipped - loaded from checkpoint]",
-                        filtered_output="[Skipped - loaded from checkpoint]",
-                        input_tokens=0,
-                        output_tokens=0,
-                        generation_time=0.0,
-                        memory_used=0,
-                        device_map={},
-                        error_message=None
-                    ))
+                if resume_results and len(resume_results) >= start_index:
+                    # Use actual results from checkpoint
+                    results.extend(resume_results[:start_index])
+                    self.logger.info(f"Loaded {start_index} results from checkpoint")
+                else:
+                    # Create placeholder results (fallback if no resume_results provided)
+                    self.logger.warning(f"No resume results provided, creating placeholders for {start_index} chunks")
+                    for i in range(start_index):
+                        results.append(GenerationResult(
+                            raw_output="[Skipped - loaded from checkpoint]",
+                            filtered_output="[Skipped - loaded from checkpoint]",
+                            input_tokens=0,
+                            output_tokens=0,
+                            generation_time=0.0,
+                            memory_used=0,
+                            device_map={},
+                            error_message=None
+                        ))
                 # Update progress to reflect skipped chunks
                 for _ in range(start_index):
                     progress.update(1)

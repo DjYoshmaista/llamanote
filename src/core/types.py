@@ -252,6 +252,18 @@ class AudioConfig:
     enable_disk_offload: bool = False # Enable disk offloading (slower but saves RAM)
     clear_cache_between_chunks: bool = True # Clear CUDA cache between audio chunks
 
+    # Multi-speaker embedding settings (Phase 1)
+    enable_multi_speaker: bool = True # Enable distinct voices for multiple speakers
+    speaker_embedding_method: str = "auto" # "auto", "random", "dataset", "audio"
+    speaker_voice_map: Dict[str, Any] = field(default_factory=dict) # Speaker name -> embedding config/index
+    speaker_embedding_cache_dir: Optional[Path] = None # Cache directory for embeddings
+    default_speaker_gender: str = "neutral" # "male", "female", "neutral" for gender filtering
+    speaker_embedding_seed: Optional[int] = None # Seed for deterministic speaker generation
+    # Dataset-specific settings
+    speaker_dataset_name: str = "Matthijs/cmu-arctic-xvectors" # Dataset for sampling embeddings
+    # Random generation settings
+    speaker_random_distribution: str = "gaussian" # "gaussian" or "uniform" for random generation
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         # Need to handle potential non-serializable types if any added later

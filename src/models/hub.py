@@ -421,18 +421,80 @@ class ModelHub:
         return False
 
 
-# --- Interactive Model Browser (Placeholder) ---
+# --- Interactive Model Browser ---
 
 class InteractiveModelBrowser:
-    """Placeholder for interactive model browsing functionality."""
+    """Interactive CLI for browsing and selecting models from the Hugging Face Hub."""
 
     def __init__(self, model_hub: ModelHub):
         """Initialize browser with a ModelHub instance."""
         self.model_hub = model_hub
         self.logger = get_logger_conf(f"{__name__}.Browser")
 
-    def browse(self):
-        """Launch interactive model browsing."""
-        self.logger.warning("InteractiveModelBrowser.browse() is not yet implemented.")
-        ConsoleOutput.warning("Interactive model browsing is not yet implemented.")
-        return None
+    def browse(self,
+               task: Optional[str] = "text-generation",
+               library: Optional[str] = "transformers",
+               sort: str = "downloads",
+               limit: int = 20) -> Optional[ModelHubInfo]:
+        """
+        Launch an interactive session to browse, search, and select a model.
+
+        Args:
+            task: The task to filter by (e.g., 'text-generation').
+            library: The library to filter by (e.g., 'transformers').
+            sort: The metric to sort by (e.g., 'downloads', 'likes').
+            limit: The number of results to display per page.
+
+        Returns:
+            The selected ModelHubInfo object, or None if cancelled.
+        """
+        while True:
+            ConsoleOutput.section("Search Hugging Face Hub")
+            search_term = input("Enter search term (or leave blank for top models): ").strip()
+
+            ConsoleOutput.info(f"Searching for '{search_term}' (task: {task}, library: {library})...")
+            
+            try:
+                results = self.model_hub.search_models(
+                    search_term=search_term,
+                    task=task,
+                    library=library,
+                    sort=sort,
+                    limit=limit
+                )
+            except Exception as e:
+                self.logger.error(f"Error during model search: {e}", exc_info=True)
+                ConsoleOutput.error(f"An error occurred while searching: {e}")
+                results = []
+
+            if not results:
+                ConsoleOutput.warning("No models found matching your criteria.")
+                try_again = input("Try another search? (y/n): ").strip().lower()
+                if try_again != 'y':
+                    return None
+                continue
+
+            print("\n--- Search Results ---")
+            model_map = {}
+            for i, model in enumerate(results, 1):
+                size_str = f" ({model.format_size()})" if model.model_size_mb else ""
+                print(f"  {i:2d}. {model.author}/{model.model_name}{size_str}")
+                print(f"      ID: {model.model_id}")
+                print(f"      Downloads: {model.downloads:,} | Likes: {model.likes:,}")
+                model_map[str(i)] = model
+            
+            print("\n  b. Back/New Search")
+            print("-" * 60)
+            
+            choice = input(f"Select a model (1-{len(results)}) or 'b' to go back: ").strip().lower()
+
+            if choice == 'b':
+                return None
+            
+            if choice in model_map:
+                selected_model = model_map[choice]
+                ConsoleOutput.success(f"You selected: {selected_model.display_name}")
+                return selected_model
+            else:
+                ConsoleOutput.warning("Invalid selection.")
+                time.sleep(1)

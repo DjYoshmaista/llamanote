@@ -119,7 +119,15 @@ class LocalModelLoader:
             gpu_memory_gb = 4.0  # Default
             if self.split_config.max_gpu_memory:
                 gpu_mem_str = list(self.split_config.max_gpu_memory.values())[0]
-                gpu_memory_gb = float(gpu_mem_str.replace("GB", ""))
+                # Handle both "GB" and "GiB" suffixes (case-insensitive)
+                gpu_mem_str_upper = gpu_mem_str.upper()
+                if "GIB" in gpu_mem_str_upper:
+                    gpu_memory_gb = float(gpu_mem_str_upper.replace("GIB", "").strip())
+                elif "GB" in gpu_mem_str_upper:
+                    gpu_memory_gb = float(gpu_mem_str_upper.replace("GB", "").strip())
+                else:
+                    # Try to parse as plain number
+                    gpu_memory_gb = float(gpu_mem_str.strip())
 
             # Try to load saved split configuration
             saved_splits = split_mgr.load_config(
@@ -224,159 +232,143 @@ class LocalModelLoader:
         if not TORCH_AVAILABLE:
             raise ModelLoadError("PyTorch/Transformers not installed.", self.model_id)
 
-        load_config = self.build_load_config()
+        # This is a workaround for a bug in some versions of `transformers` that
+        # causes a crash when loading tokenizers for models without chat template files.
+        # We temporarily disable the function that looks for remote template files.
+        original_list_repo_templates = None
+        try:
+            from transformers.utils import hub
+            if hasattr(hub, 'list_repo_templates'):
+                original_list_repo_templates = hub.list_repo_templates
+                hub.list_repo_templates = lambda *args, **kwargs: []
+                logger.info("Temporarily patched `transformers.utils.hub.list_repo_templates` to avoid chat template errors.")
+        except (ImportError, AttributeError) as e:
+            logger.warning(f"Could not patch `list_repo_templates`: {e}. Proceeding without patch.")
 
-        # --- Display Memory Projection (if enabled) ---
-        if self.split_config.show_memory_projection:
-            from ...utils.memory_estimator import display_memory_projection
-            logger.info(f"Displaying memory projection for {self.model_id}")
+        try:
+            load_config = self.build_load_config()
+
+            # --- Display Memory Projection (if enabled) ---
+            if self.split_config.show_memory_projection:
+                from ...utils.memory_estimator import display_memory_projection
+                logger.info(f"Displaying memory projection for {self.model_id}")
+                try:
+                    projection = display_memory_projection(
+                        model_id=self.model_id,
+                        quantization=self.quant_config.method,
+                        max_seq_length=4096,  # TODO: Get from hyperparameters
+                        cache_dir=self.model_cache_dir,
+                        trust_remote_code=self.trust_remote_code
+                    )
+                    logger.info(f"Memory projection: Model={projection.model_size_mb:.0f}MB, "
+                               f"KV-Cache={projection.kv_cache_size_mb:.0f}MB, "
+                               f"Total={projection.total_size_mb:.0f}MB")
+                except Exception as e:
+                    logger.warning(f"Could not display memory projection: {e}")
+
+            # --- Load Tokenizer ---
             try:
-                projection = display_memory_projection(
-                    model_id=self.model_id,
-                    quantization=self.quant_config.method,
-                    max_seq_length=4096,  # TODO: Get from hyperparameters
-                    cache_dir=self.model_cache_dir,
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_id,
+                    cache_dir=str(self.model_cache_dir),
+                    use_fast=True,
                     trust_remote_code=self.trust_remote_code
                 )
-                # Log projection details
-                logger.info(f"Memory projection: Model={projection.model_size_mb:.0f}MB, "
-                           f"KV-Cache={projection.kv_cache_size_mb:.0f}MB, "
-                           f"Total={projection.total_size_mb:.0f}MB")
             except Exception as e:
-                logger.warning(f"Could not display memory projection: {e}")
+                logger.error(f"Failed to load tokenizer for {self.model_id}: {e}", exc_info=True)
+                raise ModelLoadError(f"Failed to load tokenizer: {e}", self.model_id) from e
 
-        # --- Load Tokenizer ---
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.model_id,
-                cache_dir=str(self.model_cache_dir),
-                use_fast=True,
-                trust_remote_code=self.trust_remote_code
-            )
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer for {self.model_id}: {e}", exc_info=True)
-            raise ModelLoadError(f"Failed to load tokenizer: {e}", self.model_id) from e
+            # --- Load Model with OOM Handling ---
+            if self.device_manager.is_cuda_available():
+                log_memory_summary("before model loading", logger)
 
-        # --- Load Model with OOM Handling ---
-        # Log memory before loading
-        if self.device_manager.is_cuda_available():
-            log_memory_summary("before model loading", logger)
+            def load_model_fn(**strategy_params):
+                config = load_config.copy()
+                if 'max_memory' in strategy_params:
+                    config['max_memory'] = strategy_params['max_memory']
+                if 'device_map' in strategy_params:
+                    config['device_map'] = strategy_params['device_map']
+                if 'low_cpu_mem_usage' in strategy_params:
+                    config['low_cpu_mem_usage'] = strategy_params['low_cpu_mem_usage']
+                if 'offload_state_dict' in strategy_params:
+                    config['offload_state_dict'] = strategy_params['offload_state_dict']
+                logger.info(f"Loading model with config: device_map={config.get('device_map')}, "
+                           f"max_memory={config.get('max_memory')}")
+                model = AutoModelForCausalLM.from_pretrained(self.model_id, **config)
+                return model
 
-        # Define model loading function for OOM handler
-        def load_model_fn(**strategy_params):
-            """Model loading function that can be retried with different parameters."""
-            # Merge strategy params with base config
-            config = load_config.copy()
-
-            # Override with strategy params if provided
-            if 'max_memory' in strategy_params:
-                config['max_memory'] = strategy_params['max_memory']
-            if 'device_map' in strategy_params:
-                config['device_map'] = strategy_params['device_map']
-            if 'low_cpu_mem_usage' in strategy_params:
-                config['low_cpu_mem_usage'] = strategy_params['low_cpu_mem_usage']
-            if 'offload_state_dict' in strategy_params:
-                config['offload_state_dict'] = strategy_params['offload_state_dict']
-
-            logger.info(f"Loading model with config: device_map={config.get('device_map')}, "
-                       f"max_memory={config.get('max_memory')}")
-
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                **config
-            )
-            return model
-
-        try:
-            # Use OOM handler if enabled and on CUDA
-            if self.split_config.auto_oom_handling and self.device_manager.is_cuda_available():
-                logger.info("🛡️  Automatic OOM handling enabled for LLM")
-
-                # Get model layer count for iterative splitting
-                model_num_layers = self._get_model_num_layers()
-
-                # Create OOM recovery strategy
-                initial_gpu_mem = list(self.split_config.max_gpu_memory.values())[0] if self.split_config.max_gpu_memory else "4GB"
-                recovery_strategy = OOMRecoveryStrategy(
-                    initial_gpu_memory=initial_gpu_mem,
-                    initial_cpu_memory=self.split_config.max_cpu_memory,
-                    min_gpu_memory="1GB",
-                    model_num_layers=model_num_layers,
-                    use_iterative_layer_split=True,  # Enable iterative layer splitting
-                    offload_folder=self.split_config.offload_folder,  # Pass offload folder
-                    model_id=self.model_id,  # Pass model ID for explicit device maps
-                    use_explicit_device_map=True,  # Use explicit device maps for deterministic placement
-                    logger=logger
-                )
-
-                # Load with OOM handling
-                try:
-                    model, final_params = with_oom_handling(
-                        load_fn=load_model_fn,
-                        recovery_strategy=recovery_strategy,
+            try:
+                if self.split_config.auto_oom_handling and self.device_manager.is_cuda_available():
+                    logger.info("🛡️  Automatic OOM handling enabled for LLM")
+                    model_num_layers = self._get_model_num_layers()
+                    initial_gpu_mem = list(self.split_config.max_gpu_memory.values())[0] if self.split_config.max_gpu_memory else "4GB"
+                    recovery_strategy = OOMRecoveryStrategy(
+                        initial_gpu_memory=initial_gpu_mem,
+                        initial_cpu_memory=self.split_config.max_cpu_memory,
+                        min_gpu_memory="1GB",
+                        model_num_layers=model_num_layers,
+                        use_iterative_layer_split=True,
+                        offload_folder=self.split_config.offload_folder,
+                        model_id=self.model_id,
+                        use_explicit_device_map=True,
                         logger=logger
                     )
-                    if final_params:
-                        logger.info(f"✓ Model loaded with adjusted parameters: {final_params}")
-                except Exception as e:
-                    if CUDAMemoryManager.is_oom_error(e):
-                        logger.error("Failed to load model: CUDA Out of Memory after all recovery attempts")
-                        logger.error("Consider: 1) Using smaller model, 2) Enabling disk offloading, 3) Using GGUF format")
-                    raise
-            else:
-                # Load without OOM handling
-                logger.info(f"Attempting to load model '{self.model_id}'...")
-                model = load_model_fn()
-
-            logger.info(f"✓ Successfully loaded model: {self.model_id}")
-
-            # Log memory after loading
-            if self.device_manager.is_cuda_available():
-                log_memory_summary("after model loading", logger)
-
-            return model, tokenizer
-
-        except Exception as e:
-            logger.error(f"Failed to load model {self.model_id}: {e}", exc_info=True)
-
-            # --- Fallback Logic ---
-            is_oom = CUDAMemoryManager.is_oom_error(e)
-
-            if is_oom:
-                # OOM error - skip GPU fallback attempts, go directly to CPU
-                logger.warning("OOM detected - skipping GPU fallback attempts, trying CPU-only load.")
-                if load_config.get("device_map") != {"": "cpu"}:
-                     cpu_config = {
-                        "cache_dir": str(self.model_cache_dir),
-                        "trust_remote_code": self.trust_remote_code,
-                        "dtype": torch.float32,
-                        "device_map": {"": "cpu"},
-                     }
-                     try:
-                          model = AutoModelForCausalLM.from_pretrained(self.model_id, **cpu_config)
-                          logger.info("Successfully loaded model with CPU-only fallback.")
-                          return model, tokenizer
-                     except Exception as e3:
-                          logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
-            else:
-                # Non-OOM error - try simpler GPU config first, then CPU
-                if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
-                    logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
-                    fallback_config = {
-                        "cache_dir": str(self.model_cache_dir),
-                        "trust_remote_code": self.trust_remote_code,
-                        "dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
-                        "device_map": "auto",
-                        "low_cpu_mem_usage": self.device_manager.is_cuda_available(),
-                    }
                     try:
-                        model = AutoModelForCausalLM.from_pretrained(self.model_id, **fallback_config)
-                        logger.info("Successfully loaded model with standard 'auto' fallback.")
-                        return model, tokenizer
-                    except Exception as e2:
-                        logger.error(f"Standard 'auto' fallback failed: {e2}", exc_info=True)
+                        model, final_params = with_oom_handling(
+                            load_fn=load_model_fn,
+                            recovery_strategy=recovery_strategy,
+                            logger=logger
+                        )
+                        if final_params:
+                            logger.info(f"✓ Model loaded with adjusted parameters: {final_params}")
+                    except Exception as e:
+                        if CUDAMemoryManager.is_oom_error(e):
+                            logger.error("Failed to load model: CUDA Out of Memory after all recovery attempts")
+                            logger.error("Consider: 1) Using smaller model, 2) Enabling disk offloading, 3) Using GGUF format")
+                        raise
+                else:
+                    logger.info(f"Attempting to load model '{self.model_id}'...")
+                    model = load_model_fn()
 
-                # If that also failed (or wasn't applicable), try CPU
+                logger.info(f"✓ Successfully loaded model: {self.model_id}")
+                if self.device_manager.is_cuda_available():
+                    log_memory_summary("after model loading", logger)
+                return model, tokenizer
+
+            except Exception as e:
+                logger.error(f"Failed to load model {self.model_id}: {e}", exc_info=True)
+                is_oom = CUDAMemoryManager.is_oom_error(e)
+                if is_oom:
+                    logger.warning("OOM detected - skipping GPU fallback attempts, trying CPU-only load.")
+                    if load_config.get("device_map") != {"": "cpu"}:
+                         cpu_config = {
+                            "cache_dir": str(self.model_cache_dir),
+                            "trust_remote_code": self.trust_remote_code,
+                            "dtype": torch.float32,
+                            "device_map": {"": "cpu"},
+                         }
+                         try:
+                              model = AutoModelForCausalLM.from_pretrained(self.model_id, **cpu_config)
+                              logger.info("Successfully loaded model with CPU-only fallback.")
+                              return model, tokenizer
+                         except Exception as e3:
+                              logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
+                else:
+                    if load_config.get("device_map") != {"": "cpu"} and (load_config.get("quantization_config") or load_config.get("max_memory")):
+                        logger.warning("Falling back to standard 'auto' device map without quantization/limits.")
+                        fallback_config = {
+                            "cache_dir": str(self.model_cache_dir),
+                            "trust_remote_code": self.trust_remote_code,
+                            "dtype": torch.bfloat16 if self.device_manager.is_cuda_available() else torch.float32,
+                            "device_map": "auto",
+                            "low_cpu_mem_usage": self.device_manager.is_cuda_available(),
+                        }
+                        try:
+                            model = AutoModelForCausalLM.from_pretrained(self.model_id, **fallback_config)
+                            logger.info("Successfully loaded model with standard 'auto' fallback.")
+                            return model, tokenizer
+                        except Exception as e2:
+                            logger.error(f"Standard 'auto' fallback failed: {e2}", exc_info=True)
                 if load_config.get("device_map") != {"": "cpu"}:
                      logger.warning("Falling back to CPU-only load.")
                      cpu_config = {
@@ -391,9 +383,14 @@ class LocalModelLoader:
                           return model, tokenizer
                      except Exception as e3:
                           logger.error(f"CPU-only fallback failed: {e3}", exc_info=True)
+                raise ModelLoadError(f"All loading attempts failed. Last error: {e}", self.model_id) from e
 
-            # All attempts failed
-            raise ModelLoadError(f"All loading attempts failed. Last error: {e}", self.model_id) from e
+        finally:
+            # --- Restore monkey-patch ---
+            if original_list_repo_templates:
+                from transformers.utils import hub
+                hub.list_repo_templates = original_list_repo_templates
+                logger.info("Restored original `transformers.utils.hub.list_repo_templates`.")
 
 # --- Main Backend Class ---
 
@@ -427,35 +424,10 @@ class LocalHFBackend(LLMBackend):
         self.device = self.device_manager.get_device()
 
         # Initialize advanced cache system (NEW INTEGRATED SYSTEM)
-        self.advanced_cache: Optional[LlamaNoteDynamicCache] = None
         self.generation_wrapper: Optional[CachedGenerationWrapper] = None
 
         if self.split_config.use_advanced_cache:
-            # Map strategy string to enum
-            strategy_map = {
-                "aggressive": MemoryStrategy.AGGRESSIVE,
-                "balanced": MemoryStrategy.BALANCED,
-                "quality": MemoryStrategy.QUALITY
-            }
-            strategy = strategy_map.get(
-                self.split_config.cache_strategy.lower(),
-                MemoryStrategy.BALANCED
-            )
-
-            cache_config = CacheStrategyConfig(strategy=strategy)
-
-            # Create advanced cache
-            self.advanced_cache = LlamaNoteDynamicCache(
-                strategy_config=cache_config,
-                enable_hybrid_cache=True,
-                enable_sliding_window=True
-            )
-
-            self.logger.info(f"Advanced cache system enabled: strategy={strategy.value}")
-            self.logger.info(f"  Window size: {cache_config.get_window_size()} tokens")
-            self.logger.info(f"  Prefix preservation: {cache_config.get_prefix_size()} tokens")
-            self.logger.info(f"  Hot cache: {cache_config.get_hot_cache_size():.0f} MB")
-            self.logger.info(f"  Cold cache: {cache_config.get_cold_cache_size():.0f} MB")
+            self.logger.info(f"Advanced cache system enabled: strategy={self.split_config.cache_strategy}")
 
         # Legacy cache systems (kept for backward compatibility)
         self.hybrid_cache: Optional[HybridKVCache] = None
@@ -506,11 +478,12 @@ class LocalHFBackend(LLMBackend):
             self._log_model_info()
 
             # Initialize generation wrapper with advanced cache if enabled
-            if self.advanced_cache:
+            if self.split_config.use_advanced_cache:
                 self.generation_wrapper = CachedGenerationWrapper(
                     model=self.model_handle,
-                    cache=self.advanced_cache,
-                    enable_hooks=self.split_config.enable_generation_hooks
+                    strategy=self.split_config.cache_strategy,
+                    enable_hybrid_cache=True, # You can make this configurable
+                    enable_sliding_window=True # You can make this configurable
                 )
                 self.logger.info("Generation wrapper initialized with advanced cache")
 
@@ -637,8 +610,7 @@ class LocalHFBackend(LLMBackend):
             if self.generation_wrapper:
                 # Use advanced cache-integrated generation
                 outputs = self.generation_wrapper.generate(
-                    inputs=inputs['input_ids'],
-                    attention_mask=inputs.get('attention_mask'),
+                    **inputs,
                     generation_config=gen_config
                 )
             else:
@@ -742,17 +714,18 @@ class LocalHFBackend(LLMBackend):
         self.logger.info(f"Unloading local HF model: {self.model_specifier}")
 
         # Log advanced cache statistics if enabled (NEW SYSTEM)
-        if self.advanced_cache:
+        if hasattr(self, 'generation_wrapper') and self.generation_wrapper:
             self.log_advanced_cache_statistics()
-            self.advanced_cache.reset()
+            if hasattr(self.generation_wrapper, 'cache') and hasattr(self.generation_wrapper.cache, 'reset'):
+                self.generation_wrapper.cache.reset()
 
         # Log legacy cache statistics before unloading (BACKWARD COMPATIBILITY)
-        if self.hybrid_cache:
+        if hasattr(self, 'hybrid_cache') and self.hybrid_cache:
             self.log_cache_statistics()
             self.hybrid_cache.clear()
 
         # Log attention statistics and unpatch if enabled (LEGACY)
-        if self.attention_patcher:
+        if hasattr(self, 'attention_patcher') and self.attention_patcher:
             self.log_attention_statistics()
             self.attention_patcher.unpatch_model()
             self.attention_patcher.reset_statistics()
@@ -761,6 +734,7 @@ class LocalHFBackend(LLMBackend):
         self.model_handle = None
         self.tokenizer = None
         self.device_map = None
-        self.generation_wrapper = None
+        if hasattr(self, 'generation_wrapper'):
+            self.generation_wrapper = None
         self.is_loaded = False
         self.logger.info("Local HF model unloaded.")

@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@google/gemini-cli": "^0.12.0",
+    "ajv": "^8.17.1"
+  }
+}

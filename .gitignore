@@ -4,13 +4,12 @@ output/
 *output/
 output/*
 output/**
-cache/
+/cache/
 outputs/
 logs/
 offload/
 checkpoints/**
 logs/**
-cache/**
 outputs/**
 offload/**
 **.pyc
