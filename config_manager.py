@@ -34,6 +34,13 @@ class ConfigManager:
                 "model_name": "parler-tts/parler-tts-mini-v1",
                 "provider": "huggingface"
             },
+            "generation_settings": {
+                "temperature": 0.7,
+                "top_k": 50,
+                "top_p": 0.95,
+                "repetition_penalty": 1.2,
+                "no_repeat_ngram_size": 3
+            },
             "cloud_settings": {
                 "openai_api_key": "",
                 "anthropic_api_key": "",
@@ -174,11 +181,25 @@ class ConfigManager:
             else:
                 config[step]["model_type"] = "local"
                 self.configure_local_model(step, config)
-        
+
+        self.configure_generation_settings(config)
         # Configure cloud API keys
         self.configure_cloud_keys(config)
         
         return config
+
+    def configure_generation_settings(self, config: Dict[str, Any]):
+        """Configure generation settings"""
+        print("\n--- Generation Settings ---")
+        
+        try:
+            temp = float(input(f"Temperature (default: {config['generation_settings']['temperature']}): ").strip() or config['generation_settings']['temperature'])
+            config['generation_settings']['temperature'] = temp
+
+            top_k = int(input(f"Top K (default: {config['generation_settings']['top_k']}): ").strip() or config['generation_settings']['top_k'])
+            config['generation_settings']['top_k'] = top_k
+
+            top_p = float(input(f"Top P (default: {config['generation_se
 
     def configure_local_model(self, step: str, config: Dict[str, Any]):
         """Configure local model settings"""

@@ -108,10 +108,8 @@ class LayerSplitConfig:
     show_memory_projection: bool = True  # Show memory estimates before loading
     use_iterative_layer_split: bool = True  # Use layer-by-layer splitting in OOM recovery
 
-    # Integrated Cache System (replaces old hybrid/sliding implementations)
-    use_advanced_cache: bool = True  # Enable advanced cache with hot/cold + sliding window
-    cache_strategy: str = "balanced"  # "aggressive", "balanced", or "quality"
-    enable_generation_hooks: bool = True  # Enable hooks for future extensibility
+    # Advanced cache system removed - now using transformers' built-in DynamicCache
+    # (Custom cache implementation caused performance issues and has been replaced)
 
     # Legacy settings (deprecated but kept for compatibility)
     use_hybrid_kv_cache: bool = False  # Deprecated: use use_advanced_cache instead
@@ -320,6 +318,7 @@ class PipelineConfig:
 
     # LLM Generation settings
     hyperparameters: Any = field(default=None) # Will be lazily initialized
+    batch_size: int = 1  # Number of chunks to process in parallel (1=sequential, >1=batch inference)
     # Local Model Hardware settings
     quantization_config: Optional[QuantizationConfig] = None
     layer_split_config: Optional[LayerSplitConfig] = None

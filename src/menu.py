@@ -170,6 +170,7 @@ class AppState:
     gpu_layers: int = DEFAULT_GPU_LAYERS
     max_gpu_memory: str = "4GiB"
     max_cpu_memory: str = "24GiB"
+    batch_size: int = 1  # Number of chunks to process in parallel (1=sequential, >1=batch inference)
 
     # --- Advanced memory optimization settings ---
     layer_split_config: LayerSplitConfig = field(default_factory=LayerSplitConfig)
@@ -248,6 +249,7 @@ class AppState:
             self.gpu_layers = data.get("gpu_layers", DEFAULT_GPU_LAYERS)
             self.max_gpu_memory = data.get("max_gpu_memory", "10GB")
             self.max_cpu_memory = data.get("max_cpu_memory", "30GB")
+            self.batch_size = data.get("batch_size", 1)  # Default to 1 for backwards compatibility
 
             # Load layer_split_config
             layer_split_data = data.get("layer_split_config", {})
@@ -323,9 +325,10 @@ class AppState:
             add_emotions=(self.processing_mode == ProcessingMode.PODCAST),
 
             hyperparameters=self.hyperparameters,
+            batch_size=self.batch_size,
             quantization_config=quant_config,
             layer_split_config=layer_split_config,
-            
+
             generate_audio=self.run_audio_generation,
             audio_provider=self.audio_model_provider,
             audio_specifier=self.audio_model_specifier,
@@ -1096,18 +1099,19 @@ class MenuSystem:
             print(f"  - GPU Layers (GGUF): {self.state.gpu_layers}")
             print(f"  - Max GPU Mem (HF): {self.state.max_gpu_memory}")
             print(f"  - Max CPU Mem (HF): {self.state.max_cpu_memory}")
+            print(f"  - Batch Size: {self.state.batch_size} (1=sequential, >1=parallel)")
             print("-" * 60)
-            
+
             print("Select a profile (recommended):")
             profiles = list_memory_profiles()
             profile_map = {}
             for i, (name, desc) in enumerate(profiles, 1):
                  print(f"  {i}. {name}: {desc}")
                  profile_map[str(i)] = name
-            
+
             print("\nOr, customize individual settings (advanced):")
             is_gguf = (self.state.text_model_provider == 'local_gguf')
-            
+
             if is_gguf:
                 print("  G. GPU Layers (-1=all, 0=CPU)")
             else: # Transformers
@@ -1115,15 +1119,16 @@ class MenuSystem:
                 print("  M. Max GPU Memory (per device)")
                 print("  C. Max CPU Memory (offload)")
 
-            print("\n  b. Back to Model Settings")
+            print("  S. Batch Size (parallel inference)")
+            print("\n  0. Back to Model Settings")
             print("-" * 60)
-            
-            choice = input("Select profile, option, or 'b' to go back: ").strip().lower()
+
+            choice = input("Select profile, option, or '0' to go back: ").strip().lower()
 
             try:
-                if choice == 'b':
+                if choice == '0':
                     return MenuAction.BACK
-                
+
                 # Profile selection
                 if choice in profile_map:
                     profile_name = profile_map[choice]
@@ -1134,7 +1139,7 @@ class MenuSystem:
                 elif choice == 'g' and is_gguf:
                     val = input(f"Enter number of GPU layers (-1 for auto/all, 0 for CPU) [current: {self.state.gpu_layers}]: ").strip()
                     if val: self.state.gpu_layers = int(val)
-                
+
                 elif choice == 'q' and not is_gguf:
                     val = input(f"Enter quantization ({', '.join(QUANTIZATION_OPTIONS)}) [current: {self.state.quantization}]: ").strip().lower()
                     if val in QUANTIZATION_OPTIONS:
@@ -1157,7 +1162,19 @@ class MenuSystem:
                              self.state.max_cpu_memory = val
                          else:
                              ConsoleOutput.warning("Invalid format. Use numbers followed by GB, GiB, MB, or MiB.")
-                
+
+                elif choice == 's':  # Batch Size
+                    val = input(f"Enter Batch Size (1=sequential, 2-4 recommended for parallel) [current: {self.state.batch_size}]: ").strip()
+                    if val:
+                        batch_val = int(val)
+                        if 1 <= batch_val <= 8:
+                            self.state.batch_size = batch_val
+                            ConsoleOutput.success(f"Batch size set to {batch_val}")
+                            if batch_val > 1:
+                                ConsoleOutput.info("Parallel batch inference enabled - will process multiple chunks simultaneously")
+                        else:
+                            ConsoleOutput.warning("Batch size must be between 1 and 8")
+
                 else:
                     ConsoleOutput.warning("Invalid selection.")
 
@@ -1372,10 +1389,9 @@ class MenuSystem:
         if current_model_entry:
              # Check if current settings are just the default, if so, load model-specific defaults
              if self.state.hyperparameters == HyperparameterConfig():
-                  model_defaults = current_model_entry.get_hyperparameter_defaults()
-                  for key, value in model_defaults.items():
-                       if value is not None:
-                            setattr(self.state.hyperparameters, key, value)
+                  self.state.hyperparameters.temperature = current_model_entry.temperature
+                  self.state.hyperparameters.top_p = current_model_entry.top_p
+                  self.state.hyperparameters.max_new_tokens = current_model_entry.max_new_tokens
                   ConsoleOutput.info("Loaded model-specific default hyperparameters.")
         
         editor = InteractiveHyperparameterEditor(self.state.hyperparameters)

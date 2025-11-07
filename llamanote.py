@@ -25,6 +25,7 @@ class CloudModelClient:
     def __init__(self, config_manager: ConfigManager):
         self.config_manager = config_manager
         self.cloud_config = config_manager.current_config["cloud_settings"]
+        self.generation_config = config_manager.current_config.get("generation_settings", {})
     
     def generate_with_cloud(self, prompt: str, step: str, system_prompt: str = None) -> str:
         """Generate text using cloud provider"""
@@ -69,7 +70,9 @@ class CloudModelClient:
             "model": model,
             "messages": messages,
             "max_tokens": 512,
-            "temperature": 0.7
+            "temperature": self.generation_config.get('temperature', 0.7),
+            "top_p": self.generation_config.get('top_p', 0.95),
+            "repetition_penalty": self.generation_config.get('repetition_penalty', 1.2),
         }
         
         response = requests.post(
@@ -99,7 +102,9 @@ class CloudModelClient:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 512,
-            "temperature": 0.7
+            "temperature": self.generation_config.get('temperature', 0.7),
+            "top_k": self.generation_config.get('top_k', 50),
+            "top_p": self.generation_config.get('top_p', 0.95),
         }
         
         if system_prompt:
@@ -130,7 +135,12 @@ class CloudModelClient:
             full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
             
             model_obj = genai.GenerativeModel(model)
-            response = model_obj.generate_content(full_prompt)
+            generation_config = genai.types.GenerationConfig(
+                temperature=self.generation_config.get('temperature', 0.7),
+                top_p=self.generation_config.get('top_p', 0.95),
+                top_k=self.generation_config.get('top_k', 50),
+            )
+            response = model_obj.generate_content(full_prompt, generation_config=generation_config)
             return response.text
         except ImportError:
             raise Exception("Google Generative AI package not installed. Run: pip install google-generativeai")
@@ -155,7 +165,8 @@ class CloudModelClient:
             "model": model,
             "messages": messages,
             "max_tokens": 512,
-            "temperature": 0.7
+            "temperature": self.generation_config.get('temperature', 0.7),
+            "top_p": self.generation_config.get('top_p', 0.95),
         }
         
         response = requests.post(
@@ -189,7 +200,9 @@ class CloudModelClient:
             "model": model,
             "messages": messages,
             "max_tokens": 512,
-            "temperature": 0.7
+            "temperature": self.generation_config.get('temperature', 0.7),
+            "top_p": self.generation_config.get('top_p', 0.95),
+            "repetition_penalty": self.generation_config.get('repetition_penalty', 1.2),
         }
         
         response = requests.post(
@@ -225,7 +238,10 @@ class CloudModelClient:
             "model": model,
             "messages": messages,
             "max_tokens": 512,
-            "temperature": 0.7
+            "temperature": self.generation_config.get('temperature', 0.7),
+            "top_p": self.generation_config.get('top_p', 0.95),
+            "top_k": self.generation_config.get('top_k', 50),
+            "repetition_penalty": self.generation_config.get('repetition_penalty', 1.2),
         }
         
         response = requests.post(
@@ -260,7 +276,10 @@ class CloudModelClient:
             "input": {"messages": messages},
             "parameters": {
                 "max_tokens": 512,
-                "temperature": 0.7
+                "temperature": self.generation_config.get('temperature', 0.7),
+                "top_p": self.generation_config.get('top_p', 0.95),
+                "top_k": self.generation_config.get('top_k', 50),
+                "repetition_penalty": self.generation_config.get('repetition_penalty', 1.2),
             }
         }
         
@@ -753,13 +772,27 @@ def main():
     continue_choice = input("Generate podcast? (y/N): ").strip().lower()
     
     if continue_choice == 'y':
-        print("Welcome to the preprocessing stage!")
+        print("Welcome to the podcast generation stage!")
         print("==="*15)
-        user_input = input(f"\n\nEnter the filepath for the file you would like to read in, load, and preprocess the textual data from: ")
+        user_input = input(f"\n\nEnter the filepath for the file you would like to read in, load, and use as context for the podcast generation: ")
         INPUT_PROMPT = read_file_to_string(user_input)
-        pipeline = transformers.pipeline("text-generation", model=MODEL, model_kwargs={"torch_dtype": torch.bfloat16}, device_map=device)
+
+        # Get generation settings
+        generation_settings = config_manager.current_config.get("generation_settings", {})
+
+        pipeline = transformers.pipeline("text-generation", model=local_model, tokenizer=local_tokenizer, device=device)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": INPUT_PROMPT}]
-        outputs = pipeline(messages, max_new_tokens=8126, temperature=1)
+        
+        outputs = pipeline(
+            messages, 
+            max_new_tokens=8126, 
+            temperature=generation_settings.get('temperature', 0.7),
+            top_k=generation_settings.get('top_k', 50),
+            top_p=generation_settings.get('top_p', 0.95),
+            repetition_penalty=generation_settings.get('repetition_penalty', 1.2),
+            no_repeat_ngram_size=generation_settings.get('no_repeat_ngram_size', 3),
+            do_sample=True
+        )
 
         save_string_pkl = outputs[0]["generated_text"][-1]['content']
         print(outputs[0]["generated_text"][-1]['content'])

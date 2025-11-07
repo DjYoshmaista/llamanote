@@ -1,0 +1,39 @@
+{
+  "creative": {
+    "description": "Higher temperature and top-p for creative tasks.",
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "top_k": 50,
+    "do_sample": true,
+    "max_new_tokens": 2048,
+    "repetition_penalty": 1.1
+  },
+  "balanced": {
+    "description": "A good middle-ground for general use with anti-repetition.",
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 50,
+    "do_sample": true,
+    "max_new_tokens": 2048,
+    "repetition_penalty": 1.15,
+    "no_repeat_ngram_size": 3
+  },
+  "precise": {
+    "description": "Lower temperature for factual and precise tasks.",
+    "temperature": 0.2,
+    "top_p": 0.8,
+    "top_k": 40,
+    "do_sample": true,
+    "max_new_tokens": 1024,
+    "repetition_penalty": 1.05
+  },
+  "fast": {
+    "description": "Optimized for speed with greedy decoding.",
+    "temperature": 0.1,
+    "top_p": 1.0,
+    "top_k": 0,
+    "do_sample": false,
+    "max_new_tokens": 512,
+    "repetition_penalty": 1.0
+  }
+}

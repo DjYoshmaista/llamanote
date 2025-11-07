@@ -6,7 +6,7 @@ Implements the LLMBackend interface for running models locally using 'transforme
 
 import gc
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from ...utils.helpers import DynamicTokenLimitCalculator
 import time
 
@@ -73,8 +73,13 @@ from ...config.settings import DEFAULT_CACHE_DIR, DEFAULT_OFFLOAD_DIR
 from ..hybrid_kv_cache import HybridKVCache, CacheConfig
 from ..attention_patcher import AttentionPatcher
 from ..sliding_window_attention import SlidingWindowConfig
-from ..cache import LlamaNoteDynamicCache, CacheStrategyConfig, MemoryStrategy
-from ..cache.generation_wrapper import CachedGenerationWrapper
+# Advanced cache removed - using transformers' built-in DynamicCache instead
+try:
+    from transformers import DynamicCache
+    DYNAMIC_CACHE_AVAILABLE = True
+except ImportError:
+    DYNAMIC_CACHE_AVAILABLE = False
+    DynamicCache = None
 
 logger = get_logger_conf(__name__)
 
@@ -423,15 +428,12 @@ class LocalHFBackend(LLMBackend):
         self.device_manager = get_device_manager()
         self.device = self.device_manager.get_device()
 
-        # Initialize advanced cache system (NEW INTEGRATED SYSTEM)
-        self.generation_wrapper: Optional[CachedGenerationWrapper] = None
-
-        if self.split_config.use_advanced_cache:
-            self.logger.info(f"Advanced cache system enabled: strategy={self.split_config.cache_strategy}")
+        # Cache system: Now using transformers' built-in DynamicCache
+        # Advanced custom cache has been removed due to performance issues
 
         # Legacy cache systems (kept for backward compatibility)
         self.hybrid_cache: Optional[HybridKVCache] = None
-        if self.split_config.use_hybrid_kv_cache and not self.split_config.use_advanced_cache:
+        if self.split_config.use_hybrid_kv_cache:
             cache_config = CacheConfig(
                 hot_cache_max_size_mb=self.split_config.kv_cache_hot_size_mb,
                 cold_cache_max_size_mb=self.split_config.kv_cache_cold_size_mb,
@@ -442,7 +444,7 @@ class LocalHFBackend(LLMBackend):
             self.logger.info(f"Legacy hybrid KV-Cache enabled (hot={cache_config.hot_cache_max_size_mb}MB)")
 
         self.attention_patcher: Optional[AttentionPatcher] = None
-        if self.split_config.use_sliding_window and not self.split_config.use_advanced_cache:
+        if self.split_config.use_sliding_window:
             sliding_config = SlidingWindowConfig(
                 window_size=self.split_config.sliding_window_size,
                 stride=self.split_config.sliding_window_stride,
@@ -477,15 +479,8 @@ class LocalHFBackend(LLMBackend):
             self._post_load_setup()
             self._log_model_info()
 
-            # Initialize generation wrapper with advanced cache if enabled
-            if self.split_config.use_advanced_cache:
-                self.generation_wrapper = CachedGenerationWrapper(
-                    model=self.model_handle,
-                    strategy=self.split_config.cache_strategy,
-                    enable_hybrid_cache=True, # You can make this configurable
-                    enable_sliding_window=True # You can make this configurable
-                )
-                self.logger.info("Generation wrapper initialized with advanced cache")
+            # Advanced cache system removed - now using transformers' built-in DynamicCache
+            # This is automatically handled by transformers during generation
 
             # Apply legacy sliding window patch if enabled (backward compatibility)
             if self.attention_patcher:
@@ -569,7 +564,7 @@ class LocalHFBackend(LLMBackend):
         
         # Calculate dynamic max_new_tokens
         calculated_max = self.token_calculator.calculate_max_new_tokens(prompt)
-        max_new = min(hyperparams.max_new_tokens, calculated_max) if hyperparams.max_new_tokens else calculated_max
+        max_new = min(int(hyperparams.max_new_tokens), calculated_max) if hyperparams.max_new_tokens is not None else calculated_max
         
         max_input_length = self.model_entry.max_context - max_new - 10 # Safety buffer
 
@@ -604,21 +599,19 @@ class LocalHFBackend(LLMBackend):
              logger.error(f"Failed to create GenerationConfig: {e}. Using default.", exc_info=True)
              gen_config = GenerationConfig(max_new_tokens=max_new)
 
-        # Generate - use wrapper if available for advanced cache integration
+        # Generate - using transformers' built-in DynamicCache
         start_time = time.time()
         with torch.no_grad():
-            if self.generation_wrapper:
-                # Use advanced cache-integrated generation
-                outputs = self.generation_wrapper.generate(
-                    **inputs,
-                    generation_config=gen_config
-                )
-            else:
-                # Standard generation
-                outputs = self.model_handle.generate(
-                    **inputs,
-                    generation_config=gen_config
-                )
+            # Use transformers' built-in DynamicCache for efficient KV-cache management
+            # This is automatically created and managed by transformers during generation
+            past_key_values = DynamicCache() if DYNAMIC_CACHE_AVAILABLE else None
+
+            outputs = self.model_handle.generate(
+                **inputs,
+                generation_config=gen_config,
+                past_key_values=past_key_values,
+                use_cache=True  # Enable KV-cache for faster generation
+            )
         gen_time = time.time() - start_time
         
         # Decode output
@@ -654,6 +647,128 @@ class LocalHFBackend(LLMBackend):
             device_map=self.device_map
         )
 
+    def _generate_batch_request(self,
+                                prompts: List[str],
+                                hyperparams: HyperparameterConfig,
+                                **kwargs) -> List[GenerationResult]:
+        """
+        HF-specific batch generation logic for parallel inference.
+
+        Args:
+            prompts: List of prompts to generate responses for
+            hyperparams: Generation hyperparameters
+            **kwargs: Additional arguments (e.g., remove_thinking)
+
+        Returns:
+            List of GenerationResult objects, one per prompt
+        """
+        if not prompts:
+            return []
+
+        # Calculate max_new_tokens (use minimum across all prompts for safety)
+        max_new_list = []
+        for prompt in prompts:
+            calculated_max = self.token_calculator.calculate_max_new_tokens(prompt)
+            max_new = min(int(hyperparams.max_new_tokens), calculated_max) if hyperparams.max_new_tokens is not None else calculated_max
+            max_new_list.append(max_new)
+
+        max_new = min(max_new_list)  # Use minimum to ensure all fit
+        max_input_length = self.model_entry.max_context - max_new - 10  # Safety buffer
+
+        try:
+            # Tokenize all prompts together with padding
+            inputs = self.tokenizer(
+                prompts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_input_length,
+                padding=True  # Pad to same length for batch processing
+            )
+        except Exception as e:
+            logger.error(f"Batch tokenization failed: {e}", exc_info=True)
+            raise GenerationError(f"Batch tokenization failed: {e}", self.model_id) from e
+
+        input_tokens_per_prompt = [
+            (inputs['attention_mask'][i] == 1).sum().item() for i in range(len(prompts))
+        ]
+
+        # Move inputs to the model's primary device
+        try:
+            first_device = next(self.model_handle.parameters()).device
+            inputs = {k: v.to(first_device) for k, v in inputs.items()}
+        except Exception as e:
+            logger.error(f"Failed to move batch inputs to device {first_device}: {e}", exc_info=True)
+            raise GenerationError(f"Device placement error: {e}", self.model_id) from e
+
+        # Create GenerationConfig
+        gen_config_dict = hyperparams.to_dict()
+        gen_config_dict['max_new_tokens'] = max_new
+        gen_config_dict.setdefault('pad_token_id', self.tokenizer.pad_token_id)
+        eos_id = self.tokenizer.eos_token_id
+        if isinstance(eos_id, list): eos_id = eos_id[0]
+        gen_config_dict.setdefault('eos_token_id', eos_id)
+
+        try:
+            gen_config = GenerationConfig(**gen_config_dict)
+        except Exception as e:
+            logger.error(f"Failed to create GenerationConfig: {e}. Using default.", exc_info=True)
+            gen_config = GenerationConfig(max_new_tokens=max_new)
+
+        # Generate in batch - using transformers' built-in DynamicCache
+        start_time = time.time()
+        with torch.no_grad():
+            past_key_values = DynamicCache() if DYNAMIC_CACHE_AVAILABLE else None
+
+            outputs = self.model_handle.generate(
+                **inputs,
+                generation_config=gen_config,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+        gen_time = time.time() - start_time
+
+        # Decode outputs for each prompt in the batch
+        results = []
+        remove_thinking = kwargs.get('remove_thinking', True)
+
+        for i, output_ids in enumerate(outputs):
+            input_len = input_tokens_per_prompt[i]
+            # Get only newly generated tokens
+            output_tokens_tensor = output_ids[input_len:]
+            raw_output = self.tokenizer.decode(output_tokens_tensor, skip_special_tokens=True).strip()
+            output_tokens = output_tokens_tensor.shape[0]
+
+            # Filter if requested
+            if remove_thinking and self.model_entry.supports_thinking:
+                filter_result = self.response_filter.filter(raw_output)
+                filtered_output = filter_result.filtered_text
+            else:
+                filtered_output = raw_output
+
+            results.append(GenerationResult(
+                raw_output=raw_output,
+                filtered_output=filtered_output,
+                input_tokens=input_len,
+                output_tokens=output_tokens,
+                generation_time=gen_time / len(prompts),  # Approximate per-prompt time
+                memory_used=0,  # Will be calculated once below
+                device_map=self.device_map
+            ))
+
+        # Get memory usage once for the batch
+        memory_used = 0
+        if self.device_manager.is_cuda_available():
+            try:
+                memory_used = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                memory_used = torch.cuda.memory_allocated() / (1024 * 1024)
+
+        # Update all results with actual memory usage
+        for result in results:
+            result.memory_used = memory_used / len(prompts)  # Distribute across batch
+
+        return results
 
     def _chat_request(self, 
                       system_prompt: str, 
@@ -702,22 +817,14 @@ class LocalHFBackend(LLMBackend):
         if self.attention_patcher:
             self.logger.info(self.attention_patcher.format_statistics())
 
-    def log_advanced_cache_statistics(self):
-        """Log advanced cache statistics if enabled."""
-        if self.generation_wrapper:
-            self.generation_wrapper.log_cache_statistics()
-
     def unload(self):
         """Unload model and tokenizer, clear memory."""
         if not self.is_loaded:
             return
         self.logger.info(f"Unloading local HF model: {self.model_specifier}")
 
-        # Log advanced cache statistics if enabled (NEW SYSTEM)
-        if hasattr(self, 'generation_wrapper') and self.generation_wrapper:
-            self.log_advanced_cache_statistics()
-            if hasattr(self.generation_wrapper, 'cache') and hasattr(self.generation_wrapper.cache, 'reset'):
-                self.generation_wrapper.cache.reset()
+        # Advanced cache system removed - using transformers' built-in DynamicCache
+        # No manual cache cleanup needed as it's managed by transformers
 
         # Log legacy cache statistics before unloading (BACKWARD COMPATIBILITY)
         if hasattr(self, 'hybrid_cache') and self.hybrid_cache:
@@ -734,7 +841,5 @@ class LocalHFBackend(LLMBackend):
         self.model_handle = None
         self.tokenizer = None
         self.device_map = None
-        if hasattr(self, 'generation_wrapper'):
-            self.generation_wrapper = None
         self.is_loaded = False
         self.logger.info("Local HF model unloaded.")

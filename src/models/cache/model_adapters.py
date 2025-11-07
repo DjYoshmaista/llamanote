@@ -15,6 +15,7 @@ This modular approach allows easy extension to new model architectures.
 
 from typing import Optional, Dict, Any, Type, Tuple
 import torch
+from functools import partial
 
 from ...utils.logger import get_logger_conf
 
@@ -91,17 +92,65 @@ class LlamaAdapter(ModelAdapter):
           the sliding window.
         """
         logger.info(f"Adapting {self.model.__class__.__name__} for advanced caching")
-
         try:
-            # Patch attention layers
             for layer in self.model.model.layers:
+                logger.info(f"Adapting layer: {layer}")
+                logger.info(f"Attention layer: {layer.self_attn}")
+
+                # Skip if already patched
+                if hasattr(layer.self_attn, '_is_patched') and layer.self_attn._is_patched:
+                    logger.info("Layer already patched, skipping.")
+                    continue
+
                 # Store the original forward method before patching
-                if not hasattr(layer.self_attn, '_original_forward'):
-                    layer.self_attn._original_forward = layer.self_attn.forward
-                # Mark the layer as patched (store flag on the layer object, not the method)
+                original_forward = layer.self_attn.forward
+                logger.info("Storing original forward method.")
+
+                # Create a wrapper function that captures the original forward
+                def create_patched_forward(original_fn):
+                    def patched_forward(
+                        hidden_states: torch.Tensor,
+                        attention_mask: Optional[torch.Tensor] = None,
+                        position_ids: Optional[torch.LongTensor] = None,
+                        past_key_value: Optional[Any] = None,
+                        output_attentions: bool = False,
+                        use_cache: bool = False,
+                        cache_position: Optional[torch.LongTensor] = None,
+                        **kwargs,
+                    ):
+                        try:
+                            # Try calling with cache_position (for newer transformers)
+                            return original_fn(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_value=past_key_value,
+                                output_attentions=output_attentions,
+                                use_cache=use_cache,
+                                cache_position=cache_position,
+                                **kwargs
+                            )
+                        except TypeError as e:
+                            # cache_position not supported, try without it
+                            if 'cache_position' in str(e):
+                                return original_fn(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    past_key_value=past_key_value,
+                                    output_attentions=output_attentions,
+                                    use_cache=use_cache,
+                                    **kwargs
+                                )
+                            else:
+                                raise
+                    return patched_forward
+
+                # Apply the patch
+                layer.self_attn.forward = create_patched_forward(original_forward)
+                # Mark as patched
                 layer.self_attn._is_patched = True
-                # Bind the new forward method to the attention instance
-                layer.self_attn.forward = self._patched_attention_forward.__get__(layer.self_attn)
+                logger.info("Layer patched successfully.")
 
             # Patch model's causal mask creation
             if not hasattr(self.model, '_original_update_causal_mask'):
@@ -143,11 +192,11 @@ class LlamaAdapter(ModelAdapter):
         # Note: self is the attention layer instance, not the adapter
         if not hasattr(self, '_original_forward'):
             # This should never happen if adapt() was called correctly
-            self.logger.error("No _original_forward found on attention layer!")
+            logger.error("No _original_forward found on attention layer!")
             # Fallback: return zeros to avoid crash
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
         try:
             # Try calling with cache_position (for newer transformers)
@@ -179,7 +228,7 @@ class LlamaAdapter(ModelAdapter):
                     logger.error(f"Error calling original forward: {e2}")
                     bsz, q_len, _ = hidden_states.size()
                     attn_output = torch.zeros_like(hidden_states)
-                    return attn_output, None, None
+                    return attn_output, None
             else:
                 raise
         except Exception as e:
@@ -187,7 +236,7 @@ class LlamaAdapter(ModelAdapter):
             logger.error(f"Unexpected error in patched forward: {e}")
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
     def _patched_update_causal_mask(
         self,
@@ -227,17 +276,70 @@ class QwenAdapter(ModelAdapter):
         Patch Qwen model for sliding window attention.
         """
         logger.info(f"Adapting {self.model.__class__.__name__} for advanced caching")
+        logger.info(f"Model attributes: {dir(self.model)}")
+        if hasattr(self.model, 'model'):
+            logger.info(f"Model.model attributes: {dir(self.model.model)}")
 
         try:
             # Qwen models have a similar structure to Llama
             for layer in self.model.model.layers:
+                logger.info(f"Adapting layer: {layer}")
+                logger.info(f"Attention layer: {layer.self_attn}")
+
+                # Skip if already patched
+                if hasattr(layer.self_attn, '_is_patched') and layer.self_attn._is_patched:
+                    logger.info("Layer already patched, skipping.")
+                    continue
+
                 # Store the original forward method before patching
-                if not hasattr(layer.self_attn, '_original_forward'):
-                    layer.self_attn._original_forward = layer.self_attn.forward
-                # Mark the layer as patched (store flag on the layer object, not the method)
+                original_forward = layer.self_attn.forward
+                logger.info("Storing original forward method.")
+
+                # Create a wrapper function that captures the original forward
+                def create_patched_forward(original_fn):
+                    def patched_forward(
+                        hidden_states: torch.Tensor,
+                        attention_mask: Optional[torch.Tensor] = None,
+                        position_ids: Optional[torch.LongTensor] = None,
+                        past_key_value: Optional[Any] = None,
+                        output_attentions: bool = False,
+                        use_cache: bool = False,
+                        cache_position: Optional[torch.LongTensor] = None,
+                        **kwargs,
+                    ):
+                        try:
+                            # Try calling with cache_position (for newer transformers)
+                            return original_fn(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_value=past_key_value,
+                                output_attentions=output_attentions,
+                                use_cache=use_cache,
+                                cache_position=cache_position,
+                                **kwargs
+                            )
+                        except TypeError as e:
+                            # cache_position not supported, try without it
+                            if 'cache_position' in str(e):
+                                return original_fn(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    past_key_value=past_key_value,
+                                    output_attentions=output_attentions,
+                                    use_cache=use_cache,
+                                    **kwargs
+                                )
+                            else:
+                                raise
+                    return patched_forward
+
+                # Apply the patch
+                layer.self_attn.forward = create_patched_forward(original_forward)
+                # Mark as patched
                 layer.self_attn._is_patched = True
-                # Bind the new forward method to the attention instance
-                layer.self_attn.forward = self._patched_attention_forward.__get__(layer.self_attn)
+                logger.info("Layer patched successfully.")
 
             # Patch model's causal mask creation
             if not hasattr(self.model, '_original_update_causal_mask'):
@@ -277,11 +379,11 @@ class QwenAdapter(ModelAdapter):
         # Note: self is the attention layer instance, not the adapter
         if not hasattr(self, '_original_forward'):
             # This should never happen if adapt() was called correctly
-            self.logger.error("No _original_forward found on attention layer!")
+            logger.error("No _original_forward found on attention layer!")
             # Fallback: return zeros to avoid crash
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
         try:
             # Try calling with cache_position (for newer transformers)
@@ -313,7 +415,7 @@ class QwenAdapter(ModelAdapter):
                     logger.error(f"Error calling original forward: {e2}")
                     bsz, q_len, _ = hidden_states.size()
                     attn_output = torch.zeros_like(hidden_states)
-                    return attn_output, None, None
+                    return attn_output, None
             else:
                 raise
         except Exception as e:
@@ -321,7 +423,7 @@ class QwenAdapter(ModelAdapter):
             logger.error(f"Unexpected error in patched forward: {e}")
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
     def _patched_update_causal_mask(
         self,
@@ -365,13 +467,63 @@ class DeepSeekAdapter(ModelAdapter):
         try:
             # DeepSeek also has a Llama-like structure
             for layer in self.model.model.layers:
+                logger.info(f"Adapting layer: {layer}")
+                logger.info(f"Attention layer: {layer.self_attn}")
+
+                # Skip if already patched
+                if hasattr(layer.self_attn, '_is_patched') and layer.self_attn._is_patched:
+                    logger.info("Layer already patched, skipping.")
+                    continue
+
                 # Store the original forward method before patching
-                if not hasattr(layer.self_attn, '_original_forward'):
-                    layer.self_attn._original_forward = layer.self_attn.forward
-                # Mark the layer as patched (store flag on the layer object, not the method)
+                original_forward = layer.self_attn.forward
+                logger.info("Storing original forward method.")
+
+                # Create a wrapper function that captures the original forward
+                def create_patched_forward(original_fn):
+                    def patched_forward(
+                        hidden_states: torch.Tensor,
+                        attention_mask: Optional[torch.Tensor] = None,
+                        position_ids: Optional[torch.LongTensor] = None,
+                        past_key_value: Optional[Any] = None,
+                        output_attentions: bool = False,
+                        use_cache: bool = False,
+                        cache_position: Optional[torch.LongTensor] = None,
+                        **kwargs,
+                    ):
+                        try:
+                            # Try calling with cache_position (for newer transformers)
+                            return original_fn(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                past_key_value=past_key_value,
+                                output_attentions=output_attentions,
+                                use_cache=use_cache,
+                                cache_position=cache_position,
+                                **kwargs
+                            )
+                        except TypeError as e:
+                            # cache_position not supported, try without it
+                            if 'cache_position' in str(e):
+                                return original_fn(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    past_key_value=past_key_value,
+                                    output_attentions=output_attentions,
+                                    use_cache=use_cache,
+                                    **kwargs
+                                )
+                            else:
+                                raise
+                    return patched_forward
+
+                # Apply the patch
+                layer.self_attn.forward = create_patched_forward(original_forward)
+                # Mark as patched
                 layer.self_attn._is_patched = True
-                # Bind the new forward method to the attention instance
-                layer.self_attn.forward = self._patched_attention_forward.__get__(layer.self_attn)
+                logger.info("Layer patched successfully.")
 
             # Patch model's causal mask creation
             if not hasattr(self.model, '_original_update_causal_mask'):
@@ -411,11 +563,11 @@ class DeepSeekAdapter(ModelAdapter):
         # Note: self is the attention layer instance, not the adapter
         if not hasattr(self, '_original_forward'):
             # This should never happen if adapt() was called correctly
-            self.logger.error("No _original_forward found on attention layer!")
+            logger.error("No _original_forward found on attention layer!")
             # Fallback: return zeros to avoid crash
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
         try:
             # Try calling with cache_position (for newer transformers)
@@ -447,7 +599,7 @@ class DeepSeekAdapter(ModelAdapter):
                     logger.error(f"Error calling original forward: {e2}")
                     bsz, q_len, _ = hidden_states.size()
                     attn_output = torch.zeros_like(hidden_states)
-                    return attn_output, None, None
+                    return attn_output, None
             else:
                 raise
         except Exception as e:
@@ -455,7 +607,7 @@ class DeepSeekAdapter(ModelAdapter):
             logger.error(f"Unexpected error in patched forward: {e}")
             bsz, q_len, _ = hidden_states.size()
             attn_output = torch.zeros_like(hidden_states)
-            return attn_output, None, None
+            return attn_output, None
 
     def _patched_update_causal_mask(
         self,

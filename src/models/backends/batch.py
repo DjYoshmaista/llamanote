@@ -2,10 +2,12 @@
 """
 Batch Processing Module
 Handles batch processing of text chunks through LLM backends with checkpointing support.
+Supports both sequential and parallel batch inference for improved GPU utilization.
 """
 
 from typing import List, Optional, Callable, Any, Dict
 from pathlib import Path
+import time
 from ...utils.logger import get_logger_conf, LoggingProgress, DualProgressTracker
 from ...core.types import GenerationResult
 from ..hyperparameters import HyperparameterConfig
@@ -17,15 +19,21 @@ logger = get_logger_conf(__name__)
 class BatchProcessor:
     """Processes multiple text chunks through an LLM backend."""
 
-    def __init__(self, backend: LLMBackend):
+    def __init__(self, backend: LLMBackend, batch_size: int = 1):
         """
         Initialize batch processor.
 
         Args:
             backend: The LLM backend to use for processing.
+            batch_size: Number of chunks to process in parallel (default: 1 for sequential).
+                       Set to > 1 for true batch inference when backend supports it.
         """
         self.backend = backend
+        self.batch_size = batch_size
         self.logger = get_logger_conf(f"{__name__}.BatchProcessor")
+
+        if batch_size > 1:
+            self.logger.info(f"Batch inference enabled with batch_size={batch_size}")
 
     def process_batch(
         self,
@@ -101,51 +109,135 @@ class BatchProcessor:
                 for _ in range(start_index):
                     progress.update(1)
 
-            for i in range(start_index, len(texts)):
-                text = texts[i]
-                try:
-                    # Use chat-based processing if available
-                    if hasattr(self.backend, 'process_with_chat_template'):
-                        result = self.backend.process_with_chat_template(
-                            system_prompt=system_prompt,
-                            user_message=text,
+            # Process in batches for improved GPU utilization
+            for batch_start in range(start_index, len(texts), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(texts))
+                batch_texts = texts[batch_start:batch_end]
+
+                # Try true batch inference if backend supports it
+                if self.batch_size > 1 and hasattr(self.backend, '_generate_batch_request'):
+                    try:
+                        # Build prompts for batch processing
+                        if hasattr(self.backend, 'tokenizer') and hasattr(self.backend.tokenizer, 'chat_template'):
+                            # Use chat template for all prompts in batch
+                            batch_prompts = []
+                            for text in batch_texts:
+                                messages = [
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": text}
+                                ]
+                                prompt = self.backend.tokenizer.apply_chat_template(
+                                    messages, tokenize=False, add_generation_prompt=True
+                                )
+                                batch_prompts.append(prompt)
+                        else:
+                            # Fallback to simple prompt construction
+                            batch_prompts = [
+                                f"{system_prompt}\n\nUser: {text}\n\nAssistant:"
+                                for text in batch_texts
+                            ]
+
+                        # Parallel batch inference
+                        self.logger.debug(f"Processing batch of {len(batch_texts)} chunks in parallel")
+                        batch_results = self.backend._generate_batch_request(
+                            prompts=batch_prompts,
                             hyperparams=hyperparams,
                             **kwargs
                         )
-                    else:
-                        # Fallback to raw generation
-                        # Construct a simple prompt
-                        prompt = f"{system_prompt}\n\nUser: {text}\n\nAssistant:"
-                        result = self.backend.generate(
-                            prompt=prompt,
-                            hyperparams=hyperparams,
-                            **kwargs
+
+                        # Add results and update progress
+                        for result in batch_results:
+                            results.append(result)
+                            progress.update(1)
+
+                    except Exception as batch_error:
+                        # Fallback to sequential processing if batch fails
+                        self.logger.warning(f"Batch processing failed: {batch_error}. Falling back to sequential.")
+                        batch_results = self._process_batch_sequential(
+                            batch_texts, batch_start, system_prompt, hyperparams,
+                            results, progress, **kwargs
                         )
-
-                    results.append(result)
-                    progress.update(1)
-
-                    # Save checkpoint if callback provided and interval reached
-                    if checkpoint_callback and checkpoint_interval > 0:
-                        if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(texts):
-                            self.logger.debug(f"Saving checkpoint at chunk {i + 1}/{len(texts)}")
-                            checkpoint_callback(i + 1, results, {"system_prompt": system_prompt})
-
-                except Exception as e:
-                    self.logger.error(f"Error processing chunk {i+1}/{len(texts)}: {e}", exc_info=True)
-                    # Create an error result
-                    error_result = GenerationResult(
-                        raw_output=f"[Error: {str(e)}]",
-                        filtered_output=f"[Error: {str(e)}]",
-                        input_tokens=0,
-                        output_tokens=0,
-                        generation_time=0.0,
-                        memory_used=0,
-                        device_map={},
-                        error_message=str(e)
+                else:
+                    # Sequential processing (batch_size=1 or backend doesn't support batching)
+                    batch_results = self._process_batch_sequential(
+                        batch_texts, batch_start, system_prompt, hyperparams,
+                        results, progress, **kwargs
                     )
-                    results.append(error_result)
-                    progress.update(1)
+
+                # Save checkpoint after each batch if callback provided
+                if checkpoint_callback and checkpoint_interval > 0:
+                    if (batch_end) % checkpoint_interval == 0 or batch_end == len(texts):
+                        self.logger.debug(f"Saving checkpoint at chunk {batch_end}/{len(texts)}")
+                        checkpoint_callback(batch_end, results, {"system_prompt": system_prompt})
 
         self.logger.info(f"Batch processing complete: {len(results)} results")
         return results
+
+    def _process_batch_sequential(
+        self,
+        batch_texts: List[str],
+        batch_start: int,
+        system_prompt: str,
+        hyperparams: HyperparameterConfig,
+        results: List[GenerationResult],
+        progress: LoggingProgress,
+        **kwargs
+    ) -> List[GenerationResult]:
+        """
+        Process a batch of texts sequentially (fallback or batch_size=1).
+
+        Args:
+            batch_texts: List of texts to process
+            batch_start: Starting index in the overall list
+            system_prompt: System prompt for generation
+            hyperparams: Hyperparameters for generation
+            results: Global results list to append to
+            progress: Progress tracker to update
+            **kwargs: Additional kwargs for generation
+
+        Returns:
+            List of GenerationResult objects for this batch
+        """
+        batch_results = []
+        for local_idx, text in enumerate(batch_texts):
+            i = batch_start + local_idx
+            try:
+                # Use chat-based processing if available
+                if hasattr(self.backend, 'process_with_chat_template'):
+                    result = self.backend.process_with_chat_template(
+                        system_prompt=system_prompt,
+                        user_message=text,
+                        hyperparams=hyperparams,
+                        **kwargs
+                    )
+                else:
+                    # Fallback to raw generation
+                    prompt = f"{system_prompt}\n\nUser: {text}\n\nAssistant:"
+                    result = self.backend.generate(
+                        prompt=prompt,
+                        hyperparams=hyperparams,
+                        **kwargs
+                    )
+
+                batch_results.append(result)
+                results.append(result)
+                progress.update(1)
+
+            except Exception as e:
+                self.logger.error(f"Error processing chunk {i+1}: {e}", exc_info=True)
+                # Create an error result
+                error_result = GenerationResult(
+                    raw_output=f"[Error: {str(e)}]",
+                    filtered_output=f"[Error: {str(e)}]",
+                    input_tokens=0,
+                    output_tokens=0,
+                    generation_time=0.0,
+                    memory_used=0,
+                    device_map={},
+                    error_message=str(e)
+                )
+                batch_results.append(error_result)
+                results.append(error_result)
+                progress.update(1)
+
+        return batch_results

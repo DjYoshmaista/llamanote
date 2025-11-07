@@ -99,6 +99,20 @@ CHECKPOINT_FORMAT: str = "pickle" # Currently only pickle supported
 CHECKPOINT_RESUME_MODE: str = "auto"  # "auto", "interactive", or "disabled"
 CHECKPOINT_CLEANUP_KEEP: int = 3  # Number of checkpoints to keep per stage
 
+# Progress tracking settings
+# Stage weights for pipeline progress calculation (based on typical processing time)
+# Total weight: ~84 units (Process: 53.6%, Audio: 41.7% of total time)
+DEFAULT_STAGE_WEIGHTS: Dict[str, float] = {
+    "extract": 0.5,      # Fast - PDF/text extraction
+    "preprocess": 0.5,   # Fast - text cleaning
+    "chunk": 0.3,        # Very fast - text splitting
+    "process": 45.0,     # SLOW - LLM generation (main bottleneck)
+    "filter": 2.0,       # Medium - post-processing
+    "format": 0.2,       # Fast - formatting output
+    "save": 0.5,         # Fast - file I/O
+    "audio": 35.0,       # SLOW - Audio generation (TTS)
+}
+
 # API/Service settings (Placeholder for future API mode)
 ENABLE_API_MODE: bool = False
 API_RATE_LIMIT: int = 10
@@ -115,18 +129,30 @@ Return ONLY the cleaned text, without any introductory phrases, acknowledgments,
 Raw text follows:
 """
 
-# Kept original PREPROCESS_PROMPT for potential specific use cases (like podcast mode default)
+# Text preprocessing prompt (for preprocess stage) - used for initial cleanup
 PREPROCESS_PROMPT_PODCAST: str = """
-You are a world class text pre-processor, here is the raw data from a PDF. Please parse and return it in a way that is crispy and usable to send to a podcast writer.
-The raw data is riddled with new line breaks, LaTeX math, and you will see fluff that you should remove completely. Remove, or alternatively translate, any details or data that would be lost, useless, misunderstood, or simply lost in translation from a pure text and raw data format to the audio podcast format.
-Remember, the podcast could be on any one topic, or even on a myriad of topics, so the issues listed above are not necessarily exhaustive in scope.
-Take care with what you remove, and do so intelligently, yet creatively please.
-DO NOT START SUMMARIZING THIS. This should be a rule which is constantly and consistently at the forefront of your logic and processing as you preprocess the data into usable text. YOU ARE ONLY CLEANING UP THE TEXT AND RE-WRITING WHEN NEEDED.
-Be very smart, yet aggressive, with removing details. You will get a running portion of the text and keep returning the processed text.
-PLEASE DO NOT ADD MARKDOWN FORMATTING, STOP ADDING SPECIAL CHARACTERS THAT MARKDOWN CAPITALIZATION LENDS ITSELF TO
-ALWAYS start your response directly with processed text and NO ACKNOWLEDGEMENTS about my questions, period, end of discussion. Okay?
+Clean up this text from a PDF document. Remove formatting artifacts, fix broken sentences, and convert complex notation to plain language. Return only the cleaned text - no commentary or acknowledgments.
 
-Here's the text:
+Text:
+"""
+
+# Podcast script generation prompt (for process stage) - generates the actual dialogue
+PODCAST_GENERATION_PROMPT: str = """
+Convert the following content into an engaging podcast dialogue between a Host and a Guest.
+
+Rules:
+- Create natural, conversational exchanges
+- Host asks questions, Guest provides informed responses
+- Explain concepts clearly without repetition
+- NO meta-commentary about tasks or preprocessing
+- NO thinking process or instructions in output
+- Start immediately with dialogue
+
+Format:
+**[Speaker Host]:** [dialogue]
+**[Speaker Guest]:** [response]
+
+Content:
 """
 
 

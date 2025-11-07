@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from ..utils.logger import get_logger_conf, LoggingProgress, MemoryMonitor, ConsoleOutput, DualProgressTracker
+from ..utils.progress_tracking import ProgressManager
 from ..utils.decorators import log_execution_time
 from ..config.settings import (
     DEFAULT_PIPELINE_STAGES, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT,
     INCLUDE_METADATA, TIMESTAMP_OUTPUTS, DEFAULT_OUTPUT_DIR,
-    MAX_CHARS_PER_FILE, MAX_PDF_SIZE_MB
+    MAX_CHARS_PER_FILE, MAX_PDF_SIZE_MB, DEFAULT_STAGE_WEIGHTS
 )
 from ..config.manager import ConfigManager # For loading defaults if needed
 from .types import (
@@ -172,6 +173,27 @@ class ProcessingPipeline:
             except Exception as e:
                 self.logger.warning(f"Failed to save checkpoint for stage '{stage}': {e}")
 
+    def _update_pipeline_progress(self, progress_manager: 'ProgressManager', completed_stages: List[str], current_stage: Optional[str] = None, stage_progress: float = 0.0):
+        """
+        Update pipeline progress based on completed stages and current stage progress.
+
+        Args:
+            progress_manager: The ProgressManager instance
+            completed_stages: List of completed stage names
+            current_stage: Name of current stage being processed
+            stage_progress: Progress within current stage (0.0 to 1.0)
+        """
+        # Calculate completed weight
+        completed_weight = sum(DEFAULT_STAGE_WEIGHTS.get(s, 0.0) for s in completed_stages)
+
+        # Add partial progress of current stage
+        if current_stage and current_stage in DEFAULT_STAGE_WEIGHTS:
+            current_stage_weight = DEFAULT_STAGE_WEIGHTS[current_stage]
+            completed_weight += current_stage_weight * stage_progress
+
+        # Update pipeline progress
+        progress_manager.update_pipeline(completed_weight)
+
     @log_execution_time(logger_name=__name__)
     def process_file(self,
                     input_path: Path,
@@ -207,7 +229,12 @@ class ProcessingPipeline:
             resume_mode=resume_mode
         )
 
-        # Initialize dual progress tracker
+        # Initialize progress manager with stage weights
+        progress_manager = ProgressManager(stage_weights=DEFAULT_STAGE_WEIGHTS)
+        progress_manager.start()
+        progress_manager.add_pipeline_progress()
+
+        # Keep dual_tracker for backward compatibility with existing code
         dual_tracker = DualProgressTracker(logger=self.logger)
         total_stages = len(self.stages_to_run)
         dual_tracker.set_overall_progress(0, total_stages)
@@ -507,23 +534,42 @@ class ProcessingPipeline:
                              raise ModelLoadError("Failed to load LLM backend.", self.llm_backend.model_specifier)
 
                      from ..models.backends.batch import BatchProcessor # Local import
-                     batch_processor = BatchProcessor(self.llm_backend)
+                     batch_processor = BatchProcessor(
+                         backend=self.llm_backend,
+                         batch_size=self.config.batch_size
+                     )
 
-                     system_prompt = self.config.system_prompt or \
-                                     (PREPROCESS_PROMPT_PODCAST if self.config.mode == ProcessingMode.PODCAST else DEFAULT_SYSTEM_PROMPT)
+                     # Use the podcast generation prompt for process stage, not the preprocessing prompt!
+                     if self.config.mode == ProcessingMode.PODCAST:
+                         from ..config.settings import PODCAST_GENERATION_PROMPT
+                         system_prompt = self.config.system_prompt or PODCAST_GENERATION_PROMPT
+                     else:
+                         system_prompt = self.config.system_prompt or DEFAULT_SYSTEM_PROMPT
 
                      # Set up stage progress tracking
                      total_chunks = len(data_payload['chunks'])
                      dual_tracker.set_stage_progress(0, total_chunks, "Processing chunks")
 
-                     # Define checkpoint callback
+                     # Define checkpoint callback (optimized to avoid full payload copy)
                      def save_process_checkpoint(chunk_idx, results, extra_data, **kwargs):
-                         checkpoint_data = data_payload.copy()
+                         # Only copy essential data for checkpoint (avoid copying entire payload)
+                         checkpoint_data = {
+                             'input_path': data_payload['input_path'],
+                             'chunks': data_payload['chunks'],
+                             'process_checkpoint_index': chunk_idx
+                         }
+
+                         # Add optional data if present
+                         if 'text' in data_payload:
+                             checkpoint_data['text'] = data_payload['text']
+                         if 'metadata' in data_payload:
+                             checkpoint_data['metadata'] = data_payload['metadata']
+
                          # Convert results to raw outputs
                          processed_so_far = [r.raw_output if not r.error_message else data_payload['chunks'][i]
                                             for i, r in enumerate(results)]
                          checkpoint_data['processed_chunks'] = processed_so_far
-                         checkpoint_data['process_checkpoint_index'] = chunk_idx
+
                          try:
                              self.checkpoint_manager.save(
                                  input_path=input_path,
@@ -758,12 +804,24 @@ class ProcessingPipeline:
                         resume_from_chunk_audio = resume_chunk_index
                         self.logger.info(f"Resuming audio stage from chunk {resume_from_chunk_audio}")
 
-                    # Define checkpoint callback for audio
+                    # Define checkpoint callback for audio (optimized to avoid full payload copy)
                     def save_audio_checkpoint(chunk_idx, audio_arrays, extra_data, **kwargs):
-                        checkpoint_data = data_payload.copy()
-                        checkpoint_data['audio_arrays'] = audio_arrays
-                        checkpoint_data['audio_checkpoint_index'] = chunk_idx
+                        # Only copy essential data for checkpoint
+                        checkpoint_data = {
+                            'input_path': data_payload['input_path'],
+                            'audio_arrays': audio_arrays,
+                            'audio_checkpoint_index': chunk_idx
+                        }
+
+                        # Add optional text data if present
+                        if 'formatted_text' in data_payload:
+                            checkpoint_data['formatted_text'] = data_payload['formatted_text']
+                        elif 'filtered_text' in data_payload:
+                            checkpoint_data['filtered_text'] = data_payload['filtered_text']
+
+                        # Merge extra data
                         checkpoint_data.update(extra_data)
+
                         # Get total chunks from extra_data if available
                         total_audio_chunks = extra_data.get('total_segments', None)
                         try:
@@ -816,6 +874,9 @@ class ProcessingPipeline:
             self.logger.error(error_message, exc_info=True)
             ConsoleOutput.error(error_message)
         finally:
+            # Stop progress manager
+            progress_manager.stop()
+
             self.memory_monitor.check(f"pipeline end for {input_path.name}")
 
             # Cleanup lifecycle manager (unload any remaining models)

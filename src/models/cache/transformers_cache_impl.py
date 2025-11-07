@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 try:
-    from transformers.cache_utils import Cache, DynamicCache
+    from transformers.cache_utils import Cache, DynamicCache, CacheLayerMixin
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
@@ -24,10 +24,92 @@ except ImportError:
         def get_seq_length(self, *args, **kwargs): raise NotImplementedError
         def get_max_length(self): raise NotImplementedError
     DynamicCache = Cache
+    class CacheLayerMixin:
+        is_compileable = False
 
 from ...utils.logger import get_logger_conf
 
 logger = get_logger_conf(__name__)
+
+
+class LlamaNoteLayer(CacheLayerMixin if TRANSFORMERS_AVAILABLE else object):
+    """
+    Custom cache layer that wraps key-value tensors.
+
+    This is needed for compatibility with transformers' Cache interface,
+    which expects self.layers to be a list of layer objects, not integers.
+    """
+
+    # Mark as not compileable (transformers checks this attribute)
+    is_compileable = False
+    is_sliding = False
+
+    def __init__(self, layer_idx: int):
+        if TRANSFORMERS_AVAILABLE:
+            super().__init__()
+        self.layer_idx = layer_idx
+        self.keys: Optional[torch.Tensor] = None
+        self.values: Optional[torch.Tensor] = None
+        self.is_initialized = False
+        self.dtype = None
+        self.device = None
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+        """Initialize layer with tensor properties."""
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update the layer's key-value cache."""
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+            self.keys = key_states
+            self.values = value_states
+        else:
+            # Concatenate along sequence dimension
+            self.keys = torch.cat([self.keys, key_states], dim=2)
+            self.values = torch.cat([self.values, value_states], dim=2)
+
+        return self.keys, self.values
+
+    def get_seq_length(self) -> int:
+        """Get the sequence length for this layer."""
+        if self.keys is None or not self.is_initialized:
+            return 0
+        return self.keys.shape[2]
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> Tuple[int, int]:
+        """
+        Return the length and offset of the cache, used to generate the mask.
+
+        Args:
+            cache_position: Current cache position tensor
+
+        Returns:
+            Tuple of (kv_length, kv_offset)
+        """
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, kv_offset
+
+    def get_max_cache_shape(self) -> int:
+        """
+        Returns the maximum sequence length of the cache object.
+
+        For dynamic cache layers, there is no maximum length, so return -1.
+        """
+        return -1
+
+    def __repr__(self) -> str:
+        return f"LlamaNoteLayer(idx={self.layer_idx}, seq_len={self.get_seq_length()})"
 
 
 class MemoryStrategy(Enum):
@@ -133,8 +215,12 @@ class LlamaNoteDynamicCache(Cache if TRANSFORMERS_AVAILABLE else object):
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Compatibility with transformers Cache interface
-        # This list tracks which layers have been initialized
-        self.layers: List[int] = []
+        # This list contains LlamaNoteLayer objects (not integers!)
+        # Transformers expects layer objects with is_compileable attribute
+        self.layers: List[LlamaNoteLayer] = []
+
+        # Track mapping from layer index to layer object
+        self._layer_map: Dict[int, LlamaNoteLayer] = {}
 
         # Track which layers are in hot vs cold storage
         self._hot_layers: set = set()
@@ -234,8 +320,17 @@ class LlamaNoteDynamicCache(Cache if TRANSFORMERS_AVAILABLE else object):
         self._cache[layer_idx] = (updated_keys, updated_values)
 
         # Update layers list for transformers compatibility
-        if layer_idx not in self.layers:
-            self.layers.append(layer_idx)
+        if layer_idx not in self._layer_map:
+            # Create a new layer object
+            layer_obj = LlamaNoteLayer(layer_idx)
+            self._layer_map[layer_idx] = layer_obj
+            self.layers.append(layer_obj)
+
+        # Update the layer object with the new key-value states
+        self._layer_map[layer_idx].keys = updated_keys
+        self._layer_map[layer_idx].values = updated_values
+        self._layer_map[layer_idx].is_initialized = True
+
         self._hot_layers.add(layer_idx)
 
         # Check if we need to evict
@@ -269,6 +364,11 @@ class LlamaNoteDynamicCache(Cache if TRANSFORMERS_AVAILABLE else object):
             max_len = max(max_len, seq_len)
 
         return max_len if max_len > 0 else None
+
+    @property
+    def is_initialized(self) -> bool:
+        """Return whether the cache data is initialized."""
+        return len(self.layers) > 0 and all(layer.is_initialized for layer in self.layers)
 
     def _record_access(self, layer_idx: int):
         """Record access to a layer for LRU tracking."""
@@ -425,6 +525,7 @@ class LlamaNoteDynamicCache(Cache if TRANSFORMERS_AVAILABLE else object):
         self._access_counts.clear()
         self._access_order.clear()
         self.layers.clear()
+        self._layer_map.clear()
 
         logger.info("Cache reset")
 
@@ -483,6 +584,34 @@ class LlamaNoteDynamicCache(Cache if TRANSFORMERS_AVAILABLE else object):
         ]
 
         return "\n".join(lines)
+
+    def __len__(self) -> int:
+        """Return the number of layers in the cache."""
+        return len(self.layers)
+
+    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Support for backwards-compatible `past_key_values` indexing.
+
+        This allows code like `past_key_values[0][0].shape[2]` to get the sequence length.
+
+        Args:
+            layer_idx: Layer index
+
+        Returns:
+            Tuple of (keys, values) tensors
+        """
+        if layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            if layer.keys is not None and layer.values is not None:
+                return layer.keys, layer.values
+            else:
+                # Return empty tensors if not initialized
+                return torch.tensor([]), torch.tensor([])
+        else:
+            raise KeyError(
+                f"Cache only has {len(self.layers)} layers, attempted to access layer with index {layer_idx}"
+            )
 
     def __repr__(self) -> str:
         """String representation."""

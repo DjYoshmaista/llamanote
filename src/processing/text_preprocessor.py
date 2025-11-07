@@ -49,6 +49,15 @@ class TextPreprocessor:
             '\u200b': '',  # Zero-width space
             '\ufeff': '',  # BOM
             '\xa0': ' ',   # Non-breaking space
+            '\u00AD': '',  # Soft hyphen
+            '\u200C': '',  # Zero Width Non-Joiner
+            '\u200D': '',  # Zero Width Joiner
+            '\u00A0': ' ',  # No-break space
+            '\u00B7': '.',  # Middle dot
+            '\u2022': '-',  # Bullet
+            '\u25CF': '-',  # Black circle (another bullet)
+            '\u25BA': '>',  # Black right-pointing pointer
+            '\u25C4': '<',  # Black left-pointing pointer
         }
         
         self._audio_abbreviations = {
@@ -79,12 +88,23 @@ class TextPreprocessor:
             r'=': ' equals ',
         }
 
-    def _fix_encoding_issues(self, text: str) -> str:
-        """Fix common encoding issues and remove non-printables."""
+    def _fix_encoding_issues(self, text: str, aggressive_ascii_filter: bool = False) -> str:
+        """Fix common encoding issues and remove non-printables.
+
+        Args:
+            text: Input text
+            aggressive_ascii_filter: If True, remove all non-ASCII characters (default: False)
+                                    If False, only normalize common Unicode and remove control chars
+        """
+        # Apply direct replacements first (normalize common Unicode to ASCII equivalents)
         for old, new in self._encoding_map.items():
             text = text.replace(old, new)
-        
-        # Remove other non-printable characters except for newline/tab
+
+        # Optional: Remove ALL non-ASCII characters (disabled by default to preserve international text)
+        if aggressive_ascii_filter:
+            text = re.sub(r'[^\x00-\x7F\n\t]', '', text)
+
+        # Remove control characters (but keep printable Unicode if aggressive_ascii_filter=False)
         text = ''.join(char for char in text if char.isprintable() or char in '\n\t')
         return text
 
@@ -107,6 +127,19 @@ class TextPreprocessor:
         text = self._pdf_page_num_regex.sub('\n', text) # Remove page numbers
         text = self._pdf_bullet_regex.sub('- ', text) # Normalize bullets
         return text
+
+    def _segment_sentences(self, text: str) -> str:
+        """
+        Segments text into sentences using a rule-based approach.
+        This is a basic implementation and might not cover all edge cases.
+        """
+        self.logger.debug("Segmenting sentences...")
+        # Add a space after periods, question marks, and exclamation points if not already present
+        text = re.sub(r'(?<=[.!?])(?=[^\s0-9])', r' ', text)
+        # Split by sentence-ending punctuation followed by whitespace or end of string
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        # Filter out empty strings and re-join with a single space
+        return ' '.join([s.strip() for s in sentences if s.strip()])
 
     def clean_for_audio(self, text: str) -> str:
         """
@@ -164,13 +197,15 @@ class TextPreprocessor:
         
         return text
 
-    def preprocess_for_llm(self, 
+    def preprocess_for_llm(self,
                            text: str,
                            remove_urls: bool = True,
                            remove_emails: bool = True,
                            normalize_whitespace: bool = True,
                            fix_encoding: bool = True,
-                           fix_pdf: bool = True) -> str:
+                           fix_pdf: bool = True,
+                           segment_sentences: bool = False,
+                           aggressive_ascii_filter: bool = False) -> str:
         """
         Preprocess text for LLM processing.
 
@@ -181,21 +216,26 @@ class TextPreprocessor:
             normalize_whitespace: Whether to normalize whitespace.
             fix_encoding: Whether to fix encoding issues.
             fix_pdf: Whether to fix common PDF artifacts (hyphens, etc.).
-            
+            segment_sentences: Whether to segment text into sentences (disabled by default).
+            aggressive_ascii_filter: Whether to remove all non-ASCII characters (disabled by default).
+
         Returns:
             Preprocessed text.
         """
         if fix_encoding:
-            text = self._fix_encoding_issues(text)
+            text = self._fix_encoding_issues(text, aggressive_ascii_filter=aggressive_ascii_filter)
             
         if remove_urls:
-            text = self._url_regex.sub('[https://www.youtube.com/@RedactedNews](https://www.youtube.com/@RedactedNews)', text)
+            text = self._url_regex.sub('[URL]', text)
             
         if remove_emails:
             text = self._email_regex.sub('[EMAIL REDACTED]', text)
         
         if fix_pdf:
             text = self._fix_pdf_artifacts(text)
+
+        if segment_sentences: # New step
+            text = self._segment_sentences(text)
             
         if normalize_whitespace:
             text = self._normalize_whitespace(text)
@@ -215,7 +255,7 @@ class SpeakerSegmentParser:
 
     Example markdown format:
         **[Speaker Host]:** Welcome to the show!
-        **[Speaker Guest]:** Thanks for having me.
+        **[Speaker Guest]:** Thanks for have me.
         **[Speaker Host]:** Let's dive into the topic.
 
     Features:
