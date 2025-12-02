@@ -687,43 +687,15 @@ class LocalAudioBackend(AudioBackend):
                         if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(text_chunks):
                             self.logger.debug(f"Saving audio checkpoint at chunk {i + 1}/{len(text_chunks)}")
 
-                            # Save intermediate audio file for preview
-                            intermediate_audio_path = None
-                            if output_path and audio_arrays:
-                                try:
-                                    # Combine audio arrays so far
-                                    valid_arrays = [arr for arr in audio_arrays if arr.size > 0]
-                                    if valid_arrays:
-                                        combined_so_far = self._combine_audio(valid_arrays, self.config.sample_rate)
-                                        if combined_so_far is not None and combined_so_far.size > 0:
-                                            # Post-process
-                                            processed = self.post_processor._post_process_audio(
-                                                combined_so_far,
-                                                self.config.sample_rate,
-                                                self.config.speed,
-                                                self.config.pitch_shift,
-                                                self.config.volume_normalize
-                                            )
-                                            # Save with _checkpoint_chunk{index} suffix
-                                            intermediate_path = output_path.parent / f"{output_path.stem}_checkpoint_chunk{i+1:04d}{output_path.suffix}"
-                                            saved = self.post_processor._save_audio(
-                                                intermediate_path,
-                                                processed,
-                                                self.config.sample_rate,
-                                                self.config.output_format
-                                            )
-                                            if saved:
-                                                intermediate_audio_path = str(saved)
-                                                duration = len(processed) / self.config.sample_rate
-                                                self.logger.info(f"Saved intermediate audio: {saved.name} ({duration:.1f}s)")
-                                except Exception as e:
-                                    self.logger.warning(f"Failed to save intermediate audio: {e}")
+                            # NOTE: DO NOT save intermediate audio files - they cause massive disk bloat
+                            # Only save checkpoint metadata without generating cumulative audio files
+                            # The checkpoint system stores audio_arrays in compressed format already
 
-                            # Save checkpoint with current audio arrays and intermediate audio path
+                            # Save checkpoint with current audio arrays (no intermediate file)
                             checkpoint_callback(i + 1, audio_arrays, {
                                 "text_chunks": text_chunks,
                                 "sample_rate": self.config.sample_rate,
-                                "intermediate_audio_path": intermediate_audio_path
+                                "intermediate_audio_path": None  # Don't save intermediate files
                             })
 
             if not audio_arrays:
@@ -848,36 +820,17 @@ class LocalAudioBackend(AudioBackend):
                         if (i + 1) % checkpoint_interval == 0 or (i + 1) == len(segments):
                             self.logger.debug(f"Saving checkpoint at segment {i + 1}/{len(segments)}")
 
-                            # Save intermediate audio
-                            if output_path and audio_arrays:
-                                try:
-                                    valid_arrays = [arr for arr in audio_arrays if arr.size > 0]
-                                    if valid_arrays:
-                                        combined_so_far = self._combine_audio(valid_arrays, self.config.sample_rate)
-                                        if combined_so_far is not None and combined_so_far.size > 0:
-                                            processed = self.post_processor._post_process_audio(
-                                                combined_so_far,
-                                                self.config.sample_rate,
-                                                self.config.speed,
-                                                self.config.pitch_shift,
-                                                self.config.volume_normalize
-                                            )
-                                            intermediate_path = output_path.parent / f"{output_path.stem}_checkpoint_seg{i+1:04d}{output_path.suffix}"
-                                            saved = self.post_processor._save_audio(
-                                                intermediate_path,
-                                                processed,
-                                                self.config.sample_rate,
-                                                self.config.output_format
-                                            )
-                                            if saved:
-                                                checkpoint_callback(
-                                                    stage="audio",
-                                                    chunk_index=i + 1,
-                                                    total_chunks=len(segments),
-                                                    intermediate_audio_path=str(intermediate_path)
-                                                )
-                                except Exception as checkpoint_err:
-                                    self.logger.warning(f"Failed to save checkpoint: {checkpoint_err}")
+                            # NOTE: DO NOT save intermediate audio files - they cause massive disk bloat
+                            # Only save checkpoint with audio_arrays (compressed by checkpoint system)
+                            try:
+                                checkpoint_callback(i + 1, audio_arrays, {
+                                    "segments": segments,
+                                    "sample_rate": self.config.sample_rate,
+                                    "intermediate_audio_path": None,  # Don't save intermediate files
+                                    "total_segments": len(segments)
+                                })
+                            except Exception as checkpoint_err:
+                                self.logger.warning(f"Failed to save checkpoint: {checkpoint_err}")
 
             # Combine all audio segments
             if not audio_arrays:

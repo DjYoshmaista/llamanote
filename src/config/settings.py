@@ -120,39 +120,68 @@ API_TIMEOUT_SECONDS: int = 300
 
 # === Default Prompts ===
 DEFAULT_SYSTEM_PROMPT: str = """
-You are a world class text pre-processor. Analyze the following raw text extracted from a document.
-Clean it up, remove any irrelevant formatting artifacts (like excessive newlines, page numbers, headers/footers if obvious), and reformat it for readability and downstream use (e.g., feeding into a summarizer or audio generator).
-Focus ONLY on cleaning and reformatting. DO NOT summarize, add opinions, or change the core meaning.
-Remove or translate elements unsuitable for plain text (e.g., complex LaTeX math, broken table structures) intelligently.
-Return ONLY the cleaned text, without any introductory phrases, acknowledgments, or markdown formatting unless it was present and meaningful in the original text structure (like lists or headings).
+Clean up the text below by:
+- Removing formatting artifacts (excessive newlines, page numbers, headers/footers)
+- Fixing broken sentences and formatting
+- Converting complex notation to plain language
+- Preserving the original meaning and content
 
-Raw text follows:
+Return ONLY the cleaned text with no commentary or acknowledgments.
 """
 
 # Text preprocessing prompt (for preprocess stage) - used for initial cleanup
 PREPROCESS_PROMPT_PODCAST: str = """
 Clean up this text from a PDF document. Remove formatting artifacts, fix broken sentences, and convert complex notation to plain language. Return only the cleaned text - no commentary or acknowledgments.
-
-Text:
 """
 
-# Podcast script generation prompt (for process stage) - generates the actual dialogue
+# Podcast planning prompt (first pass) - creates outline
+PODCAST_PLANNING_PROMPT: str = """
+Create a structured outline for a podcast episode using the content below.
+
+1. Identify 3-5 main topics or sections
+2. For each section, write ONE question the Host should ask
+3. For each question, write 2-3 key points the Guest should cover
+4. Keep it focused and avoid repetition
+
+Write ONLY the outline. Do NOT include:
+- <think> tags or reasoning process
+- Meta-commentary about your process
+- Phrases like "Okay, let's..." or "I'll identify..."
+
+Start immediately with this format:
+SECTION 1: [Topic name]
+Host question: [Question about the topic]
+Guest points: [Point 1], [Point 2], [Point 3]
+
+SECTION 2: [Next topic]
+...
+"""
+
+# Podcast script generation prompt (second pass) - generates dialogue from outline
 PODCAST_GENERATION_PROMPT: str = """
-Convert the following content into an engaging podcast dialogue between a Host and a Guest.
+Write natural, engaging dialogue between a Host and Guest for a podcast.
 
-Rules:
-- Create natural, conversational exchanges
-- Host asks questions, Guest provides informed responses
-- Explain concepts clearly without repetition
-- NO meta-commentary about tasks or preprocessing
-- NO thinking process or instructions in output
-- Start immediately with dialogue
+CRITICAL RULES:
+- Host: Asks clear questions to introduce topics
+- Guest: Provides informative, detailed answers based on the content
+- NO preprocessing instructions in the dialogue
+- NO thinking process or meta-commentary (do NOT include <think> tags or reasoning)
+- NO repetitive phrases
+- Write ONLY speaker dialogue - NO explanations about what you're doing
+- Start immediately with Host or Guest speaking
+- DO NOT describe your process or planning
+- DO NOT use phrases like "I'll structure" or "Let me" or "The user"
 
-Format:
-**[Speaker Host]:** [dialogue]
-**[Speaker Guest]:** [response]
+FORBIDDEN OUTPUT:
+- <think>...</think> tags
+- "Okay, let's..." or "First, I'll..."
+- "Looking at the outline..."
+- "The task is to..."
+- Any meta-commentary about the writing process
 
-Content:
+Format (ONLY this):
+**[Speaker Host]:** [question or introduction]
+**[Speaker Guest]:** [informed response]
 """
 
 

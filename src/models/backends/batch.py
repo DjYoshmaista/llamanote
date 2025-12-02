@@ -8,32 +8,53 @@ Supports both sequential and parallel batch inference for improved GPU utilizati
 from typing import List, Optional, Callable, Any, Dict
 from pathlib import Path
 import time
+import torch
 from ...utils.logger import get_logger_conf, LoggingProgress, DualProgressTracker
 from ...core.types import GenerationResult
 from ..hyperparameters import HyperparameterConfig
 from .base import LLMBackend
+from .dynamic_batch import DynamicBatchManager
 
 logger = get_logger_conf(__name__)
 
 
 class BatchProcessor:
-    """Processes multiple text chunks through an LLM backend."""
+    """Processes multiple text chunks through an LLM backend with dynamic batching."""
 
-    def __init__(self, backend: LLMBackend, batch_size: int = 1):
+    def __init__(
+        self,
+        backend: LLMBackend,
+        batch_size: int = 1,
+        enable_dynamic_batching: bool = True,
+        max_batch_size: int = 8
+    ):
         """
         Initialize batch processor.
 
         Args:
             backend: The LLM backend to use for processing.
-            batch_size: Number of chunks to process in parallel (default: 1 for sequential).
-                       Set to > 1 for true batch inference when backend supports it.
+            batch_size: Initial batch size (default: 1 for sequential).
+            enable_dynamic_batching: Enable dynamic batch size adjustment.
+            max_batch_size: Maximum batch size for dynamic adjustment.
         """
         self.backend = backend
-        self.batch_size = batch_size
+        self.base_batch_size = batch_size
         self.logger = get_logger_conf(f"{__name__}.BatchProcessor")
 
+        # Initialize dynamic batch manager
+        self.dynamic_batch_mgr = DynamicBatchManager(
+            initial_batch_size=batch_size,
+            min_batch_size=1,
+            max_batch_size=max_batch_size,
+            enable_dynamic=enable_dynamic_batching
+        )
+
         if batch_size > 1:
-            self.logger.info(f"Batch inference enabled with batch_size={batch_size}")
+            self.logger.info(
+                f"Batch inference enabled: initial_size={batch_size}, "
+                f"dynamic={'enabled' if enable_dynamic_batching else 'disabled'}, "
+                f"max_size={max_batch_size}"
+            )
 
     def process_batch(
         self,
@@ -46,6 +67,7 @@ class BatchProcessor:
         resume_from_chunk: Optional[int] = None,
         resume_results: Optional[List[GenerationResult]] = None,
         dual_tracker: Optional[DualProgressTracker] = None,
+        progress_manager: Optional[object] = None,  # ProgressManager instance
         **kwargs
     ) -> List[GenerationResult]:
         """
@@ -72,6 +94,9 @@ class BatchProcessor:
             return []
 
         self.logger.info(f"Processing batch of {len(texts)} chunks...")
+
+        # Add remove_thinking to kwargs for backend processing
+        kwargs['remove_thinking'] = remove_thinking
 
         # Determine starting point
         start_index = resume_from_chunk if resume_from_chunk is not None else 0
@@ -109,14 +134,19 @@ class BatchProcessor:
                 for _ in range(start_index):
                     progress.update(1)
 
-            # Process in batches for improved GPU utilization
-            for batch_start in range(start_index, len(texts), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(texts))
+            # Process in batches with dynamic batch sizing
+            batch_start = start_index
+            while batch_start < len(texts):
+                # Get dynamic batch size
+                items_remaining = len(texts) - batch_start
+                current_batch_size = self.dynamic_batch_mgr.get_batch_size(items_remaining)
+                batch_end = min(batch_start + current_batch_size, len(texts))
                 batch_texts = texts[batch_start:batch_end]
 
                 # Try true batch inference if backend supports it
-                if self.batch_size > 1 and hasattr(self.backend, '_generate_batch_request'):
+                if current_batch_size > 1 and hasattr(self.backend, '_generate_batch_request'):
                     try:
+                        self.logger.debug(f"Processing batch [{batch_start}:{batch_end}] with dynamic_batch_size={current_batch_size}")
                         # Build prompts for batch processing
                         if hasattr(self.backend, 'tokenizer') and hasattr(self.backend.tokenizer, 'chat_template'):
                             # Use chat template for all prompts in batch
@@ -150,25 +180,53 @@ class BatchProcessor:
                             results.append(result)
                             progress.update(1)
 
+                            # Update rich progress manager if provided (per-chunk updates)
+                            if progress_manager and hasattr(progress_manager, 'update_stage'):
+                                progress_manager.update_stage("process", len(results))
+
+                        # Record success for dynamic batch manager
+                        peak_memory = 0
+                        if torch.cuda.is_available():
+                            peak_memory = torch.cuda.max_memory_allocated(0) / (1024 ** 2)  # MB
+                        self.dynamic_batch_mgr.record_success(current_batch_size, peak_memory)
+
+                    except torch.cuda.OutOfMemoryError as oom_error:
+                        # Record OOM and retry with smaller batch
+                        self.logger.error(f"OOM at batch_size={current_batch_size}: {oom_error}")
+                        self.dynamic_batch_mgr.record_oom(current_batch_size)
+
+                        # Clear cache and retry
+                        torch.cuda.empty_cache()
+                        self.logger.warning("Retrying batch with reduced size...")
+
+                        # Skip this batch iteration and let the next iteration use smaller batch size
+                        continue
+
                     except Exception as batch_error:
                         # Fallback to sequential processing if batch fails
                         self.logger.warning(f"Batch processing failed: {batch_error}. Falling back to sequential.")
                         batch_results = self._process_batch_sequential(
                             batch_texts, batch_start, system_prompt, hyperparams,
-                            results, progress, **kwargs
+                            results, progress, progress_manager=progress_manager, **kwargs
                         )
+                        # Record successful sequential processing
+                        self.dynamic_batch_mgr.record_success(len(batch_texts))
                 else:
                     # Sequential processing (batch_size=1 or backend doesn't support batching)
                     batch_results = self._process_batch_sequential(
                         batch_texts, batch_start, system_prompt, hyperparams,
-                        results, progress, **kwargs
+                        results, progress, progress_manager=progress_manager, **kwargs
                     )
+                    self.dynamic_batch_mgr.record_success(len(batch_texts))
 
                 # Save checkpoint after each batch if callback provided
                 if checkpoint_callback and checkpoint_interval > 0:
                     if (batch_end) % checkpoint_interval == 0 or batch_end == len(texts):
                         self.logger.debug(f"Saving checkpoint at chunk {batch_end}/{len(texts)}")
                         checkpoint_callback(batch_end, results, {"system_prompt": system_prompt})
+
+                # Move to next batch
+                batch_start = batch_end
 
         self.logger.info(f"Batch processing complete: {len(results)} results")
         return results
@@ -181,6 +239,7 @@ class BatchProcessor:
         hyperparams: HyperparameterConfig,
         results: List[GenerationResult],
         progress: LoggingProgress,
+        progress_manager: Optional[object] = None,
         **kwargs
     ) -> List[GenerationResult]:
         """
@@ -222,6 +281,10 @@ class BatchProcessor:
                 batch_results.append(result)
                 results.append(result)
                 progress.update(1)
+
+                # Update rich progress manager if provided
+                if progress_manager and hasattr(progress_manager, 'update_stage'):
+                    progress_manager.update_stage("process", len(results))
 
             except Exception as e:
                 self.logger.error(f"Error processing chunk {i+1}: {e}", exc_info=True)

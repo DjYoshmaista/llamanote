@@ -9,7 +9,8 @@ paths, memory profiles, hyperparameter presets, and API keys.
 from .settings import (
     BASE_DIR, DEFAULT_OUTPUT_DIR as OUTPUT_DIR, DEFAULT_LOG_DIR as LOG_DIR, DEFAULT_CACHE_DIR as CACHE_DIR,
     DEFAULT_OFFLOAD_DIR as OFFLOAD_DIR, DEFAULT_MODEL_KEY, FALLBACK_MODEL_KEY, SUPPORTED_FORMATS,
-    DEFAULT_PIPELINE_STAGES, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT
+    DEFAULT_PIPELINE_STAGES, PREPROCESS_PROMPT_PODCAST, DEFAULT_SYSTEM_PROMPT,
+    PODCAST_PLANNING_PROMPT, PODCAST_GENERATION_PROMPT
 )
 from .manager import ConfigManager
 from .profiles import MemoryProfile, get_memory_profile, create_configs_from_memory_profile
@@ -29,7 +30,9 @@ __all__ = [
     "DEFAULT_PIPELINE_STAGES",
     "PREPROCESS_PROMPT_PODCAST",
     "DEFAULT_SYSTEM_PROMPT",
-    
+    "PODCAST_PLANNING_PROMPT",
+    "PODCAST_GENERATION_PROMPT",
+
     # manager.py exports
     "ConfigManager",
     

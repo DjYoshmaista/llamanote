@@ -33,6 +33,13 @@ Run powerful, multi-billion parameter models on consumer hardware with as little
 
 For more details, see the [GPU Optimization Guide](./documentation/GPU_OPTIMIZATION_GUIDE.md).
 
+## Documentation
+
+- **[Architecture Guide](./documentation/ARCHITECTURE.md)** - Comprehensive codebase architecture, module structure, and code reuse opportunities
+- **[Chat Template Guide](./documentation/CHAT_TEMPLATE_GUIDE.md)** - Chat template management system for batch processing
+- **[Speaker Embedding Guide](./documentation/SPEAKER_EMBEDDING_GUIDE.md)** - Multi-speaker TTS system documentation
+- **[GPU Optimization Guide](./documentation/GPU_OPTIMIZATION_GUIDE.md)** - Advanced GPU memory management
+
 ## Getting Started
 
 1.  **Create a Virtual Environment**: Use your preferred tool (conda, venv, etc.).

@@ -1202,9 +1202,6 @@ class MenuSystem:
             print(f"  KV-Cache Device:         {lsc.kv_cache_device.upper()}")
             print(f"  Context Device:          {lsc.context_device.upper()}")
             print(f"  Show Memory Projection:  {'YES' if lsc.show_memory_projection else 'NO'}")
-            print(f"  Advanced Cache System:   {'ENABLED' if lsc.use_advanced_cache else 'DISABLED'}")
-            print(f"  Cache Strategy:          {lsc.cache_strategy.upper()}")
-            print(f"  Generation Hooks:        {'ENABLED' if lsc.enable_generation_hooks else 'DISABLED'}")
             print(f"  Disk Offloading:         {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
             print(f"  Cache Clearing (Audio):  {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
             print(f"  Low CPU Mem Mode:        {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
@@ -1219,13 +1216,10 @@ class MenuSystem:
             print("  6. Set KV-Cache Device (auto/cpu/gpu)")
             print("  7. Set Context Device (auto/cpu/gpu)")
             print("  8. Toggle Memory Projection Display")
-            print("  9. Toggle Advanced Cache System (Hot/Cold + Sliding Window)")
-            print(" 10. Set Cache Strategy (aggressive/balanced/quality)")
-            print(" 11. Toggle Generation Hooks")
-            print(" 12. Toggle Disk Offloading")
-            print(" 13. Toggle Cache Clearing Between Audio Chunks")
-            print(" 14. Toggle Low CPU Memory Mode")
-            print(" 15. Reset to Recommended Defaults (4GB VRAM + 28GB RAM)")
+            print("  9. Toggle Disk Offloading")
+            print(" 10. Toggle Cache Clearing Between Audio Chunks")
+            print(" 11. Toggle Low CPU Memory Mode")
+            print(" 12. Reset to Recommended Defaults (4GB VRAM + 28GB RAM)")
             print("\n  b. Back to Model Settings")
             print("-" * 70)
 
@@ -1303,54 +1297,20 @@ class MenuSystem:
                         ConsoleOutput.info("Will show estimated memory usage before loading models")
 
                 elif choice == '9':
-                    lsc.use_advanced_cache = not lsc.use_advanced_cache
-                    ConsoleOutput.success(f"Advanced Cache System {'ENABLED' if lsc.use_advanced_cache else 'DISABLED'}")
-                    if lsc.use_advanced_cache:
-                        ConsoleOutput.info("Advanced cache integrates hot/cold KV-cache + sliding window attention")
-                        ConsoleOutput.info(f"Current strategy: {lsc.cache_strategy.upper()}")
-                        ConsoleOutput.info("Compatible with: LLaMA, Qwen, DeepSeek, Gemma, GPT-NeoX")
-                    else:
-                        ConsoleOutput.warning("Disabling advanced cache - will use standard generation")
-
-                elif choice == '10':
-                    print("\nCache Strategy Options:")
-                    print("  aggressive - Smallest windows, maximum memory savings (may impact quality)")
-                    print("  balanced   - Moderate windows, good balance (RECOMMENDED)")
-                    print("  quality    - Large windows, prioritize quality over memory")
-                    val = input(f"Select strategy (aggressive/balanced/quality) [current: {lsc.cache_strategy}]: ").strip().lower()
-                    if val in ['aggressive', 'balanced', 'quality']:
-                        lsc.cache_strategy = val
-                        ConsoleOutput.success(f"Cache Strategy set to {val.upper()}")
-                        if val == 'aggressive':
-                            ConsoleOutput.info("Window: 1024 tokens | Prefix: 64 | Hot cache: 256MB")
-                        elif val == 'balanced':
-                            ConsoleOutput.info("Window: 2048 tokens | Prefix: 128 | Hot cache: 512MB")
-                        else:  # quality
-                            ConsoleOutput.info("Window: 4096 tokens | Prefix: 256 | Hot cache: 1024MB")
-                    elif val:
-                        ConsoleOutput.warning("Invalid choice. Use aggressive, balanced, or quality.")
-
-                elif choice == '11':
-                    lsc.enable_generation_hooks = not lsc.enable_generation_hooks
-                    ConsoleOutput.success(f"Generation Hooks {'ENABLED' if lsc.enable_generation_hooks else 'DISABLED'}")
-                    if lsc.enable_generation_hooks:
-                        ConsoleOutput.info("Hooks allow custom logic at various generation stages")
-
-                elif choice == '12':
                     ac.enable_disk_offload = not ac.enable_disk_offload
                     ConsoleOutput.success(f"Disk Offloading {'ENABLED' if ac.enable_disk_offload else 'DISABLED'}")
                     if ac.enable_disk_offload:
                         ConsoleOutput.warning("Disk offloading is SLOW but saves RAM. Only use if necessary.")
 
-                elif choice == '13':
+                elif choice == '10':
                     ac.clear_cache_between_chunks = not ac.clear_cache_between_chunks
                     ConsoleOutput.success(f"Cache Clearing {'ENABLED' if ac.clear_cache_between_chunks else 'DISABLED'}")
 
-                elif choice == '14':
+                elif choice == '11':
                     lsc.low_cpu_mem_usage = not lsc.low_cpu_mem_usage
                     ConsoleOutput.success(f"Low CPU Memory Mode {'ENABLED' if lsc.low_cpu_mem_usage else 'DISABLED'}")
 
-                elif choice == '15':
+                elif choice == '12':
                     # Reset to recommended defaults
                     lsc.enabled = True
                     lsc.auto_oom_handling = True
@@ -1360,9 +1320,6 @@ class MenuSystem:
                     lsc.kv_cache_device = "auto"
                     lsc.context_device = "auto"
                     lsc.show_memory_projection = True
-                    lsc.use_advanced_cache = True  # NEW: Enable advanced cache by default
-                    lsc.cache_strategy = "balanced"  # NEW: Use balanced strategy by default
-                    lsc.enable_generation_hooks = True  # NEW: Enable hooks by default
                     lsc.low_cpu_mem_usage = True
                     lsc.offload_state_dict = True
                     ac.enable_disk_offload = False
@@ -1370,7 +1327,6 @@ class MenuSystem:
                     ac.quantization = "4bit"
                     ac.enable_cpu_offload = True
                     ConsoleOutput.success("Reset to recommended defaults for 4GB VRAM + 32GB RAM system")
-                    ConsoleOutput.info("Advanced cache system enabled with balanced strategy")
 
                 else:
                     ConsoleOutput.warning("Invalid selection.")

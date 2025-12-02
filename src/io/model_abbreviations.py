@@ -157,15 +157,16 @@ class ModelAbbreviationManager:
         prefixes = [
             'meta-llama/', 'microsoft/', 'Qwen/', 'deepseek-ai/', 'google/',
             'mistralai/', 'facebook/', 'suno/', 'coqui/', 'huggingface/',
-            'openai/', 'anthropic/', 'EleutherAI/'
+            'openai/', 'anthropic/', 'EleutherAI/', 'TinyLlama/'
         ]
         for prefix in prefixes:
             if name.startswith(prefix):
                 name = name[len(prefix):]
                 break
 
-        # Replace hyphens and dots with underscores
-        name = name.replace('-', '_').replace('.', '_')
+        # Replace hyphens, dots, and forward slashes with underscores
+        # IMPORTANT: Forward slashes would create directory paths in filenames
+        name = name.replace('-', '_').replace('.', '_').replace('/', '_')
 
         # Remove common suffixes (case-insensitive)
         suffixes = ['_Instruct', '_Chat', '_Base', '_v0_1', '_v0_2', '_v1', '_v2', '_tts', '_stt']

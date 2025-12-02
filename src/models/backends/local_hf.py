@@ -283,6 +283,25 @@ class LocalModelLoader:
                 logger.error(f"Failed to load tokenizer for {self.model_id}: {e}", exc_info=True)
                 raise ModelLoadError(f"Failed to load tokenizer: {e}", self.model_id) from e
 
+            # --- Apply Chat Template if Missing ---
+            try:
+                from ...utils.chat_template_manager import ChatTemplateManager
+                template_manager = ChatTemplateManager()
+
+                # Check if tokenizer needs a template
+                if not hasattr(tokenizer, 'chat_template') or not tokenizer.chat_template:
+                    logger.info(f"Tokenizer for {self.model_id} has no chat template, applying automatic template...")
+                    template_applied = template_manager.apply_template(tokenizer, model_name=self.model_id)
+                    if template_applied:
+                        logger.info(f"✅ Applied chat template for {self.model_id}")
+                    else:
+                        logger.warning(f"Failed to apply chat template for {self.model_id}")
+                else:
+                    logger.debug(f"Tokenizer already has chat template, skipping template application")
+
+            except Exception as e:
+                logger.warning(f"Could not apply chat template (non-critical): {e}")
+
             # --- Load Model with OOM Handling ---
             if self.device_manager.is_cuda_available():
                 log_memory_summary("before model loading", logger)

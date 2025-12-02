@@ -161,8 +161,10 @@ class ProcessingPipeline:
 
     def _save_checkpoint(self, input_path: Path, stage: str, data_payload: Dict[str, Any]):
         """Save a checkpoint for the current stage."""
+        self.logger.debug(f"=== _save_checkpoint ENTRY: stage={stage} ===")
         if self.config.enable_checkpoints and self.checkpoint_manager:
             try:
+                self.logger.debug(f"=== _save_checkpoint: Calling checkpoint_manager.save ===")
                 self.checkpoint_manager.save(
                     input_path,
                     self.config,
@@ -170,8 +172,12 @@ class ProcessingPipeline:
                     data_payload,
                     config_uuid=self.config_uuid  # Link checkpoint to configuration
                 )
+                self.logger.debug(f"=== _save_checkpoint: checkpoint_manager.save returned ===")
             except Exception as e:
                 self.logger.warning(f"Failed to save checkpoint for stage '{stage}': {e}")
+        else:
+            self.logger.debug(f"=== _save_checkpoint: Checkpoints disabled or no checkpoint manager ===")
+        self.logger.debug(f"=== _save_checkpoint EXIT: stage={stage} ===")
 
     def _update_pipeline_progress(self, progress_manager: 'ProgressManager', completed_stages: List[str], current_stage: Optional[str] = None, stage_progress: float = 0.0):
         """
@@ -193,6 +199,37 @@ class ProcessingPipeline:
 
         # Update pipeline progress
         progress_manager.update_pipeline(completed_weight)
+
+    def _complete_stage(self, progress_manager: 'ProgressManager', stage_name: str):
+        """
+        Mark a stage as complete and update progress.
+
+        Args:
+            progress_manager: The ProgressManager instance
+            stage_name: Name of the completed stage
+        """
+        self.logger.debug(f"=== _complete_stage ENTRY: stage={stage_name} ===")
+        # Add to completed stages first
+        if stage_name not in self.stages_completed:
+            self.logger.debug(f"=== _complete_stage: Adding {stage_name} to stages_completed ===")
+            self.stages_completed.append(stage_name)
+        else:
+            self.logger.debug(f"=== _complete_stage: {stage_name} already in stages_completed ===")
+
+        # Remove the stage progress bar if it exists
+        self.logger.debug(f"=== _complete_stage: Checking if {stage_name} in progress_manager.stage_tasks ===")
+        if stage_name in progress_manager.stage_tasks:
+            self.logger.debug(f"=== _complete_stage: Removing stage progress bar for {stage_name} ===")
+            progress_manager.remove_stage(stage_name)
+            self.logger.debug(f"=== _complete_stage: Stage progress bar removed ===")
+
+        # Update pipeline progress
+        self.logger.debug(f"=== _complete_stage: Calling _update_pipeline_progress ===")
+        self._update_pipeline_progress(progress_manager, self.stages_completed)
+        self.logger.debug(f"=== _complete_stage: _update_pipeline_progress returned ===")
+
+        self.logger.debug(f"Completed stage: {stage_name}")
+        self.logger.debug(f"=== _complete_stage EXIT: stage={stage_name} ===")
 
     @log_execution_time(logger_name=__name__)
     def process_file(self,
@@ -235,7 +272,9 @@ class ProcessingPipeline:
         progress_manager.add_pipeline_progress()
 
         # Keep dual_tracker for backward compatibility with existing code
+        # BUT: Disable its display to avoid console conflicts with Rich Live display
         dual_tracker = DualProgressTracker(logger=self.logger)
+        dual_tracker.enabled = False  # CRITICAL: Disable to prevent console conflicts
         total_stages = len(self.stages_to_run)
         dual_tracker.set_overall_progress(0, total_stages)
 
@@ -342,6 +381,7 @@ class ProcessingPipeline:
                             data_payload['metadata'] = extract_result.metadata
                             data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
                             self._save_checkpoint(input_path, "extract", data_payload)
+                            self._complete_stage(progress_manager, "extract")
                     except ValueError:
                         # resume_from_stage not in stage_order, run normally
                         extract_result: Optional[ExtractionResult]
@@ -366,6 +406,7 @@ class ProcessingPipeline:
                         data_payload['metadata'] = extract_result.metadata
                         data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
                         self._save_checkpoint(input_path, "extract", data_payload)
+                        self._complete_stage(progress_manager, "extract")
                 else:
                     # No resume, run normally
                     extract_result: Optional[ExtractionResult]
@@ -390,6 +431,7 @@ class ProcessingPipeline:
                     data_payload['metadata'] = extract_result.metadata
                     data_payload['stats_extraction'] = {"chars": extract_result.char_count, "pages": extract_result.metadata.num_pages if extract_result.metadata else 1}
                     self._save_checkpoint(input_path, "extract", data_payload)
+                    self._complete_stage(progress_manager, "extract")
 
             # --- Stage 2: Preprocess ---
             if "preprocess" in self.stages_to_run and "preprocess" not in skip_stages:
@@ -417,6 +459,7 @@ class ProcessingPipeline:
                             data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
                             data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
                             self._save_checkpoint(input_path, "preprocess", data_payload)
+                            self._complete_stage(progress_manager, "preprocess")
                     except ValueError:
                         # resume_from_stage not in stage_order, run normally
                         def run_preprocess():
@@ -430,6 +473,7 @@ class ProcessingPipeline:
                         data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
                         data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
                         self._save_checkpoint(input_path, "preprocess", data_payload)
+                        self._complete_stage(progress_manager, "preprocess")
                 else:
                     # No resume, run normally
                     def run_preprocess():
@@ -442,57 +486,126 @@ class ProcessingPipeline:
 
                     data_payload['text'] = self.stage_executor.execute("preprocess", run_preprocess, data_payload, ['text'])
                     data_payload['stats_preprocess'] = {"chars": len(data_payload['text'])}
+                    self.logger.info("About to save preprocess checkpoint...")
                     self._save_checkpoint(input_path, "preprocess", data_payload)
+                    self.logger.info("Preprocess checkpoint saved, calling _complete_stage...")
+                    self._complete_stage(progress_manager, "preprocess")
+                    self.logger.info("_complete_stage returned for preprocess")
+
+            self.logger.debug("=== CHECKPOINT 1: After preprocess stage block ===")
+            self.logger.info(f"Current stages_to_run: {self.stages_to_run}")
+            self.logger.info(f"Current skip_stages: {skip_stages}")
+            self.logger.info(f"Checking chunk stage: 'chunk' in stages_to_run = {'chunk' in self.stages_to_run}")
+            self.logger.info(f"Checking chunk stage: 'chunk' not in skip_stages = {'chunk' not in skip_stages}")
 
             # --- Stage 3: Chunk ---
+            self.logger.debug("=== CHECKPOINT 2: About to check chunk stage condition ===")
             if "chunk" in self.stages_to_run and "chunk" not in skip_stages:
+                self.logger.debug("=== CHECKPOINT 3: Entered chunk stage block ===")
+                self.logger.debug("=== CHECKPOINT 4: Incrementing stage counter ===")
                 current_stage_num += 1
+                self.logger.info(f"Current stage num: {current_stage_num}/{len(self.stages_to_run)}")
+
+                self.logger.debug("=== CHECKPOINT 5: Calling dual_tracker.set_overall_progress ===")
                 dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
+                self.logger.debug("=== CHECKPOINT 6: dual_tracker.set_overall_progress returned ===")
 
                 # Check if chunks already exist from checkpoint (resume case)
+                self.logger.debug("=== CHECKPOINT 7: Checking resume condition ===")
+                self.logger.info(f"'chunks' in data_payload: {'chunks' in data_payload}")
+                self.logger.info(f"resume_from_stage: {resume_from_stage}")
                 if 'chunks' in data_payload and resume_from_stage:
+                    self.logger.debug("=== CHECKPOINT 8: Entered resume condition block ===")
                     try:
+                        self.logger.debug("=== CHECKPOINT 9: Inside resume try block ===")
                         resume_idx = stage_order.index(resume_from_stage)
                         chunk_idx = stage_order.index("chunk")
+                        self.logger.info(f"resume_idx={resume_idx}, chunk_idx={chunk_idx}")
                         if chunk_idx < resume_idx:
+                            self.logger.debug("=== CHECKPOINT 10: Chunk already completed, skipping ===")
                             self.logger.info("Chunk stage already completed from checkpoint, using existing data")
                         else:
+                            self.logger.debug("=== CHECKPOINT 11: Running chunk stage ===")
                             def run_chunk():
+                                self.logger.debug("=== CHECKPOINT 11a: Inside run_chunk function ===")
                                 if 'text' not in data_payload: raise MissingDataError("chunk", "text")
-                                return self.text_chunker.chunk_text(data_payload['text'])
+                                self.logger.debug(f"=== CHECKPOINT 11b: Calling text_chunker.chunk_text (text length: {len(data_payload['text'])}) ===")
+                                result = self.text_chunker.chunk_text(data_payload['text'])
+                                self.logger.debug(f"=== CHECKPOINT 11c: chunk_text returned {len(result.chunks) if result else 'None'} chunks ===")
+                                return result
 
+                            self.logger.debug("=== CHECKPOINT 12: Calling stage_executor.execute ===")
                             chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                            self.logger.debug(f"=== CHECKPOINT 13: stage_executor.execute returned ===")
                             data_payload['chunks'] = [c.text for c in chunk_result.chunks]
                             data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                            self.logger.debug("=== CHECKPOINT 14: Saving chunk checkpoint ===")
                             self._save_checkpoint(input_path, "chunk", data_payload)
-                    except ValueError:
+                            self.logger.debug("=== CHECKPOINT 15: Completing chunk stage ===")
+                            self._complete_stage(progress_manager, "chunk")
+                            self.logger.debug("=== CHECKPOINT 16: Chunk stage completed ===")
+                    except ValueError as ve:
+                        self.logger.debug(f"=== CHECKPOINT 17: ValueError in resume block: {ve} ===")
                         def run_chunk():
+                            self.logger.debug("=== CHECKPOINT 17a: Inside run_chunk (ValueError path) ===")
                             if 'text' not in data_payload: raise MissingDataError("chunk", "text")
-                            return self.text_chunker.chunk_text(data_payload['text'])
+                            self.logger.debug(f"=== CHECKPOINT 17b: Calling text_chunker.chunk_text ===")
+                            result = self.text_chunker.chunk_text(data_payload['text'])
+                            self.logger.debug(f"=== CHECKPOINT 17c: chunk_text returned ===")
+                            return result
 
+                        self.logger.debug("=== CHECKPOINT 18: Calling stage_executor.execute (ValueError path) ===")
                         chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                        self.logger.debug("=== CHECKPOINT 19: stage_executor.execute returned (ValueError path) ===")
                         data_payload['chunks'] = [c.text for c in chunk_result.chunks]
                         data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                        self.logger.debug("=== CHECKPOINT 20: Saving chunk checkpoint (ValueError path) ===")
                         self._save_checkpoint(input_path, "chunk", data_payload)
+                        self.logger.debug("=== CHECKPOINT 21: Completing chunk stage (ValueError path) ===")
+                        self._complete_stage(progress_manager, "chunk")
+                        self.logger.debug("=== CHECKPOINT 22: Chunk stage completed (ValueError path) ===")
                 else:
+                    self.logger.debug("=== CHECKPOINT 23: No resume, running chunk normally ===")
                     def run_chunk():
+                        self.logger.debug("=== CHECKPOINT 23a: Inside run_chunk (normal path) ===")
                         if 'text' not in data_payload: raise MissingDataError("chunk", "text")
-                        return self.text_chunker.chunk_text(data_payload['text'])
+                        self.logger.debug(f"=== CHECKPOINT 23b: Calling text_chunker.chunk_text ===")
+                        result = self.text_chunker.chunk_text(data_payload['text'])
+                        self.logger.debug(f"=== CHECKPOINT 23c: chunk_text returned ===")
+                        return result
 
+                    self.logger.debug("=== CHECKPOINT 24: Calling stage_executor.execute (normal path) ===")
                     chunk_result = self.stage_executor.execute("chunk", run_chunk, data_payload, ['text'])
+                    self.logger.debug("=== CHECKPOINT 25: stage_executor.execute returned (normal path) ===")
                     data_payload['chunks'] = [c.text for c in chunk_result.chunks]
                     data_payload['stats_chunk'] = {"count": chunk_result.total_chunks, "avg_size": chunk_result.average_chunk_size}
+                    self.logger.debug("=== CHECKPOINT 26: Saving chunk checkpoint (normal path) ===")
                     self._save_checkpoint(input_path, "chunk", data_payload)
+                    self.logger.debug("=== CHECKPOINT 27: Completing chunk stage (normal path) ===")
+                    self._complete_stage(progress_manager, "chunk")
+                    self.logger.debug("=== CHECKPOINT 28: Chunk stage completed (normal path) ===")
+
+            self.logger.debug("=== CHECKPOINT 29: After chunk stage block ===")
 
             # --- Stage 4: Process ---
+            self.logger.debug("=== CHECKPOINT 30: About to check process stage condition ===")
+            self.logger.info(f"'process' in stages_to_run: {'process' in self.stages_to_run}")
+            self.logger.info(f"'process' not in skip_stages: {'process' not in skip_stages}")
             if "process" in self.stages_to_run and "process" not in skip_stages:
+                 self.logger.debug("=== CHECKPOINT 31: Entered process stage block ===")
                  # Handle model lifecycle before stage
+                 self.logger.debug("=== CHECKPOINT 32: Checking lifecycle manager ===")
                  if self.lifecycle_manager:
+                     self.logger.debug("=== CHECKPOINT 33: Calling lifecycle_manager.handle_stage_transition ===")
                      self.lifecycle_manager.handle_stage_transition("process")
+                     self.logger.debug("=== CHECKPOINT 34: lifecycle_manager.handle_stage_transition returned ===")
 
                  # Update overall progress
+                 self.logger.debug("=== CHECKPOINT 35: Incrementing process stage counter ===")
                  current_stage_num += 1
+                 self.logger.debug("=== CHECKPOINT 36: Calling dual_tracker.set_overall_progress ===")
                  dual_tracker.set_overall_progress(current_stage_num, len(self.stages_to_run))
+                 self.logger.debug("=== CHECKPOINT 37: dual_tracker.set_overall_progress returned ===")
 
                  # Check if chunking was skipped
                  if 'chunks' not in data_payload:
@@ -536,13 +649,54 @@ class ProcessingPipeline:
                      from ..models.backends.batch import BatchProcessor # Local import
                      batch_processor = BatchProcessor(
                          backend=self.llm_backend,
-                         batch_size=self.config.batch_size
+                         batch_size=self.config.batch_size,
+                         enable_dynamic_batching=self.config.enable_dynamic_batching,
+                         max_batch_size=self.config.max_batch_size
                      )
 
-                     # Use the podcast generation prompt for process stage, not the preprocessing prompt!
-                     if self.config.mode == ProcessingMode.PODCAST:
-                         from ..config.settings import PODCAST_GENERATION_PROMPT
-                         system_prompt = self.config.system_prompt or PODCAST_GENERATION_PROMPT
+                     # For podcast mode, use two-stage generation: planning then dialogue
+                     use_two_stage_podcast = (self.config.mode == ProcessingMode.PODCAST)
+
+                     if use_two_stage_podcast:
+                         from ..config.settings import PODCAST_PLANNING_PROMPT, PODCAST_GENERATION_PROMPT
+                         # Stage 1: Create outline for each chunk using BATCHING
+                         self.logger.info(f"Podcast mode: Creating outlines for {len(data_payload['chunks'])} chunks (batch_size={self.config.batch_size})...")
+
+                         # Process outlines in batches
+                         outlines = []
+                         for batch_start in range(0, len(data_payload['chunks']), self.config.batch_size):
+                             batch_end = min(batch_start + self.config.batch_size, len(data_payload['chunks']))
+                             batch_chunks = data_payload['chunks'][batch_start:batch_end]
+
+                             # Check if backend supports batch generation
+                             if self.config.batch_size > 1 and hasattr(self.llm_backend, '_generate_batch_request'):
+                                 # Batch processing
+                                 self.logger.info(f"Generating outlines for batch {batch_start}-{batch_end} (batch mode)")
+                                 batch_results = self.llm_backend._generate_batch_request(
+                                     prompts=batch_chunks,
+                                     system_prompt=PODCAST_PLANNING_PROMPT,
+                                     hyperparams=self.config.get_hyperparameters()
+                                 )
+                                 for result in batch_results:
+                                     outline_text = result.filtered_output if result.filtered_output else result.raw_output
+                                     outlines.append(outline_text)
+                             else:
+                                 # Sequential fallback
+                                 self.logger.info(f"Generating outlines for chunks {batch_start}-{batch_end} (sequential mode)")
+                                 for chunk_text in batch_chunks:
+                                     outline_result = self.llm_backend.process_with_chat_template(
+                                         system_prompt=PODCAST_PLANNING_PROMPT,
+                                         user_message=chunk_text,
+                                         hyperparams=self.config.get_hyperparameters()
+                                     )
+                                     outline_text = outline_result.filtered_output if outline_result.filtered_output else outline_result.raw_output
+                                     outlines.append(outline_text)
+
+                             self.logger.info(f"Created {len(outlines)} outlines so far...")
+
+                         # Store outlines for use in generation
+                         data_payload['podcast_outlines'] = outlines
+                         system_prompt = PODCAST_GENERATION_PROMPT
                      else:
                          system_prompt = self.config.system_prompt or DEFAULT_SYSTEM_PROMPT
 
@@ -550,13 +704,17 @@ class ProcessingPipeline:
                      total_chunks = len(data_payload['chunks'])
                      dual_tracker.set_stage_progress(0, total_chunks, "Processing chunks")
 
+                     # Add rich progress bar for process stage
+                     progress_manager.add_stage_progress("process", total_chunks)
+
                      # Define checkpoint callback (optimized to avoid full payload copy)
                      def save_process_checkpoint(chunk_idx, results, extra_data, **kwargs):
                          # Only copy essential data for checkpoint (avoid copying entire payload)
                          checkpoint_data = {
                              'input_path': data_payload['input_path'],
                              'chunks': data_payload['chunks'],
-                             'process_checkpoint_index': chunk_idx
+                             'process_checkpoint_index': chunk_idx,
+                             'completed_stages': self.stages_completed.copy()  # Add completed stages for progress calculation
                          }
 
                          # Add optional data if present
@@ -570,8 +728,25 @@ class ProcessingPipeline:
                                             for i, r in enumerate(results)]
                          checkpoint_data['processed_chunks'] = processed_so_far
 
+                         # Calculate completion percentage for notification display
+                         total_chunks = len(data_payload['chunks'])
+                         completion_pct = None
                          try:
-                             self.checkpoint_manager.save(
+                             from ..config.settings import DEFAULT_STAGE_WEIGHTS
+                             completion_pct = self.checkpoint_manager.calculate_pipeline_completion(
+                                 current_stage="process",
+                                 current_chunk=chunk_idx,
+                                 total_chunks=total_chunks,
+                                 stage_weights=DEFAULT_STAGE_WEIGHTS,
+                                 completed_stages=self.stages_completed
+                             )
+                             self.logger.debug(f"Calculated completion_pct={completion_pct}% for process checkpoint")
+                         except Exception as e:
+                             self.logger.debug(f"Could not calculate completion percentage: {e}")
+                             completion_pct = None
+
+                         try:
+                             success = self.checkpoint_manager.save(
                                  input_path=input_path,
                                  config=self.config,
                                  stage="process",
@@ -580,21 +755,77 @@ class ProcessingPipeline:
                                  total_chunks=len(data_payload['chunks']),
                                  config_uuid=self.config_uuid
                              )
+
+                             # Display checkpoint notification if save succeeded
+                             if success and progress_manager and hasattr(progress_manager, 'display_checkpoint_info'):
+                                 # Get checkpoint path to extract filename (use calculated completion_pct)
+                                 checkpoint_path = self.checkpoint_manager._get_checkpoint_path(
+                                     input_path, self.config, "process",
+                                     chunk_index=chunk_idx,
+                                     total_chunks=total_chunks,
+                                     completion_pct=completion_pct  # Use the completion_pct we calculated above
+                                 )
+
+                                 # Get file size
+                                 import os
+                                 if checkpoint_path.exists():
+                                     compressed_size = checkpoint_path.stat().st_size
+                                     compressed_size_mb = compressed_size / (1024 * 1024)
+
+                                     # Estimate uncompressed size (roughly 1.7x compressed)
+                                     uncompressed_size_mb = compressed_size_mb * 1.7 if self.checkpoint_manager.enable_compression else compressed_size_mb
+                                     compression_ratio = compressed_size_mb / uncompressed_size_mb if uncompressed_size_mb > 0 else 1.0
+
+                                     # Get timestamp
+                                     from datetime import datetime
+                                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                                     # Display notification
+                                     progress_manager.display_checkpoint_info({
+                                         'filename': checkpoint_path.name,
+                                         'chunk_index': chunk_idx,
+                                         'total_chunks': len(data_payload['chunks']),
+                                         'uncompressed_size_mb': uncompressed_size_mb,
+                                         'compressed_size_mb': compressed_size_mb,
+                                         'compression_ratio': compression_ratio,
+                                         'hash': 'N/A',  # Hash calculation not currently implemented
+                                         'timestamp': timestamp
+                                     })
                          except TypeError as e:
                              # Handle case where save method signature doesn't match expected
                              self.logger.warning(f"Failed to save checkpoint: {e}")
 
+                     # Prepare texts for processing
+                     # For podcast mode with outlines, we need to combine outline + content
+                     if use_two_stage_podcast:
+                         # Format each chunk with its outline for the generation stage
+                         # NOTE: Do NOT use labels like "OUTLINE:" or "CONTENT:" as they leak into output
+                         # Instead, structure implicitly: outline first, then content separated by newlines
+                         texts_to_process = []
+                         for i, chunk_text in enumerate(data_payload['chunks']):
+                             outline = outlines[i] if i < len(outlines) else ""
+                             # Format WITHOUT labels - just structure with separation
+                             formatted_text = f"{outline}\n\n---\n\n{chunk_text}"
+                             texts_to_process.append(formatted_text)
+                     else:
+                         texts_to_process = data_payload['chunks']
+
                      # Run batch (sequentially) with checkpointing
+                     # For podcast mode, ALWAYS remove thinking tags (models like DeepSeek-R1 generate them automatically)
+                     # For other modes, let the filter stage handle it based on config
+                     should_remove_thinking = use_two_stage_podcast or self.config.remove_thinking
+
                      results = batch_processor.process_batch(
-                         texts=data_payload['chunks'],
+                         texts=texts_to_process,
                          system_prompt=system_prompt,
                          hyperparams=self.config.get_hyperparameters(),
-                         remove_thinking=False, # Pass remove_thinking=False so we get raw output for filtering stage
+                         remove_thinking=should_remove_thinking,
                          checkpoint_callback=save_process_checkpoint if self.config.enable_checkpoints else None,
                          checkpoint_interval=self.config.checkpoint_interval,
                          resume_from_chunk=resume_from_chunk_process,
                          resume_results=resume_process_results,
-                         dual_tracker=dual_tracker
+                         dual_tracker=dual_tracker,
+                         progress_manager=progress_manager  # Pass progress manager for rich progress bars
                      )
 
                      # Process results, handle errors, and fallback
@@ -625,6 +856,9 @@ class ProcessingPipeline:
 
                  # Save final stage checkpoint (not mid-stage)
                  self._save_checkpoint(input_path, "process", data_payload)
+
+                 # Mark process stage as complete
+                 self._complete_stage(progress_manager, "process")
 
             # --- Stage 5: Filter ---
             if "filter" in self.stages_to_run and "filter" not in skip_stages:
@@ -672,6 +906,7 @@ class ProcessingPipeline:
 
                     # Save checkpoint
                     self._save_checkpoint(input_path, "filter", data_payload)
+                    self._complete_stage(progress_manager, "filter")
 
             # --- Stage 6: Format ---
             if "format" in self.stages_to_run and "format" not in skip_stages:
@@ -697,6 +932,7 @@ class ProcessingPipeline:
 
                 # Save checkpoint
                 self._save_checkpoint(input_path, "format", data_payload)
+                self._complete_stage(progress_manager, "format")
 
             # --- Stage 7: Save ---
             if "save" in self.stages_to_run and "save" not in skip_stages:
@@ -744,6 +980,7 @@ class ProcessingPipeline:
 
                 # Save checkpoint
                 self._save_checkpoint(input_path, "save", data_payload)
+                self._complete_stage(progress_manager, "save")
 
             # --- Stage 8: Audio (Custom, not in default list) ---
             if ("audio" in self.stages_to_run or self.config.generate_audio) and "audio" not in skip_stages: # Check both
@@ -806,11 +1043,13 @@ class ProcessingPipeline:
 
                     # Define checkpoint callback for audio (optimized to avoid full payload copy)
                     def save_audio_checkpoint(chunk_idx, audio_arrays, extra_data, **kwargs):
+                        self.logger.debug(f"Audio checkpoint callback called: chunk_idx={chunk_idx}, audio_arrays len={len(audio_arrays) if audio_arrays else 0}, extra_data keys={list(extra_data.keys()) if extra_data else []}")
                         # Only copy essential data for checkpoint
                         checkpoint_data = {
                             'input_path': data_payload['input_path'],
                             'audio_arrays': audio_arrays,
-                            'audio_checkpoint_index': chunk_idx
+                            'audio_checkpoint_index': chunk_idx,
+                            'completed_stages': self.stages_completed.copy()  # Add completed stages for progress calculation
                         }
 
                         # Add optional text data if present
@@ -824,8 +1063,26 @@ class ProcessingPipeline:
 
                         # Get total chunks from extra_data if available
                         total_audio_chunks = extra_data.get('total_segments', None)
+
+                        # Calculate completion percentage for notification display
+                        completion_pct = None
+                        if total_audio_chunks is not None:
+                            try:
+                                from ..config.settings import DEFAULT_STAGE_WEIGHTS
+                                completion_pct = self.checkpoint_manager.calculate_pipeline_completion(
+                                    current_stage="audio",
+                                    current_chunk=chunk_idx,
+                                    total_chunks=total_audio_chunks,
+                                    stage_weights=DEFAULT_STAGE_WEIGHTS,
+                                    completed_stages=self.stages_completed
+                                )
+                                self.logger.debug(f"Calculated completion_pct={completion_pct}% for audio checkpoint")
+                            except Exception as e:
+                                self.logger.debug(f"Could not calculate completion percentage: {e}")
+                                completion_pct = None
+
                         try:
-                            self.checkpoint_manager.save(
+                            success = self.checkpoint_manager.save(
                                 input_path=input_path,
                                 config=self.config,
                                 stage="audio",
@@ -834,9 +1091,56 @@ class ProcessingPipeline:
                                 total_chunks=total_audio_chunks,
                                 config_uuid=self.config_uuid
                             )
+
+                            # Display checkpoint notification if save succeeded
+                            if success and progress_manager and hasattr(progress_manager, 'display_checkpoint_info'):
+                                # Get checkpoint path to extract filename (use calculated completion_pct)
+                                checkpoint_path = self.checkpoint_manager._get_checkpoint_path(
+                                    input_path, self.config, "audio",
+                                    chunk_index=chunk_idx,
+                                    total_chunks=total_audio_chunks,
+                                    completion_pct=completion_pct  # Use the completion_pct we calculated above
+                                )
+
+                                # Get file size
+                                import os
+                                if checkpoint_path.exists():
+                                    compressed_size = checkpoint_path.stat().st_size
+                                    compressed_size_mb = compressed_size / (1024 * 1024)
+
+                                    # Estimate uncompressed size (roughly 1.7x compressed)
+                                    uncompressed_size_mb = compressed_size_mb * 1.7 if self.checkpoint_manager.enable_compression else compressed_size_mb
+                                    compression_ratio = compressed_size_mb / uncompressed_size_mb if uncompressed_size_mb > 0 else 1.0
+
+                                    # Get timestamp
+                                    from datetime import datetime
+                                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                                    # Display notification
+                                    progress_manager.display_checkpoint_info({
+                                        'filename': checkpoint_path.name,
+                                        'chunk_index': chunk_idx,
+                                        'total_chunks': total_audio_chunks,
+                                        'uncompressed_size_mb': uncompressed_size_mb,
+                                        'compressed_size_mb': compressed_size_mb,
+                                        'compression_ratio': compression_ratio,
+                                        'hash': 'N/A',  # Hash calculation not currently implemented
+                                        'timestamp': timestamp
+                                    })
+
+                            # Update pipeline progress during audio generation
+                            if total_audio_chunks is not None and total_audio_chunks > 0:
+                                stage_progress = chunk_idx / total_audio_chunks  # Progress within audio stage (0.0 to 1.0)
+                                self._update_pipeline_progress(
+                                    progress_manager,
+                                    self.stages_completed,
+                                    current_stage="audio",
+                                    stage_progress=stage_progress
+                                )
+                                self.logger.debug(f"Updated pipeline progress: audio stage {chunk_idx}/{total_audio_chunks} ({stage_progress*100:.1f}%)")
                         except TypeError as e:
                             # Handle case where save method signature doesn't match expected
-                            self.logger.warning(f"Failed to save checkpoint: {e}")
+                            self.logger.error(f"Failed to save checkpoint: {e}", exc_info=True)
 
                     # Generate with checkpointing support
                     audio_result = self.audio_backend.generate_audio(
@@ -859,8 +1163,7 @@ class ProcessingPipeline:
 
                     # Save final stage checkpoint (not mid-stage)
                     self._save_checkpoint(input_path, "audio", data_payload)
-
-                    self.stages_completed.append("audio")
+                    self._complete_stage(progress_manager, "audio")
                     self.memory_monitor.check("after audio generation")
 
             success = True

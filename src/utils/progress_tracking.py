@@ -8,7 +8,7 @@ Supports pipeline-level, stage-level, and batch-level progress bars.
 
 import time
 from typing import Dict, Optional, Any
-from threading import Lock
+from threading import RLock  # Changed from Lock to RLock for reentrant locking
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -65,23 +65,17 @@ class ProgressManager:
             expand=True
         )
 
-        # Layout for progress bars + checkpoint notification
-        self.layout = Layout()
-        self.layout.split_column(
-            Layout(name="notification", size=0),  # Initially hidden
-            Layout(name="progress")
-        )
-
-        # Live display
+        # Live display (don't create layout yet - create on start)
         self.live: Optional[Live] = None
+        self.layout: Optional[Layout] = None
 
         # Task tracking
         self.pipeline_task: Optional[TaskID] = None
         self.stage_tasks: Dict[str, TaskID] = {}
         self.batch_tasks: Dict[int, TaskID] = {}
 
-        # Thread safety
-        self.lock = Lock()
+        # Thread safety - using RLock for reentrant locking
+        self.lock = RLock()
 
         # Checkpoint notification state
         self.checkpoint_info: Optional[Dict[str, Any]] = None
@@ -97,14 +91,14 @@ class ProgressManager:
                 logger.warning("ProgressManager already started")
                 return
 
-            self.layout["progress"].update(self.progress)
+            # Create and start Live display entirely within the lock
             self.live = Live(
-                self.layout,
+                self.progress,
                 console=self.console,
                 refresh_per_second=10,
                 transient=False
             )
-            self.live.start()
+            self.live.start()  # This starts the background refresh thread
             self.is_started = True
             logger.info("Progress tracking started")
 
@@ -113,11 +107,11 @@ class ProgressManager:
         with self.lock:
             if not self.is_started:
                 return
-
+            
             if self.live:
                 self.live.stop()
-                self.live = None
-
+            
+            self.live = None
             self.is_started = False
             logger.info("Progress tracking stopped")
 
@@ -129,20 +123,25 @@ class ProgressManager:
             total_weight: Total weight for the pipeline (sum of all stage weights).
                          If None, uses self.total_weight.
         """
+        # Check state INSIDE lock
         with self.lock:
             if self.pipeline_task is not None:
                 logger.warning("Pipeline progress already exists")
                 return
-
             if total_weight is not None:
                 self.total_weight = total_weight
 
-            # Use 100 as total for percentage display
-            self.pipeline_task = self.progress.add_task(
-                "[bold magenta]Pipeline Progress",
-                total=100
-            )
-            logger.debug("Added pipeline progress bar")
+        # Call Rich library OUTSIDE lock
+        task_id = self.progress.add_task(
+            "[bold magenta]Pipeline Progress",
+            total=100
+        )
+
+        # Store task ID INSIDE lock
+        with self.lock:
+            self.pipeline_task = task_id
+
+        logger.debug("Added pipeline progress bar")
 
     def add_stage_progress(self, stage_name: str, total_items: int):
         """
@@ -152,18 +151,23 @@ class ProgressManager:
             stage_name: Name of the stage (e.g., "extract", "process", "audio")
             total_items: Total number of items/chunks in this stage
         """
+        # Check if already exists INSIDE lock
         with self.lock:
             if stage_name in self.stage_tasks:
                 logger.warning(f"Stage progress for '{stage_name}' already exists")
                 return
 
-            # Create indented description for hierarchy
-            task_id = self.progress.add_task(
-                f"[cyan]  ├─ {stage_name.capitalize()}",
-                total=total_items
-            )
+        # Call Rich library OUTSIDE lock
+        task_id = self.progress.add_task(
+            f"[cyan]  ├─ {stage_name.capitalize()}",
+            total=total_items
+        )
+
+        # Store task ID INSIDE lock
+        with self.lock:
             self.stage_tasks[stage_name] = task_id
-            logger.debug(f"Added stage progress: {stage_name} ({total_items} items)")
+
+        logger.debug(f"Added stage progress: {stage_name} ({total_items} items)")
 
     def add_batch_progress(self, batch_id: int, total_items: int):
         """
@@ -173,20 +177,25 @@ class ProgressManager:
             batch_id: Unique identifier for the batch
             total_items: Total number of items in this batch
         """
+        # Check if already exists INSIDE lock
         with self.lock:
             if batch_id in self.batch_tasks:
                 logger.warning(f"Batch progress for batch {batch_id} already exists")
                 return
 
-            # Create double-indented description for hierarchy
-            is_last = False  # TODO: Detect if this is the last batch
-            prefix = "└─" if is_last else "├─"
-            task_id = self.progress.add_task(
-                f"[yellow]  │  {prefix} Batch {batch_id}",
-                total=total_items
-            )
+        # Call Rich library OUTSIDE lock
+        is_last = False  # TODO: Detect if this is the last batch
+        prefix = "└─" if is_last else "├─"
+        task_id = self.progress.add_task(
+            f"[yellow]  │  {prefix} Batch {batch_id}",
+            total=total_items
+        )
+
+        # Store task ID INSIDE lock
+        with self.lock:
             self.batch_tasks[batch_id] = task_id
-            logger.debug(f"Added batch progress: batch {batch_id} ({total_items} items)")
+
+        logger.debug(f"Added batch progress: batch {batch_id} ({total_items} items)")
 
     def update_pipeline(self, completed_weight: float):
         """
@@ -195,17 +204,28 @@ class ProgressManager:
         Args:
             completed_weight: Total weight completed so far
         """
+        logger.info(f"=== ProgressManager.update_pipeline ENTRY: weight={completed_weight} ===")
+        # Get task ID and calculate percentage INSIDE lock
+        logger.info(f"=== ProgressManager.update_pipeline: Acquiring lock ===")
         with self.lock:
+            logger.info(f"=== ProgressManager.update_pipeline: Lock acquired ===")
             if self.pipeline_task is None:
                 logger.warning("Pipeline progress not initialized")
+                logger.info(f"=== ProgressManager.update_pipeline: pipeline_task is None, returning ===")
                 return
 
             self.completed_weight = completed_weight
             # Convert weight to percentage (0-100)
             percentage = (completed_weight / self.total_weight * 100) if self.total_weight > 0 else 0
             percentage = min(100, max(0, percentage))  # Clamp to 0-100
+            task_id = self.pipeline_task
+            logger.info(f"=== ProgressManager.update_pipeline: Calculated percentage={percentage:.2f}% ===")
 
-            self.progress.update(self.pipeline_task, completed=percentage)
+        logger.info(f"=== ProgressManager.update_pipeline: Lock released, calling progress.update ===")
+        # Call Rich library OUTSIDE lock to avoid nested locking
+        self.progress.update(task_id, completed=percentage)
+        logger.info(f"=== ProgressManager.update_pipeline EXIT ===")
+
 
     def update_stage(self, stage_name: str, completed: int, advance: bool = False):
         """
@@ -216,16 +236,18 @@ class ProgressManager:
             completed: Number of items completed (or amount to advance if advance=True)
             advance: If True, increment by 'completed'. If False, set to 'completed'.
         """
+        # Get task ID INSIDE lock
         with self.lock:
             if stage_name not in self.stage_tasks:
                 logger.warning(f"Stage '{stage_name}' not found in progress tracking")
                 return
-
             task_id = self.stage_tasks[stage_name]
-            if advance:
-                self.progress.update(task_id, advance=completed)
-            else:
-                self.progress.update(task_id, completed=completed)
+
+        # Call Rich library OUTSIDE lock to avoid nested locking
+        if advance:
+            self.progress.update(task_id, advance=completed)
+        else:
+            self.progress.update(task_id, completed=completed)
 
     def update_batch(self, batch_id: int, completed: int, advance: bool = False):
         """
@@ -236,16 +258,18 @@ class ProgressManager:
             completed: Number of items completed (or amount to advance if advance=True)
             advance: If True, increment by 'completed'. If False, set to 'completed'.
         """
+        # Get task ID INSIDE lock
         with self.lock:
             if batch_id not in self.batch_tasks:
                 logger.warning(f"Batch {batch_id} not found in progress tracking")
                 return
-
             task_id = self.batch_tasks[batch_id]
-            if advance:
-                self.progress.update(task_id, advance=completed)
-            else:
-                self.progress.update(task_id, completed=completed)
+
+        # Call Rich library OUTSIDE lock to avoid nested locking
+        if advance:
+            self.progress.update(task_id, advance=completed)
+        else:
+            self.progress.update(task_id, completed=completed)
 
     def remove_stage(self, stage_name: str):
         """
@@ -254,14 +278,25 @@ class ProgressManager:
         Args:
             stage_name: Name of the stage to remove
         """
+        logger.info(f"=== ProgressManager.remove_stage ENTRY: stage={stage_name} ===")
+        # Get task ID and remove from dict INSIDE lock
+        logger.info(f"=== ProgressManager.remove_stage: Acquiring lock ===")
         with self.lock:
+            logger.info(f"=== ProgressManager.remove_stage: Lock acquired ===")
             if stage_name not in self.stage_tasks:
+                logger.info(f"=== ProgressManager.remove_stage: {stage_name} not in stage_tasks, returning ===")
                 return
-
             task_id = self.stage_tasks[stage_name]
-            self.progress.update(task_id, visible=False)
+            logger.info(f"=== ProgressManager.remove_stage: Deleting {stage_name} from stage_tasks ===")
             del self.stage_tasks[stage_name]
-            logger.debug(f"Removed stage progress: {stage_name}")
+            logger.info(f"=== ProgressManager.remove_stage: Deleted ===")
+
+        logger.info(f"=== ProgressManager.remove_stage: Lock released, calling progress.update ===")
+        # Call Rich library OUTSIDE lock to avoid nested locking
+        self.progress.update(task_id, visible=False)
+        logger.info(f"=== ProgressManager.remove_stage: progress.update returned ===")
+        logger.debug(f"Removed stage progress: {stage_name}")
+        logger.info(f"=== ProgressManager.remove_stage EXIT: stage={stage_name} ===")
 
     def remove_batch(self, batch_id: int):
         """
@@ -270,14 +305,16 @@ class ProgressManager:
         Args:
             batch_id: ID of the batch to remove
         """
+        # Get task ID and remove from dict INSIDE lock
         with self.lock:
             if batch_id not in self.batch_tasks:
                 return
-
             task_id = self.batch_tasks[batch_id]
-            self.progress.update(task_id, visible=False)
             del self.batch_tasks[batch_id]
-            logger.debug(f"Removed batch progress: {batch_id}")
+
+        # Call Rich library OUTSIDE lock to avoid nested locking
+        self.progress.update(task_id, visible=False)
+        logger.debug(f"Removed batch progress: {batch_id}")
 
     def display_checkpoint_info(self, checkpoint_info: Dict[str, Any], display_duration: float = 5.0):
         """

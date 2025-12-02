@@ -90,6 +90,21 @@ class QuantizationConfig:
 
 
 @dataclass
+class SplitReference:
+    """Lightweight reference to a cached layer split configuration."""
+    cache_key: str                      # Hash of model_id + quant + GPU type
+    layers_on_gpu: int                  # Cached layer split value
+    validation_hash: str                # Hash of validation parameters
+    last_validated: str                 # ISO timestamp of last validation
+
+    # Validation metadata
+    validated_batch_size: int           # Batch size used for validation
+    validated_max_tokens: int           # Max tokens used for validation
+    validated_vram_mb: float            # VRAM available during validation
+    estimated_peak_memory_mb: float     # Estimated peak memory usage
+
+
+@dataclass
 class LayerSplitConfig:
     """Configuration for splitting model layers between devices (GPU/CPU/Disk)."""
     enabled: bool = True # Whether to attempt splitting
@@ -101,6 +116,7 @@ class LayerSplitConfig:
     low_cpu_mem_usage: bool = True # Enable low CPU memory usage mode
     auto_oom_handling: bool = True # Enable automatic CUDA OOM error handling with progressive layer offloading
     auto_discover_splits: bool = True # Automatically discover optimal layer splits on first model load
+    split_reference: Optional['SplitReference'] = None  # Reference to cached layer split configuration
 
     # Advanced memory management settings
     kv_cache_device: str = "auto"  # "auto", "cpu", "gpu" - Where to store KV cache
@@ -319,6 +335,8 @@ class PipelineConfig:
     # LLM Generation settings
     hyperparameters: Any = field(default=None) # Will be lazily initialized
     batch_size: int = 1  # Number of chunks to process in parallel (1=sequential, >1=batch inference)
+    enable_dynamic_batching: bool = True  # Enable dynamic batch size adjustment based on VRAM
+    max_batch_size: int = 8  # Maximum batch size for dynamic batching
     # Local Model Hardware settings
     quantization_config: Optional[QuantizationConfig] = None
     layer_split_config: Optional[LayerSplitConfig] = None

@@ -22,13 +22,26 @@ class TextPreprocessor:
         self._email_regex = re.compile(r'\S+@\S+\.\S+')
         self._multi_newline_regex = re.compile(r'\n{3,}')
         self._multi_space_regex = re.compile(r' {2,}')
-        
+
         # --- PDF Artifact Regex ---
         self._pdf_hyphen_regex = re.compile(r'(\w+)-\n(\w+)')
         self._pdf_punct_space_regex = re.compile(r'\s+([.,;!?])')
         self._pdf_punct_word_regex = re.compile(r'([.,;!?])(\w)')
         self._pdf_page_num_regex = re.compile(r'\n\s*\d+\s*\n|\nPage \d+ of \d+\n', re.IGNORECASE)
         self._pdf_bullet_regex = re.compile(r'^[•·■□▪▫◦‣⁃]\s+', re.MULTILINE)
+
+        # --- Reference Section Detection ---
+        # Patterns to detect common reference section headers
+        self._ref_section_patterns = [
+            re.compile(r'\n\s*(?:REFERENCES|References|Bibliography|BIBLIOGRAPHY|Works Cited|WORKS CITED|Literature Cited)\s*\n', re.IGNORECASE),
+            re.compile(r'\n\s*\[\d+\]\s+\w', re.MULTILINE),  # Numbered reference list
+            # Detect numbered author citations (1. J. J. Hopfield, 2. E. D. Schoedel, etc.)
+            re.compile(r'\n\d+\.\s+[A-Z]\.\s+(?:[A-Z]\.\s+)*\w+', re.MULTILINE),
+            # Detect Acknowledgments section
+            re.compile(r'\n\s*(?:Acknowledgments?|ACKNOWLEDGMENTS?|Funding|FUNDING)\s*\n', re.IGNORECASE),
+            # Detect dense citation blocks (3+ consecutive lines starting with numbers)
+            re.compile(r'(?:\n\d+\..*){3,}', re.MULTILINE),
+        ]
 
         # --- Audio Cleaning Regex ---
         self._citation_regex = re.compile(r'\[\d+(, ?\d+)*\]') # [1], [1, 2]
@@ -141,31 +154,66 @@ class TextPreprocessor:
         # Filter out empty strings and re-join with a single space
         return ' '.join([s.strip() for s in sentences if s.strip()])
 
-    def clean_for_audio(self, text: str) -> str:
+    def _remove_references_section(self, text: str) -> str:
+        """
+        Remove or move reference sections to the end of the text.
+
+        Args:
+            text: Input text
+
+        Returns:
+            Text with references section removed or relocated
+        """
+        # Try to find reference section using various patterns
+        for pattern in self._ref_section_patterns:
+            match = pattern.search(text)
+            if match:
+                # Found reference section - remove everything from this point onward
+                # since references are typically at the end of research papers
+                ref_start = match.start()
+                main_content = text[:ref_start].strip()
+                self.logger.debug(f"Removed references section starting at position {ref_start}")
+                return main_content
+
+        # No clear reference section found, return as-is
+        return text
+
+    def clean_for_audio(self, text: str, remove_references: bool = True) -> str:
         """
         Clean text specifically for audio/podcast generation.
-        
+
         Args:
             text: Input text (likely already preprocessed for LLM).
-            
+            remove_references: Whether to remove/relocate reference sections (default: True).
+
         Returns:
             Cleaned text suitable for audio.
         """
         self.logger.debug("Applying audio-specific cleaning...")
-        
+
+        # Remove reference sections first (common in research papers)
+        if remove_references:
+            text = self._remove_references_section(text)
+
         # Convert URLs/Emails (might have been done in preprocess_for_llm, but run again)
         text = self._url_regex.sub('[web link]', text)
         text = self._email_regex.sub('[email address]', text)
-        
-        # Remove or simplify citations
-        text = self._citation_regex.sub('', text) # Remove [1] style citations
-        text = self._year_regex.sub('', text)     # Remove (2024) style years
+
+        # Remove or simplify citations (more aggressive)
+        text = self._citation_regex.sub('', text)  # Remove [1] style citations
+        text = self._year_regex.sub('', text)      # Remove (2024) style years
+
+        # Remove inline citations with author names (e.g., "Smith et al. (2020)")
+        text = re.sub(r'\b\w+\s+et\s+al\.\s*\(\d{4}\)', '', text)
+
+        # Remove standalone author-year citations (e.g., "(Smith, 2020)")
+        text = re.sub(r'\([A-Z][a-z]+(?:\s+et\s+al\.)?,?\s*\d{4}\)', '', text)
 
         # Remove complex LaTeX
         text = self._latex_inline_regex.sub('[formula]', text)
         text = self._latex_block_regex.sub('[formula]', text)
         text = self._latex_cmd_regex.sub('[formula]', text)
-        
+
         # Convert simple math symbols
         for pattern, replacement in self._audio_math_replacements.items():
             text = re.sub(pattern, replacement, text)
@@ -183,7 +231,7 @@ class TextPreprocessor:
                 in_table = False
                 cleaned_lines.append(line)
         text = '\n'.join(cleaned_lines)
-        
+
         # Expand abbreviations
         # Use regex to ensure we match whole words (e.g., 'Mr.' not 'OMr.')
         for abbr, expansion in self._audio_abbreviations.items():
@@ -192,9 +240,19 @@ class TextPreprocessor:
             pattern = r'\b' + re.escape(abbr) + r'\b'
             text = re.sub(pattern, expansion, text)
 
+        # Remove special characters that don't belong in audio (but preserve punctuation)
+        # This removes things like ©, ®, ™, §, ¶, †, ‡, etc.
+        text = re.sub(r'[©®™§¶†‡°•◦▪▫■□●○▸▹►▻‣⁃←→↑↓]', '', text)
+
+        # Clean up multiple consecutive punctuation marks
+        text = re.sub(r'([.,!?])\1+', r'\1', text)  # e.g., "..." -> "."
+
+        # Remove orphaned punctuation with excessive spacing
+        text = re.sub(r'\s+([.,;!?])\s+', r'\1 ', text)
+
         # Final whitespace cleanup
         text = self._normalize_whitespace(text)
-        
+
         return text
 
     def preprocess_for_llm(self,

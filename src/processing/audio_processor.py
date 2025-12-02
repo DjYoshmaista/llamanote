@@ -108,9 +108,36 @@ class AudioPostProcessor:
         sf = get_sf()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(path, audio, sr, subtype=subtype, format=format.upper())
-            logger.info(f"Saved post-processed audio to {path}")
-            return path
+
+            # Handle MP3: soundfile doesn't support MP3 writing directly
+            # Save as WAV first, then convert to MP3 if needed
+            if format.lower() == "mp3":
+                # Save as temporary WAV file
+                temp_wav_path = path.with_suffix('.wav')
+                sf.write(temp_wav_path, audio, sr, subtype='PCM_16', format='WAV')
+
+                # Convert WAV to MP3 using pydub if available
+                try:
+                    from pydub import AudioSegment
+                    audio_segment = AudioSegment.from_wav(str(temp_wav_path))
+                    audio_segment.export(str(path), format="mp3", bitrate="192k")
+
+                    # Clean up temporary WAV file
+                    temp_wav_path.unlink()
+                    logger.info(f"Saved and converted audio to MP3: {path}")
+                    return path
+                except ImportError:
+                    # pydub not available, just rename WAV to MP3 (will be WAV format with .mp3 extension)
+                    logger.warning("pydub not available, saving as WAV with .mp3 extension")
+                    temp_wav_path.rename(path)
+                    logger.info(f"Saved audio (WAV format) to {path}")
+                    return path
+            else:
+                # For other formats (WAV, FLAC, etc.), use soundfile directly
+                sf.write(path, audio, sr, subtype=subtype, format=format.upper())
+                logger.info(f"Saved post-processed audio to {path}")
+                return path
+
         except Exception as e:
             logger.error(f"Failed to save audio file {path}: {e}", exc_info=True)
             return None
